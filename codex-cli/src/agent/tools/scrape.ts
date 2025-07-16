@@ -1,7 +1,11 @@
 import type { ScrapeOptions } from "../../utils/web-scraper.js";
 import type { FunctionTool } from "openai/resources/beta/assistants.mjs";
 
-import { getCodexModel } from "../../utils/providers.js";
+// `scrapeWebpage` needs to know the model name so it can use the correct
+// tiktoken encoder when counting tokens.  The CLI already tracks the model
+// that is active for the current session via the session utilities, so we
+// reuse that instead of importing a non-existent helper.
+import { getCurrentModel } from "../../utils/session.js";
 import { scrapeWebpage } from "../../utils/web-scraper.js";
 
 export const scrapeFunctionTool: FunctionTool = {
@@ -49,8 +53,11 @@ export async function executeScrape(args: {
   truncate_tokens?: number;
 }): Promise<string> {
   try {
-    // Get current model for token counting
-    const currentModel = getCodexModel() || "gpt-4";
+    // Determine the model currently in use so that the scraper can pick the
+    // matching encoder.  Fallback to a sensible default when the session has
+    // not recorded a model yet (e.g. standalone `codex scrape <url>` command
+    // in which no chat session is active).
+    const currentModel = getCurrentModel() || "gpt-4";
 
     const options: ScrapeOptions = {
       url: args.url,
