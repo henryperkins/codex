@@ -264,6 +264,17 @@ function convertTools(
   for (const tool of tools) {
     // Standard function tool – needs to be nested under a `function` key.
     if (tool.type === "function") {
+      // Validate required "name" field to prevent 400 errors from the API.
+      // An empty or missing name produces the `"tools[x].name" is missing` error.
+      if (
+        tool.name === undefined ||
+        (typeof tool.name === "string" && tool.name.trim() === "")
+      ) {
+        throw new Error(
+          "Each function tool must include a non-empty 'name' property.",
+        );
+      }
+
       converted.push({
         type: "function",
         function: {
@@ -278,8 +289,28 @@ function convertTools(
     // Pass through any other tool types (e.g. "web_search_preview", "mcp")
     // verbatim – the SDK typings may not yet include them so we cast via
     // `unknown` to avoid compile-time errors.
+
+    // Ensure all tools have a name property, even non-function tools
+    const toolWithName = { ...tool } as Record<string, unknown> & {
+      type?: string;
+      name?: string;
+    };
+    if (
+      !toolWithName.name ||
+      (typeof toolWithName.name === "string" && toolWithName.name.trim() === "")
+    ) {
+      if (toolWithName.type) {
+        // Use tool type as the name if name is missing or empty
+        toolWithName.name = toolWithName.type;
+      } else {
+        throw new Error(
+          "Each tool must include a non-empty 'name' property or a 'type' property that can be used as the name.",
+        );
+      }
+    }
+
     converted.push(
-      tool as unknown as OpenAI.Chat.Completions.ChatCompletionTool,
+      toolWithName as unknown as OpenAI.Chat.Completions.ChatCompletionTool,
     );
   }
 
@@ -319,6 +350,9 @@ const createCompletion = (openai: OpenAI, input: ResponseCreateInput) => {
       // Cast through `unknown` to satisfy the narrower SDK type without
       // polluting our own type definitions.
       const deepResearchTool = {
+        // The `name` property is required by some endpoints (e.g. Azure) even
+        // for built-in tool types.
+        name: "web_search_preview",
         type: "web_search_preview",
       } as unknown as OpenAI.Chat.Completions.ChatCompletionTool;
 

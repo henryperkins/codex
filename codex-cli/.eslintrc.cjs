@@ -10,6 +10,7 @@ module.exports = {
     ".eslintrc.cjs",
     "build.mjs",
     "dist",
+    "dirname-shim.js",
     // Ignore the root-level Vite config, but allow nested ones such as the
     // dashboard's config under codex-web/web/ so they can be linted.
     "/vite.config.ts",

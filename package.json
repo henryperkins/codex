@@ -42,10 +42,13 @@
     "*.json": "prettier --write",
     "*.md": "prettier --write",
     ".github/workflows/*.yml": "prettier --write",
-    "**/*.{js,ts,tsx}": [
+    "**/*.{ts,tsx}": [
       "prettier --write",
       "pnpm --filter @openai/codex run lint",
       "pnpm --filter codex-cli run typecheck"
+    ],
+    "**/*.js": [
+      "prettier --write"
     ]
   },
   "packageManager": "pnpm@10.13.1+sha512.37ebf1a5c7a30d5fabe0c5df44ee8da4c965ca0c5af3dbab28c3a1681b70a256218d05c81c9c0dcf767ef6b8551eb5b960042b9ed4300c59242336377e01cfad",

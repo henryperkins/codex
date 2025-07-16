@@ -50,31 +50,68 @@ function patchForDeepResearchModels(client: OpenAI | AzureOpenAI) {
     let patchedParams = rawParams as Record<string, unknown>;
 
     try {
-      if (
-        patchedParams &&
-        typeof patchedParams === "object" &&
-        typeof patchedParams.model === "string" &&
-        patchedParams.model.includes("deep-research")
-      ) {
-        const originalTools = Array.isArray(patchedParams.tools)
-          ? [...patchedParams.tools]
-          : [];
+      if (patchedParams && typeof patchedParams === "object") {
+        // Ensure all tools have names regardless of model
+        if (Array.isArray(patchedParams["tools"])) {
+          const tools = [...(patchedParams["tools"] as Array<unknown>)];
 
-        const hasRequiredTool = originalTools.some(
-          (t) =>
-            (t as { type?: string }).type === "web_search_preview" ||
-            (t as { type?: string }).type === "mcp",
-        );
+          // Ensure all tools have names
+          const patchedTools = tools.map((tool) => {
+            if (tool && typeof tool === "object") {
+              const toolObj = tool as Record<string, unknown>;
+              // If tool doesn't have a name or has an empty name, use type as name
+              if (
+                (!("name" in toolObj) ||
+                  !toolObj["name"] ||
+                  (typeof toolObj["name"] === "string" &&
+                    toolObj["name"].trim() === "")) &&
+                "type" in toolObj &&
+                toolObj["type"]
+              ) {
+                return { ...tool, name: toolObj["type"] };
+              }
+            }
+            return tool;
+          });
 
-        const tools = hasRequiredTool
-          ? originalTools
-          : [...originalTools, { type: "web_search_preview" }];
+          // Only replace tools if we actually made changes
+          if (JSON.stringify(tools) !== JSON.stringify(patchedTools)) {
+            patchedParams = { ...patchedParams, tools: patchedTools };
+          }
+        }
 
+        // Add web_search_preview for deep-research models if needed
         if (
-          tools.length !==
-          (patchedParams.tools as Array<unknown> | undefined)?.length
+          typeof patchedParams["model"] === "string" &&
+          (patchedParams["model"] as string).includes("deep-research")
         ) {
-          patchedParams = { ...patchedParams, tools };
+          const originalTools = Array.isArray(patchedParams["tools"])
+            ? [...(patchedParams["tools"] as Array<unknown>)]
+            : [];
+
+          const hasRequiredTool = originalTools.some(
+            (t) =>
+              (t as { type?: string }).type === "web_search_preview" ||
+              (t as { type?: string }).type === "mcp",
+          );
+
+          const tools = hasRequiredTool
+            ? originalTools
+            : [
+                ...originalTools,
+                {
+                  // add required name for Azure compatibility
+                  name: "web_search_preview",
+                  type: "web_search_preview",
+                },
+              ];
+
+          if (
+            tools.length !==
+            (patchedParams["tools"] as Array<unknown> | undefined)?.length
+          ) {
+            patchedParams = { ...patchedParams, tools };
+          }
         }
       }
     } catch {

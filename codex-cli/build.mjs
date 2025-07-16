@@ -24,6 +24,72 @@ const ignoreReactDevToolsPlugin = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Plugin: externalise *everything* that is exactly "jsdom" or starts with it
+// ---------------------------------------------------------------------------
+const externalizeJsdomPlugin = {
+  name: "externalize-jsdom",
+  setup(build) {
+    // Matches "jsdom" **and** any deep sub-path.
+    const filter = /^jsdom($|\/)/;
+    build.onResolve({ filter }, args => ({
+      path: args.path,
+      external: true,
+    }));
+
+    // Also externalize canvas which jsdom may try to load
+    build.onResolve({ filter: /^canvas($|\/)/ }, args => ({
+      path: args.path,
+      external: true,
+    }));
+
+    // Externalize other potential JSDOM dependencies that might cause issues
+    const jsdomDeps = [
+      /^parse5($|\/)/,
+      /^whatwg-encoding($|\/)/,
+      /^whatwg-mimetype($|\/)/,
+      /^data-urls($|\/)/,
+      /^domexception($|\/)/,
+      /^cssstyle($|\/)/,
+      /^cssom($|\/)/,
+      /^nwsapi($|\/)/,
+      /^w3c-hr-time($|\/)/,
+      /^w3c-xmlserializer($|\/)/,
+      /^xml-name-validator($|\/)/,
+      /^html-encoding-sniffer($|\/)/,
+      /^tough-cookie($|\/)/,
+      /^form-data($|\/)/,
+    ];
+
+    jsdomDeps.forEach(depFilter => {
+      build.onResolve({ filter: depFilter }, args => ({
+        path: args.path,
+        external: true,
+      }));
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Plugin: externalise everything under "@mozilla/readability"
+// ---------------------------------------------------------------------------
+const externalizeReadabilityPlugin = {
+  name: "externalize-readability",
+  setup(build) {
+    const filter = /^@mozilla\/readability($|\/)/;
+    build.onResolve({ filter }, args => ({
+      path: args.path,
+      external: true,
+    }));
+
+    // Also handle readability without scope
+    build.onResolve({ filter: /^readability($|\/)/ }, args => ({
+      path: args.path,
+      external: true,
+    }));
+  },
+};
+
 // ----------------------------------------------------------------------------
 // Build mode detection (production vs development)
 //
@@ -39,7 +105,11 @@ const isDevBuild =
   process.env.CODEX_DEV === "1" ||
   process.env.NODE_ENV === "development";
 
-const plugins = [ignoreReactDevToolsPlugin];
+const plugins = [
+  ignoreReactDevToolsPlugin,
+  externalizeJsdomPlugin,
+  externalizeReadabilityPlugin,
+];
 
 // Build Hygiene, ensure we drop previous dist dir and any leftover files
 const outPath = path.resolve(OUT_DIR);
@@ -74,7 +144,39 @@ esbuild
     entryPoints: ["src/cli.tsx"],
     // Do not bundle the contents of package.json at build time: always read it
     // at runtime.
-    external: ["../package.json"],
+    // Avoid bundling libraries that dynamically require worker scripts (e.g.
+    // whatwg-url and jsdom both resolve './xhr-sync-worker.js' at runtime). Bundling
+    // breaks the relative path and causes a MODULE_NOT_FOUND error when the CLI
+    // is executed. Marking them as external ensures Node can resolve the worker
+    // files from their respective directories in node_modules.
+    // Mark jsdom and its deep imports as external so worker files like
+    // xhr-sync-worker.js stay on disk and resolve correctly at runtime.
+    // esbuild patterns can only contain a single "*", so we enumerate up to
+    // four directory levels which is enough for jsdom's internal structure.
+    external: [
+      "../package.json",
+      "whatwg-url",
+      "canvas",
+      // Add more potential JSDOM dependencies
+      "parse5",
+      "whatwg-encoding",
+      "whatwg-mimetype",
+      "data-urls",
+      "domexception",
+      "cssstyle",
+      "cssom",
+      "nwsapi",
+      "w3c-hr-time",
+      "w3c-xmlserializer",
+      "xml-name-validator",
+      "html-encoding-sniffer",
+      "tough-cookie",
+      "form-data",
+      // Explicitly externalize readability
+      "@mozilla/readability",
+      "readability",
+      // leave every jsdom flavour to the plugin
+    ],
     bundle: true,
     format: "esm",
     platform: "node",
@@ -83,6 +185,11 @@ esbuild
     minify: !isDevBuild,
     sourcemap: isDevBuild ? "inline" : true,
     plugins,
-    inject: ["./require-shim.js"],
+    inject: ["./require-shim.js", "./dirname-shim.js"],
+    define: {
+      // Define __dirname for direct usage in code
+      '__dirname': 'globalThis.__dirname',
+      '__filename': 'globalThis.__filename'
+    },
   })
   .catch(() => process.exit(1));

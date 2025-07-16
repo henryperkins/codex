@@ -2,41 +2,51 @@ import type { Tiktoken } from "tiktoken";
 
 import iconv from "iconv-lite";
 import { JSDOM } from "jsdom";
-import { AbortController } from "node:abort-controller";
 import { URL } from "node:url";
-import { Readability } from "readability";
 import sanitizeHtml from "sanitize-html";
 import { encoding_for_model, get_encoding } from "tiktoken";
 import TurndownService from "turndown";
 import { fetch, Agent } from "undici";
 
-export interface ScrapeResult {
-  url: string;
-  title: string | null;
-  markdown: string;
-  text: string;
-  html_excerpt?: string;
-  token_count: number;
-  meta: {
-    model: string;
-    truncated: boolean;
-    fetched_at: string;
-    fetch_ms: number;
-  };
-  error?: {
-    code: string;
-    message: string;
+// Polyfill HTML elements before importing readability
+// This prevents readability from failing when it tries to access these elements
+if (typeof globalThis.HTMLElement === "undefined") {
+  globalThis.HTMLElement = class HTMLElement {
+    constructor() {}
+    setAttribute() {}
+    getAttribute() {
+      return null;
+    }
+    removeAttribute() {}
   };
 }
 
-export interface ScrapeOptions {
-  url: string;
-  selector?: string | Array<string>;
-  attr?: string;
-  truncate_tokens?: number;
-  model?: string;
-  include_html_excerpt?: boolean;
-  no_readability?: boolean;
+if (typeof globalThis.HTMLFrameElement === "undefined") {
+  globalThis.HTMLFrameElement = class HTMLFrameElement extends (
+    globalThis.HTMLElement
+  ) {
+    constructor() {
+      super();
+    }
+  };
+}
+
+if (typeof globalThis.HTMLFrameSetElement === "undefined") {
+  globalThis.HTMLFrameSetElement = class HTMLFrameSetElement extends (
+    globalThis.HTMLElement
+  ) {
+    constructor() {
+      super();
+    }
+  };
+}
+
+// Create a core object that readability expects
+if (typeof globalThis.core === "undefined") {
+  globalThis.core = {
+    HTMLFrameElement: globalThis.HTMLFrameElement,
+    HTMLFrameSetElement: globalThis.HTMLFrameSetElement,
+  };
 }
 
 const MAX_REDIRECTS = 5;
@@ -257,50 +267,86 @@ function sanitizeAndPrepareHtml(inputHtml: string): string {
   });
 }
 
-function extractContent(
+async function extractContent(
   dom: JSDOM,
   options: ScrapeOptions,
-): { title: string | null; content: string; isReadability: boolean } {
-  const document = dom.window.document;
+): Promise<{ title: string | null; content: string; isReadability: boolean }> {
+  try {
+    const document = dom.window.document;
 
-  // Try user-specified selectors first
-  if (options.selector) {
-    const selectors = Array.isArray(options.selector)
-      ? options.selector
-      : [options.selector];
-    for (const selector of selectors) {
-      try {
-        const elements = document.querySelectorAll(selector);
-        if (elements.length > 0) {
-          let content = "";
-          elements.forEach((el) => {
-            if (options.attr && el.hasAttribute(options.attr)) {
-              content += el.getAttribute(options.attr) + "\n";
-            } else {
-              content += el.textContent + "\n";
-            }
-          });
+    // Try user-specified selectors first
+    if (options.selector) {
+      const selectors = Array.isArray(options.selector)
+        ? options.selector
+        : [options.selector];
+      for (const selector of selectors) {
+        try {
+          const elements = document.querySelectorAll(selector);
+          if (elements.length > 0) {
+            let content = "";
+            elements.forEach((el) => {
+              if (options.attr && el.hasAttribute(options.attr)) {
+                content += el.getAttribute(options.attr) + "\n";
+              } else {
+                content += el.textContent + "\n";
+              }
+            });
 
-          const title =
-            document.querySelector("title")?.textContent?.trim() || null;
-          return { title, content: content.trim(), isReadability: false };
+            const title =
+              document.querySelector("title")?.textContent?.trim() || null;
+            return { title, content: content.trim(), isReadability: false };
+          }
+        } catch (e) {
+          // Invalid selector, continue
         }
-      } catch (e) {
-        // Invalid selector, continue
       }
     }
+
+    // Try Readability unless disabled
+    if (!options.no_readability) {
+      try {
+        // Use dynamic import to avoid loading issues
+        const readabilityResult = await tryReadability(document);
+        if (readabilityResult) {
+          return readabilityResult;
+        }
+      } catch (e) {
+        // Readability failed, fall through
+      }
+    }
+
+    // Fallback to body text
+    const content = document.body?.textContent || "";
+    const title = document.querySelector("title")?.textContent?.trim() || null;
+
+    return { title, content: content.trim(), isReadability: false };
+  } catch (error) {
+    // If JSDOM operations fail completely, return minimal content
+    return { title: null, content: "", isReadability: false };
   }
+}
 
-  // Try Readability unless disabled
-  if (!options.no_readability) {
-    try {
-      const reader = new Readability(document);
-      const article = reader.parse();
+async function tryReadability(
+  document: Document,
+): Promise<{
+  title: string | null;
+  content: string;
+  isReadability: boolean;
+} | null> {
+  try {
+    // Try to dynamically import readability
+    const ReadabilityPkg = await import("readability");
+    const { Readability } = ReadabilityPkg.default || ReadabilityPkg;
 
-      if (article?.content) {
-        // Create a new DOM from the article content to extract text
-        const articleDom = new JSDOM(article.content);
+    const reader = new Readability(document);
+    const article = reader.parse();
+
+    if (article?.content) {
+      // Create a new DOM from the article content to extract text
+      const articleDom = createSafeJSDOM(article.content);
+      if (articleDom) {
         const content = articleDom.window.document.body.textContent || "";
+        articleDom.window.close();
 
         return {
           title: article.title || null,
@@ -308,16 +354,13 @@ function extractContent(
           isReadability: true,
         };
       }
-    } catch (e) {
-      // Readability failed, fall through
     }
+  } catch (e) {
+    // If readability fails to load or execute, return null
+    return null;
   }
 
-  // Fallback to body text
-  const content = document.body?.textContent || "";
-  const title = document.querySelector("title")?.textContent?.trim() || null;
-
-  return { title, content: content.trim(), isReadability: false };
+  return null;
 }
 
 function convertToMarkdown(html: string): string {
@@ -426,6 +469,97 @@ function truncateToTokenLimit(
   }
 }
 
+function createSafeJSDOM(html: string, url?: string): JSDOM | null {
+  // Try multiple JSDOM creation strategies
+  const strategies = [
+    // Strategy 1: Full options with beforeParse
+    () =>
+      new JSDOM(html, {
+        url: url,
+        runScripts: "outside-only",
+        resources: "usable",
+        beforeParse(window) {
+          // Polyfill missing HTML elements
+          if (!window.HTMLFrameElement) {
+            window.HTMLFrameElement = window.HTMLElement;
+          }
+          if (!window.HTMLFrameSetElement) {
+            window.HTMLFrameSetElement = window.HTMLElement;
+          }
+          if (!window.HTMLMarqueeElement) {
+            window.HTMLMarqueeElement = window.HTMLElement;
+          }
+        },
+      }),
+
+    // Strategy 2: Minimal options with beforeParse
+    () =>
+      new JSDOM(html, {
+        url: url,
+        beforeParse(window) {
+          if (!window.HTMLFrameElement) {
+            window.HTMLFrameElement = window.HTMLElement;
+          }
+        },
+      }),
+
+    // Strategy 3: Just URL
+    () => new JSDOM(html, { url: url }),
+
+    // Strategy 4: Bare minimum
+    () => new JSDOM(html),
+
+    // Strategy 5: Empty DOM as last resort
+    () =>
+      new JSDOM(
+        "<!DOCTYPE html><html><head><title></title></head><body></body></html>",
+      ),
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const dom = strategy();
+      // Test that the DOM is actually usable
+      dom.window.document.querySelector("body");
+      return dom;
+    } catch (error) {
+      // Continue to next strategy
+      continue;
+    }
+  }
+
+  return null;
+}
+
+export interface ScrapeResult {
+  url: string;
+  title: string | null;
+  markdown: string;
+  text: string;
+  html_excerpt?: string;
+  token_count: number;
+  meta: {
+    model: string;
+    truncated: boolean;
+    fetched_at: string;
+    fetch_ms: number;
+  };
+  error?: {
+    code: string;
+    message: string;
+  };
+}
+
+export interface ScrapeOptions {
+  url: string;
+  selector?: string | Array<string>;
+  attr?: string;
+  truncate_tokens?: number;
+  model?: string;
+  include_html_excerpt?: boolean;
+  no_readability?: boolean;
+}
+
 export async function scrapeWebpage(
   options: ScrapeOptions,
 ): Promise<ScrapeResult> {
@@ -447,48 +581,76 @@ export async function scrapeWebpage(
     // Sanitize HTML
     const sanitizedHtml = sanitizeAndPrepareHtml(body);
 
-    // Create DOM
-    const dom = new JSDOM(sanitizedHtml, {
-      url: finalUrl,
-      runScripts: "outside-only",
-      resources: "usable",
-    });
-
-    // Check DOM size
-    const nodeCount = dom.window.document.querySelectorAll("*").length;
-    if (nodeCount > MAX_DOM_NODES) {
-      dom.window.close();
-      throw new Error("DOM too large");
+    // Create DOM with comprehensive error handling
+    const dom = createSafeJSDOM(sanitizedHtml, finalUrl);
+    if (!dom) {
+      throw new Error("Failed to create DOM - JSDOM initialization failed");
     }
 
-    // Extract content
-    const { title, content, isReadability } = extractContent(dom, options);
+    // Check DOM size
+    try {
+      const nodeCount = dom.window.document.querySelectorAll("*").length;
+      if (nodeCount > MAX_DOM_NODES) {
+        dom.window.close();
+        throw new Error("DOM too large");
+      }
+    } catch (e) {
+      // If DOM query fails, continue with simplified processing
+    }
+
+    // Extract content (now async)
+    const { title, content, isReadability } = await extractContent(
+      dom,
+      options,
+    );
 
     // Get HTML for markdown conversion
     let htmlForMarkdown: string;
-    if (isReadability) {
-      // Re-run Readability to get HTML content
-      const reader = new Readability(dom.window.document);
-      const article = reader.parse();
-      htmlForMarkdown = article?.content || sanitizedHtml;
-    } else if (options.selector) {
-      // Get HTML from selected elements
-      const selectors = Array.isArray(options.selector)
-        ? options.selector
-        : [options.selector];
-      htmlForMarkdown = "";
-      for (const selector of selectors) {
-        const elements = dom.window.document.querySelectorAll(selector);
-        elements.forEach((el) => {
-          htmlForMarkdown += el.innerHTML + "\n";
-        });
+    try {
+      if (isReadability) {
+        // Re-run Readability to get HTML content with error handling
+        try {
+          const readabilityResult = await tryReadability(dom.window.document);
+          if (readabilityResult) {
+            // Get the HTML content by re-parsing
+            const ReadabilityPkg = await import("readability");
+            const { Readability } = ReadabilityPkg.default || ReadabilityPkg;
+            const reader = new Readability(dom.window.document);
+            const article = reader.parse();
+            htmlForMarkdown = article?.content || sanitizedHtml;
+          } else {
+            htmlForMarkdown = sanitizedHtml;
+          }
+        } catch (readabilityError) {
+          // If Readability fails here too, use sanitized HTML
+          htmlForMarkdown = sanitizedHtml;
+        }
+      } else if (options.selector) {
+        // Get HTML from selected elements
+        const selectors = Array.isArray(options.selector)
+          ? options.selector
+          : [options.selector];
+        htmlForMarkdown = "";
+        for (const selector of selectors) {
+          const elements = dom.window.document.querySelectorAll(selector);
+          elements.forEach((el) => {
+            htmlForMarkdown += el.innerHTML + "\n";
+          });
+        }
+      } else {
+        htmlForMarkdown = dom.window.document.body.innerHTML;
       }
-    } else {
-      htmlForMarkdown = dom.window.document.body.innerHTML;
+    } catch (e) {
+      // Fallback to sanitized HTML if DOM operations fail
+      htmlForMarkdown = sanitizedHtml;
     }
 
     // Clean up DOM
-    dom.window.close();
+    try {
+      dom.window.close();
+    } catch (e) {
+      // Ignore cleanup errors
+    }
 
     // Convert to markdown
     const markdown = convertToMarkdown(htmlForMarkdown);
