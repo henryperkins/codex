@@ -119,6 +119,7 @@ const shellFunctionTool: FunctionTool = {
 const localShellTool: Tool = {
   //@ts-expect-error - waiting on sdk
   type: "local_shell",
+  name: "shell",
 };
 
 export class AgentLoop {
