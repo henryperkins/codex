@@ -12,7 +12,11 @@ import type {
 } from "../responses.js";
 
 import { applyPatchToolInstructions } from "./apply-patch.js";
-import { handleExecCommand } from "./handle-exec-command.js";
+import {
+  handleExecCommand,
+  alwaysApprovedCommands,
+} from "./handle-exec-command.js";
+import { scrapeFunctionTool, executeScrape } from "../../agent/tools/scrape.js";
 import { CLI_VERSION } from "../../version.js";
 import {
   getApiKey,
