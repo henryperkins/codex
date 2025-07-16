@@ -1,9 +1,11 @@
-import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  plugins: [react()],
+  // Minimal config without React plugin to avoid import errors
+  build: {
+    outDir: "dist",
+  },
   server: {
-    port: 5173,
+    port: 3000,
   },
 });

@@ -70,6 +70,23 @@ function patchForDeepResearchModels(client: OpenAI | AzureOpenAI) {
               ) {
                 return { ...tool, name: toolObj["type"] };
               }
+              // If tool doesn't have a name or has an empty name, use function.name as name
+              if (
+                (!("name" in toolObj) ||
+                  !toolObj["name"] ||
+                  (typeof toolObj["name"] === "string" &&
+                    toolObj["name"].trim() === "")) &&
+                "function" in toolObj &&
+                toolObj["function"] &&
+                typeof toolObj["function"] === "object" &&
+                "name" in toolObj["function"] &&
+                toolObj["function"]["name"]
+              ) {
+                return {
+                  ...tool,
+                  name: (toolObj["function"] as { name: string })["name"],
+                };
+              }
             }
             return tool;
           });

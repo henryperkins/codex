@@ -182,6 +182,14 @@ function generateId(prefix: string = "msg"): string {
   return `${prefix}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// Add new helper function
+function getProviderDisplayName(openai: OpenAI): string {
+  if ("isAzure" in openai && openai.isAzure) {
+    return "Azure OpenAI";
+  }
+  return "OpenAI";
+}
+
 // Function to convert ResponseInputItem to ChatCompletionMessageParam
 type ResponseInputItem = ResponseCreateInput["input"][number];
 
@@ -216,7 +224,9 @@ function convertInputItemToMessage(
       content: responseItem.output,
     };
   }
-  throw new Error(`Unsupported input item type: ${responseItem.type}`);
+  throw new Error(
+    `Unsupported input item type from ${getProviderDisplayName(openai)}: ${responseItem.type}`,
+  );
 }
 
 // Function to get full messages including history
@@ -229,7 +239,7 @@ function getFullMessages(
     const prev = conversationHistories.get(input.previous_response_id);
     if (!prev) {
       throw new Error(
-        `Previous response not found: ${input.previous_response_id}`,
+        `${getProviderDisplayName(openai)}: Previous response not found: ${input.previous_response_id}`,
       );
     }
     baseHistory = prev.messages;
@@ -276,6 +286,10 @@ function convertTools(
       }
 
       converted.push({
+        // Azure and some OpenAI endpoints require a top-level `name`
+        // in addition to the nested `function.name`. Including it
+        // avoids 400 errors like `"tools[x].name" is missing`.
+        name: tool.name,
         type: "function",
         function: {
           name: tool.name,
@@ -408,6 +422,48 @@ async function responsesCreateViaChatCompletions(
   // API on `AzureOpenAI`.  We therefore use a runtime feature-check to detect
   // availability instead of relying on `instanceof` or compile-time types.
 
+  // ---------------------------------------------------------------------
+  // Ensure every tool in the *original* input has a `name` so that calls
+  // made directly to the (preview) Responses API succeed.  The conversion
+  // logic below already handles this for chat-completions, but
+  // `maybeResponses.create(input)` receives the raw tools array.
+  // ---------------------------------------------------------------------
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  if (Array.isArray(input.tools)) {
+    // Narrow to a loose but explicit shape to satisfy TS without index-signature issues
+    type MutableTool = {
+      [key: string]: any;
+      type?: string;
+      name?: string;
+      function?: { name?: string };
+    };
+    for (const t of input.tools as Array<MutableTool>) {
+      const toolType = t["type"];
+      const toolName = t["name"];
+
+      if (toolType === "function") {
+        if (
+          !toolName ||
+          (typeof toolName === "string" && toolName.trim() === "")
+        ) {
+          const fnName = t["function"]?.name;
+          if (fnName && fnName.trim() !== "") {
+            t["name"] = fnName;
+          }
+        }
+      } else {
+        // Non-function tools: ensure a name exists (fallback to type)
+        if (
+          !toolName ||
+          (typeof toolName === "string" && toolName.trim() === "")
+        ) {
+          t["name"] = toolType ?? "tool";
+        }
+      }
+    }
+  }
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
   const maybeResponses = (
     openai as unknown as {
       responses?: { create: (p: ResponseCreateInput) => unknown };
@@ -449,11 +505,15 @@ async function nonStreamResponses(
   try {
     const chatResponse = completion;
     if (!("choices" in chatResponse) || chatResponse.choices.length === 0) {
-      throw new Error("No choices in chat completion response");
+      throw new Error(
+        `${getProviderDisplayName(openai)}: No choices in chat completion response`,
+      );
     }
     const assistantMessage = chatResponse.choices?.[0]?.message;
     if (!assistantMessage) {
-      throw new Error("No assistant message in chat completion response");
+      throw new Error(
+        `${getProviderDisplayName(openai)}: No assistant message in chat completion response`,
+      );
     }
 
     // Construct ResponseOutput

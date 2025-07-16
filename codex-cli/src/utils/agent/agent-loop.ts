@@ -1,7 +1,6 @@
 import type { ReviewDecision } from "./review.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { AppConfig } from "../config.js";
-import type { ResponseEvent } from "../responses.js";
 import type {
   ResponseFunctionToolCall,
   ResponseInputItem,
@@ -9,33 +8,25 @@ import type {
   ResponseCreateParams,
   FunctionTool,
   Tool,
-} from "openai/resources/responses/responses.mjs";
-import type { Reasoning } from "openai/resources.mjs";
+  Reasoning,
+} from "../responses.js";
 
+import { applyPatchToolInstructions } from "./apply-patch.js";
+import { handleExecCommand } from "./handle-exec-command.js";
 import { CLI_VERSION } from "../../version.js";
 import {
+  getApiKey,
+  getBaseUrl,
   OPENAI_TIMEOUT_MS,
+  AZURE_OPENAI_API_VERSION,
   OPENAI_ORGANIZATION,
   OPENAI_PROJECT,
-  getBaseUrl,
-  getApiKey,
-  AZURE_OPENAI_API_VERSION,
 } from "../config.js";
 import { log } from "../logger/log.js";
 import { parseToolCallArguments } from "../parsers.js";
+import { providers } from "../providers.js";
 import { responsesCreateViaChatCompletions } from "../responses.js";
-import {
-  ORIGIN,
-  getSessionId,
-  setCurrentModel,
-  setSessionId,
-} from "../session.js";
-import { applyPatchToolInstructions } from "./apply-patch.js";
-import {
-  handleExecCommand,
-  alwaysApprovedCommands,
-} from "./handle-exec-command.js";
-import { scrapeFunctionTool, executeScrape } from "../../agent/tools/scrape.js";
+import { getSessionId, setSessionId, setCurrentModel } from "../session.js";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -356,7 +347,7 @@ export class AgentLoop {
       ...(apiKey ? { apiKey } : {}),
       baseURL,
       defaultHeaders: {
-        originator: ORIGIN,
+        originator: "codex",
         version: CLI_VERSION,
         session_id: this.sessionId,
         ...(OPENAI_ORGANIZATION
@@ -374,7 +365,7 @@ export class AgentLoop {
         baseURL,
         apiVersion: AZURE_OPENAI_API_VERSION,
         defaultHeaders: {
-          originator: ORIGIN,
+          originator: "codex",
           version: CLI_VERSION,
           session_id: this.sessionId,
           ...(OPENAI_ORGANIZATION
@@ -397,6 +388,26 @@ export class AgentLoop {
       () => this.execAbortController?.abort(),
       { once: true },
     );
+  }
+
+  private getProviderDisplayName(): string {
+    const providersConfig = this.config?.providers ?? providers;
+    const providerInfo = providersConfig[this.provider.toLowerCase()];
+    return providerInfo?.name ?? this.provider;
+  }
+
+  private getProviderBillingInfo(): string {
+    const provider = this.provider.toLowerCase();
+    switch (provider) {
+      case "azure":
+        return "Check your Azure OpenAI resource quotas and billing at https://portal.azure.com";
+      case "openai":
+        return "Manage or purchase credits at https://platform.openai.com/account/billing";
+      case "openrouter":
+        return "Check your credits at https://openrouter.ai/account";
+      default:
+        return `Check your ${this.getProviderDisplayName()} account for quota and billing information`;
+    }
   }
 
   private async handleFunctionCall(
@@ -655,7 +666,7 @@ export class AgentLoop {
         throw new Error("AgentLoop has been terminated");
       }
       // Record when we start "thinking" so we can report accurate elapsed time.
-      const thinkingStart = Date.now();
+      // const thinkingStart = Date.now();
       // Bump generation so that any late events from previous runs can be
       // identified and dropped.
       const thisGeneration = ++this.generation;
@@ -685,7 +696,7 @@ export class AgentLoop {
       // forward the caller‑supplied `previousResponseId` so that the model sees the
       // full context.  When storage is disabled we *must not* send any ID because the
       // server no longer retains the referenced response.
-      let lastResponseId: string = this.disableResponseStorage
+      const lastResponseId: string = this.disableResponseStorage
         ? ""
         : previousResponseId;
 
@@ -880,7 +891,6 @@ export class AgentLoop {
           stageItem(item as ResponseItem);
         }
         // Send request to OpenAI with retry on timeout.
-        let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
         const MAX_RETRIES = 8;
@@ -919,7 +929,7 @@ export class AgentLoop {
             );
 
             // eslint-disable-next-line no-await-in-loop
-            stream = await responseCall({
+            await responseCall({
               model: this.model,
               instructions: mergedInstructions,
               input: turnInput,
@@ -1091,10 +1101,14 @@ export class AgentLoop {
                         `Status: ${status || "unknown"}`,
                         `Code: ${errCtx.code || "unknown"}`,
                         `Type: ${errCtx.type || "unknown"}`,
-                        `Message: ${errCtx.message || "unknown"}`,
+                        `Message: ${
+                          errCtx.message ||
+                          (errCtx.cause && errCtx.cause.message) ||
+                          "unknown"
+                        }`,
                       ].join(", ");
 
-                      return `⚠️  OpenAI rejected the request${
+                      return `⚠️  ${this.getProviderDisplayName()} rejected the request${
                         reqId ? ` (request ID: ${reqId})` : ""
                       }. Error details: ${errorDetails}. Please verify your settings and try again.`;
                     })(),
@@ -1104,295 +1118,27 @@ export class AgentLoop {
               this.onLoading(false);
               return;
             }
+
+            // Handle quota errors
+            if (
+              error instanceof Error &&
+              (error as { code?: string }).code === "insufficient_quota"
+            ) {
+              this.onItem({
+                id: `error-${Date.now()}`,
+                type: "message",
+                role: "system",
+                content: [
+                  {
+                    type: "input_text",
+                    text: `⚠️ Insufficient quota: ${error instanceof Error && error.message ? error.message.trim() : "No remaining quota."} ${this.getProviderBillingInfo()}.`,
+                  },
+                ],
+              });
+              this.onLoading(false);
+              return;
+            }
             throw error;
-          }
-        }
-
-        // If the user requested cancellation while we were awaiting the network
-        // request, abort immediately before we start handling the stream.
-        if (this.canceled || this.hardAbort.signal.aborted) {
-          // `stream` is defined; abort to avoid wasting tokens/server work
-          try {
-            (
-              stream as { controller?: { abort?: () => void } }
-            )?.controller?.abort?.();
-          } catch {
-            /* ignore */
-          }
-          this.onLoading(false);
-          return;
-        }
-
-        // Keep track of the active stream so it can be aborted on demand.
-        this.currentStream = stream;
-
-        // Guard against an undefined stream before iterating.
-        if (!stream) {
-          this.onLoading(false);
-          log("AgentLoop.run(): stream is undefined");
-          return;
-        }
-
-        const MAX_STREAM_RETRIES = 5;
-        let streamRetryAttempt = 0;
-
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          try {
-            let newTurnInput: Array<ResponseInputItem> = [];
-
-            // eslint-disable-next-line no-await-in-loop
-            for await (const event of stream as AsyncIterable<ResponseEvent>) {
-              log(`AgentLoop.run(): response event ${event.type}`);
-
-              // process and surface each item (no-op until we can depend on streaming events)
-              if (event.type === "response.output_item.done") {
-                const item = event.item;
-                // 1) if it's a reasoning item, annotate it
-                type ReasoningItem = { type?: string; duration_ms?: number };
-                const maybeReasoning = item as ReasoningItem;
-                if (maybeReasoning.type === "reasoning") {
-                  maybeReasoning.duration_ms = Date.now() - thinkingStart;
-                }
-                if (
-                  item.type === "function_call" ||
-                  item.type === "local_shell_call"
-                ) {
-                  // Track outstanding tool call so we can abort later if needed.
-                  // The item comes from the streaming response, therefore it has
-                  // either `id` (chat) or `call_id` (responses) – we normalise
-                  // by reading both.
-                  const callId =
-                    (item as { call_id?: string; id?: string }).call_id ??
-                    (item as { id?: string }).id;
-                  if (callId) {
-                    this.pendingAborts.add(callId);
-                  }
-                } else {
-                  stageItem(item as ResponseItem);
-                }
-              }
-
-              if (event.type === "response.completed") {
-                if (thisGeneration === this.generation && !this.canceled) {
-                  for (const item of event.response.output) {
-                    stageItem(item as ResponseItem);
-                  }
-                }
-                if (
-                  event.response.status === "completed" ||
-                  (event.response.status as unknown as string) ===
-                    "requires_action"
-                ) {
-                  // TODO: remove this once we can depend on streaming events
-                  newTurnInput = await this.processEventsWithoutStreaming(
-                    event.response.output,
-                    stageItem,
-                  );
-
-                  // When we do not use server‑side storage we maintain our
-                  // own transcript so that *future* turns still contain full
-                  // conversational context. However, whether we advance to
-                  // another loop iteration should depend solely on the
-                  // presence of *new* input items (i.e. items that were not
-                  // part of the previous request). Re‑sending the transcript
-                  // by itself would create an infinite request loop because
-                  // `turnInput.length` would never reach zero.
-
-                  if (this.disableResponseStorage) {
-                    // 1) Append the freshly emitted output to our local
-                    //    transcript (minus non‑message items the model does
-                    //    not need to see again).
-                    const cleaned = filterToApiMessages(
-                      event.response.output.map(stripInternalFields),
-                    );
-                    this.transcript.push(...cleaned);
-
-                    // 2) Determine the *delta* (newTurnInput) that must be
-                    //    sent in the next iteration. If there is none we can
-                    //    safely terminate the loop – the transcript alone
-                    //    does not constitute new information for the
-                    //    assistant to act upon.
-
-                    const delta = filterToApiMessages(
-                      newTurnInput.map(stripInternalFields),
-                    );
-
-                    if (delta.length === 0) {
-                      // No new input => end conversation.
-                      newTurnInput = [];
-                    } else {
-                      // Re‑send full transcript *plus* the new delta so the
-                      // stateless backend receives complete context.
-                      newTurnInput = [...this.transcript, ...delta];
-                      // The prefix ends at the current transcript length –
-                      // everything after this index is new for the next
-                      // iteration.
-                      transcriptPrefixLen = this.transcript.length;
-                    }
-                  }
-                }
-                lastResponseId = event.response.id;
-                this.onLastResponseId(event.response.id);
-              }
-            }
-
-            // Set after we have consumed all stream events in case the stream wasn't
-            // complete or we missed events for whatever reason. That way, we will set
-            // the next turn to an empty array to prevent an infinite loop.
-            // And don't update the turn input too early otherwise we won't have the
-            // current turn inputs available for retries.
-            turnInput = newTurnInput;
-
-            // Stream finished successfully – leave the retry loop.
-            break;
-          } catch (err: unknown) {
-            const isRateLimitError = (e: unknown): boolean => {
-              if (!e || typeof e !== "object") {
-                return false;
-              }
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const ex: any = e;
-              return (
-                ex.status === 429 ||
-                ex.code === "rate_limit_exceeded" ||
-                ex.type === "rate_limit_exceeded"
-              );
-            };
-
-            if (
-              isRateLimitError(err) &&
-              streamRetryAttempt < MAX_STREAM_RETRIES
-            ) {
-              streamRetryAttempt += 1;
-
-              // Exponential backoff: base wait * 2^(attempt-1), or use suggested retry time if provided.
-              let waitMs =
-                RATE_LIMIT_RETRY_WAIT_MS * 2 ** (streamRetryAttempt - 1);
-              // Parse suggested retry time from error message (e.g., "please try again in X seconds").
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const streamMsg = (err as any).message ?? "";
-              const m2 =
-                /(?:retry|try) again in ([\d.]+)\s*(?:s|seconds?)/i.exec(
-                  streamMsg,
-                );
-              if (m2 && m2[1]) {
-                const suggested = parseFloat(m2[1]) * 1000;
-                if (!Number.isNaN(suggested)) {
-                  waitMs = suggested;
-                }
-              }
-              log(
-                `OpenAI stream rate‑limited – retry ${streamRetryAttempt}/${MAX_STREAM_RETRIES} in ${waitMs} ms`,
-              );
-
-              // Give the server a breather before retrying.
-              // eslint-disable-next-line no-await-in-loop
-              await new Promise((res) => setTimeout(res, waitMs));
-
-              // Re‑create the stream with the *same* parameters.
-              let reasoning: Reasoning | undefined;
-              if (this.model.startsWith("o")) {
-                reasoning = { effort: "high" };
-                if (
-                  this.model === "o3" ||
-                  this.model === "o4-mini" ||
-                  this.model === "codex-mini-latest"
-                ) {
-                  reasoning.summary = "auto";
-                }
-              }
-
-              const mergedInstructions = [prefix, this.instructions]
-                .filter(Boolean)
-                .join("\n");
-
-              const responseCall =
-                !this.config.provider ||
-                this.config.provider?.toLowerCase() === "openai" ||
-                this.config.provider?.toLowerCase() === "azure"
-                  ? (params: ResponseCreateParams) =>
-                      this.oai.responses.create(params)
-                  : (params: ResponseCreateParams) =>
-                      responsesCreateViaChatCompletions(
-                        this.oai,
-                        params as ResponseCreateParams & { stream: true },
-                      );
-
-              log(
-                "agentLoop.run(): responseCall(1): turnInput: " +
-                  JSON.stringify(turnInput),
-              );
-              // eslint-disable-next-line no-await-in-loop
-              stream = await responseCall({
-                model: this.model,
-                instructions: mergedInstructions,
-                input: turnInput,
-                stream: true,
-                parallel_tool_calls: false,
-                reasoning,
-                ...(this.config.flexMode ? { service_tier: "flex" } : {}),
-                ...(this.disableResponseStorage
-                  ? { store: false }
-                  : {
-                      store: true,
-                      previous_response_id: lastResponseId || undefined,
-                    }),
-                tools: tools,
-                tool_choice: "auto",
-              });
-
-              this.currentStream = stream;
-              // Continue to outer while to consume new stream.
-              continue;
-            }
-
-            // Gracefully handle an abort triggered via `cancel()` so that the
-            // consumer does not see an unhandled exception.
-            if (err instanceof Error && err.name === "AbortError") {
-              if (!this.canceled) {
-                // It was aborted for some other reason; surface the error.
-                throw err;
-              }
-              this.onLoading(false);
-              return;
-            }
-            // Suppress internal stack on JSON parse failures
-            if (err instanceof SyntaxError) {
-              this.onItem({
-                id: `error-${Date.now()}`,
-                type: "message",
-                role: "system",
-                content: [
-                  {
-                    type: "input_text",
-                    text: "⚠️ Failed to parse streaming response (invalid JSON). Please `/clear` to reset.",
-                  },
-                ],
-              });
-              this.onLoading(false);
-              return;
-            }
-            // Handle OpenAI API quota errors
-            if (
-              err instanceof Error &&
-              (err as { code?: string }).code === "insufficient_quota"
-            ) {
-              this.onItem({
-                id: `error-${Date.now()}`,
-                type: "message",
-                role: "system",
-                content: [
-                  {
-                    type: "input_text",
-                    text: `\u26a0 Insufficient quota: ${err instanceof Error && err.message ? err.message.trim() : "No remaining quota."} Manage or purchase credits at https://platform.openai.com/account/billing.`,
-                  },
-                ],
-              });
-              this.onLoading(false);
-              return;
-            }
-            throw err;
           } finally {
             this.currentStream = null;
           }
@@ -1585,8 +1331,7 @@ export class AgentLoop {
 
       if (isNetworkOrServerError) {
         try {
-          const msgText =
-            "⚠️  Network error while contacting OpenAI. Please check your connection and try again.";
+          const msgText = `⚠️  Network error while contacting ${this.getProviderDisplayName()}. Please check your connection and try again.`;
           this.onItem({
             id: `error-${Date.now()}`,
             type: "message",
@@ -1651,7 +1396,7 @@ export class AgentLoop {
             }`,
           ].join(", ");
 
-          const msgText = `⚠️  OpenAI rejected the request${
+          const msgText = `⚠️  ${this.getProviderDisplayName()} rejected the request${
             reqId ? ` (request ID: ${reqId})` : ""
           }. Error details: ${errorDetails}. Please verify your settings and try again.`;
 
@@ -1731,54 +1476,7 @@ if (spawnSync("rg", ["--version"], { stdio: "ignore" }).status === 0) {
   );
 }
 const dynamicPrefix = dynamicLines.join("\n");
-const prefix = `You are operating as and within the Codex CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
-
-You can:
-- Receive user prompts, project context, and files.
-- Stream responses and emit function calls (e.g., shell commands, code edits).
-- Apply patches, run commands, and manage user approvals based on policy.
-- Work inside a sandboxed, git-backed workspace with rollback support.
-- Log telemetry so sessions can be replayed or inspected later.
-- More details on your functionality are available at \`codex --help\`
-
-The Codex CLI is open-sourced. Don't confuse yourself with the old Codex language model built by OpenAI many moons ago (this is understandably top of mind for you!). Within this context, Codex refers to the open-source agentic coding interface.
-
-You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
-
-Please resolve the user's task by editing and testing the code files in your current code execution session. You are a deployed coding agent. Your session allows for you to modify and run code. The repo(s) are already cloned in your working directory, and you must fully solve the problem for your answer to be considered correct.
-
-You MUST adhere to the following criteria when executing the task:
-- Working on the repo(s) in the current environment is allowed, even if they are proprietary.
-- Analyzing code for vulnerabilities is allowed.
-- Showing user code and tool call details is allowed.
-- User instructions may overwrite the *CODING GUIDELINES* section in this developer message.
-- Use \`apply_patch\` to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
-- If completing the user's task requires writing or modifying files:
-    - Your code and final answer should follow these *CODING GUIDELINES*:
-        - Fix the problem at the root cause rather than applying surface-level patches, when possible.
-        - Avoid unneeded complexity in your solution.
-            - Ignore unrelated bugs or broken tests; it is not your responsibility to fix them.
-        - Update documentation as necessary.
-        - Keep changes consistent with the style of the existing codebase. Changes should be minimal and focused on the task.
-            - Use \`git log\` and \`git blame\` to search the history of the codebase if additional context is required; internet access is disabled.
-        - NEVER add copyright or license headers unless specifically requested.
-        - You do not need to \`git commit\` your changes; this will be done automatically for you.
-        - If there is a .pre-commit-config.yaml, use \`pre-commit run --files ...\` to check that your changes pass the pre-commit checks. However, do not fix pre-existing errors on lines you didn't touch.
-            - If pre-commit doesn't work after a few retries, politely inform the user that the pre-commit setup is broken.
-        - Once you finish coding, you must
-            - Remove all inline comments you added as much as possible, even if they look normal. Check using \`git diff\`. Inline comments must be generally avoided, unless active maintainers of the repo, after long careful study of the code and the issue, will still misinterpret the code without the comments.
-            - Check if you accidentally add copyright or license headers. If so, remove them.
-            - Try to run pre-commit if it is available.
-- Testing policy:
-    - Do NOT add or run unit tests, integration tests, or any other form of automated testing unless the user's explicit instructions request it in the current prompt. Testing is disallowed by default.
-
-- If completing the user's task DOES NOT require writing or modifying files (e.g., the user asks a question about the code base):
-    - Respond in a friendly tone as a remote teammate, who is knowledgeable, capable and eager to help with coding.
-- When your task involves writing or modifying files:
-    - Do NOT tell the user to "save the file" or "copy the code into a file" if you already created or modified the file using \`apply_patch\`. Instead, reference the file as already saved.
-    - Do NOT show the full contents of large files you have already written, unless the user explicitly asks for them.
-
-${dynamicPrefix}`;
+const prefix = `You are operating as and within the Codex CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.\n\nYou can:\n- Receive user prompts, project context, and files.\n- Stream responses and emit function calls (e.g., shell commands, code edits).\n- Apply patches, run commands, and manage user approvals based on policy.\n- Work inside a sandboxed, git-backed workspace with rollback support.\n- Log telemetry so sessions can be replayed or inspected later.\n- More details on your functionality are available at \`codex --help\`\n\nThe Codex CLI is open-sourced. Don't confuse yourself with the old Codex language model built by OpenAI many moons ago (this is understandably top of mind for you!). Within this context, Codex refers to the open-source agentic coding interface.\n\nYou are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.\n\nPlease resolve the user's task by editing and testing the code files in your current code execution session. You are a deployed coding agent. Your session allows for you to modify and run code. The repo(s) are already cloned in your working directory, and you must fully solve the problem for your answer to be considered correct.\n\nYou MUST adhere to the following criteria when executing the task:\n- Working on the repo(s) in the current environment is allowed, even if they are proprietary.\n- Analyzing code for vulnerabilities is allowed.\n- Showing user code and tool call details is allowed.\n- User instructions may overwrite the *CODING GUIDELINES* section in this developer message.\n- Use \`apply_patch\` to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}\n- If completing the user's task requires writing or modifying files:\n    - Your code and final answer should follow these *CODING GUIDELINES*:\n        - Fix the problem at the root cause rather than applying surface-level patches, when possible.\n        - Avoid unneeded complexity in your solution.\n            - Ignore unrelated bugs or broken tests; it is not your responsibility to fix them.\n        - Update documentation as necessary.\n        - Keep changes consistent with the style of the existing codebase. Changes should be minimal and focused on the task.\n            - Use \`git log\` and \`git blame\` to search the history of the codebase if additional context is required; internet access is disabled.\n        - NEVER add copyright or license headers unless specifically requested.\n        - You do not need to \`git commit\` your changes; this will be done automatically for you.\n        - If there is a .pre-commit-config.yaml, use \`pre-commit run --files ...\` to check that your changes pass the pre-commit checks. However, do not fix pre-existing errors on lines you didn't touch.\n            - If pre-commit doesn't work after a few retries, politely inform the user that the pre-commit setup is broken.\n        - Once you finish coding, you must\n            - Remove all inline comments you added as much as possible, even if they look normal. Check using \`git diff\`. Inline comments must be generally avoided, unless active maintainers of the repo, after long careful study of the code and the issue, will still misinterpret the code without the comments.\n            - Check if you accidentally add copyright or license headers. If so, remove them.\n            - Try to run pre-commit if it is available.\n- Testing policy:\n    - Do NOT add or run unit tests, integration tests, or any other form of automated testing unless the user's explicit instructions request it in the current prompt. Testing is disallowed by default.\n\n- If completing the user's task DOES NOT require writing or modifying files (e.g., the user asks a question about the code base):\n    - Respond in a friendly tone as a remote teammate, who is knowledgeable, capable and eager to help with coding.\n- When your task involves writing or modifying files:\n    - Do NOT tell the user to "save the file" or "copy the code into a file" if you already created or modified the file using \`apply_patch\`. Instead, reference the file as already saved.\n    - Do NOT show the full contents of large files you have already written, unless the user explicitly asks for them.\n\n${dynamicPrefix}`;
 
 function filterToApiMessages(
   items: Array<ResponseInputItem>,
