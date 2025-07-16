@@ -23,7 +23,11 @@ import fs from "fs/promises";
 // for a given class of command we will genuinely stop prompting them for
 // subsequent, equivalent invocations during the same CLI session.
 // ---------------------------------------------------------------------------
-const alwaysApprovedCommands = new Set<string>();
+// Exported so other agent utilities (e.g. the scrape-tool approval logic in
+// `agent-loop.ts`) can reference the same session-level state.  Sharing the
+// instance avoids prompting the user multiple times for equivalent commands
+// across different tools.
+export const alwaysApprovedCommands = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // Helper: Given the argv-style representation of a command, return a stable

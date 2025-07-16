@@ -70,6 +70,7 @@ const cli = meow(
   Usage
     $ codex [options] <prompt>
     $ codex completion <bash|zsh|fish>
+    $ codex scrape <url> [-o file.json]
 
   Options
     --version                       Print version and exit
@@ -117,6 +118,7 @@ const cli = meow(
     $ codex "Write and run a python program that prints ASCII art"
     $ codex -q "fix build issues"
     $ codex completion bash
+    $ codex scrape https://example.com -o content.json
 `,
   {
     importMeta: import.meta,
@@ -206,6 +208,22 @@ const cli = meow(
           "Disable server-side response storage (sends full conversation context with every request)",
       },
 
+      // Scrape subcommand flags
+      o: { type: "string", description: "Output file for scrape command" },
+      output: { type: "string", description: "Output file for scrape command" },
+      htmlExcerpt: {
+        type: "boolean",
+        description: "Include HTML excerpt in scrape output",
+      },
+      truncate: {
+        type: "string",
+        description: "Maximum tokens for scraped content",
+      },
+      noReadability: {
+        type: "boolean",
+        description: "Disable Readability extraction",
+      },
+
       // Experimental mode where whole directory is loaded in context and model is requested
       // to make code edits in a single pass.
       fullContext: {
@@ -254,6 +272,82 @@ complete -c codex -a '(__fish_complete_path)' -d 'file path'`,
   process.exit(0);
 }
 
+// Handle 'scrape' subcommand
+if (cli.input[0] === "scrape") {
+  const { scrapeWebpage } = await import("./utils/web-scraper.js");
+  const scrapeUrl = cli.input[1];
+
+  if (!scrapeUrl) {
+    // eslint-disable-next-line no-console
+    console.error("Usage: codex scrape <url> [-o file.json]");
+    process.exit(1);
+  }
+
+  const outputPath = cli.flags.o || cli.flags.output;
+  const htmlExcerpt = cli.flags.htmlExcerpt;
+  const truncateTokens = cli.flags.truncate
+    ? parseInt(cli.flags.truncate as string)
+    : undefined;
+  const noReadability = cli.flags.noReadability;
+
+  // Determine which model to pass to the scraper. We cannot rely on the global
+  // `model` constant that is declared further below in the file because this
+  // `scrape` branch executes *before* that declaration is evaluated. Attempting
+  // to access it would therefore throw a run-time `ReferenceError` due to the
+  // temporal dead-zone of `const`/`let` bindings.
+  //
+  // Instead we resolve the value locally, mirroring the logic used for the
+  // global constant: prefer an explicit `--model` flag over whatever is stored
+  // in the user's config file, and fall back to a sensible default when
+  // neither is available.
+  let selectedModel = (cli.flags.model as string | undefined) ?? undefined;
+  if (!selectedModel) {
+    try {
+      const cfg = loadConfig(undefined, undefined, {
+        cwd: process.cwd(),
+        disableProjectDoc: Boolean(cli.flags.noProjectDoc),
+        projectDocPath: cli.flags.projectDoc,
+        isFullContext: false,
+      });
+      selectedModel = cfg.model;
+    } catch {
+      /* ignore errors, fall back to default below */
+    }
+  }
+  if (!selectedModel) {
+    selectedModel = "gpt-4";
+  }
+
+  try {
+    const result = await scrapeWebpage({
+      url: scrapeUrl,
+      model: selectedModel,
+      include_html_excerpt: htmlExcerpt,
+      truncate_tokens: truncateTokens,
+      no_readability: noReadability,
+    });
+
+    const output = JSON.stringify(result, null, 2);
+
+    if (outputPath) {
+      fs.writeFileSync(outputPath as string, output);
+      // eslint-disable-next-line no-console
+      console.log(`Scraped content saved to: ${outputPath}`);
+    } else {
+      // eslint-disable-next-line no-console
+      console.log(output);
+    }
+
+    process.exit(result.error ? 1 : 0);
+  } catch (error: unknown) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    // eslint-disable-next-line no-console
+    console.error(`Error scraping webpage: ${errorMessage}`);
+    process.exit(1);
+  }
+}
+
 // For --help, show help and exit.
 if (cli.flags.help) {
   cli.showHelp();
@@ -263,7 +357,7 @@ if (cli.flags.help) {
 if (cli.flags.config) {
   try {
     loadConfig(); // Ensures the file is created if it doesn't already exit.
-  } catch {
+  } catch (error: unknown) {
     // ignore errors
   }
 

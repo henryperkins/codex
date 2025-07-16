@@ -31,7 +31,11 @@ import {
   setSessionId,
 } from "../session.js";
 import { applyPatchToolInstructions } from "./apply-patch.js";
-import { handleExecCommand } from "./handle-exec-command.js";
+import {
+  handleExecCommand,
+  alwaysApprovedCommands,
+} from "./handle-exec-command.js";
+import { scrapeFunctionTool, executeScrape } from "../../agent/tools/scrape.js";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -500,6 +504,51 @@ export class AgentLoop {
       if (additionalItemsFromExec) {
         additionalItems.push(...additionalItemsFromExec);
       }
+    } else if (name === "scrape") {
+      // Scrape tool always requires user confirmation unless in full-auto mode
+      if (this.approvalPolicy !== "full-auto") {
+        // Check if user has already approved scraping for this domain in this session
+        const commandKey = `scrape:${new URL(args.url).hostname}`;
+        const scrapeCommand = ["scrape", args.url];
+
+        if (!alwaysApprovedCommands.has(commandKey)) {
+          // Request user confirmation
+          const confirmation = await this.getCommandConfirmation(
+            scrapeCommand,
+            undefined,
+          );
+
+          if (confirmation.review === ReviewDecision.NO_STOP) {
+            outputItem.output = JSON.stringify({
+              error: "User denied webpage scraping",
+            });
+            return [outputItem, ...additionalItems];
+          }
+
+          if (confirmation.review === ReviewDecision.NO_CONTINUE) {
+            outputItem.output = JSON.stringify({
+              error:
+                "User denied webpage scraping, continuing with other tasks",
+            });
+            return [outputItem, ...additionalItems];
+          }
+
+          if (confirmation.review === ReviewDecision.YES_ALWAYS) {
+            alwaysApprovedCommands.add(commandKey);
+          }
+        }
+      }
+
+      try {
+        const result = await executeScrape(args);
+        outputItem.output = JSON.stringify({ output: result });
+      } catch (error: unknown) {
+        const errorMessage =
+          error instanceof Error ? error.message : "Failed to scrape webpage";
+        outputItem.output = JSON.stringify({
+          error: errorMessage,
+        });
+      }
     }
 
     return [outputItem, ...additionalItems];
@@ -672,7 +721,7 @@ export class AgentLoop {
       // `disableResponseStorage === true`.
       let transcriptPrefixLen = 0;
 
-      let tools: Array<Tool> = [shellFunctionTool];
+      let tools: Array<Tool> = [shellFunctionTool, scrapeFunctionTool];
       if (this.model.startsWith("codex")) {
         tools = [localShellTool];
       }
