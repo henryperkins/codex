@@ -4,7 +4,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::panic;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -16,11 +18,13 @@ use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_apply_patch::maybe_parse_apply_patch_verified;
 use codex_login::CodexAuth;
-use futures::prelude::*;
+use futures::future::join_all;
+use futures::stream::StreamExt;
 use mcp_types::CallToolResult;
 use serde::Serialize;
 use serde_json;
 use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tracing::debug;
@@ -238,6 +242,10 @@ pub(crate) struct Session {
     codex_linux_sandbox_exe: Option<PathBuf>,
     user_shell: shell::Shell,
     show_raw_agent_reasoning: bool,
+
+    // Per-turn cancellation tokens and concurrency control
+    turn_cancels: Mutex<HashMap<String, Arc<Notify>>>,
+    tool_parallel_sema: Arc<Semaphore>,
 }
 
 impl Session {
@@ -245,6 +253,32 @@ impl Session {
         path.as_ref()
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
+    }
+
+    pub fn register_turn_cancel(&self, sub_id: &str) -> Arc<Notify> {
+        let mut map = self.turn_cancels.lock().unwrap();
+        map.entry(sub_id.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    pub fn get_turn_cancel(&self, sub_id: &str) -> Arc<Notify> {
+        self.turn_cancels
+            .lock()
+            .unwrap()
+            .get(sub_id)
+            .cloned()
+            .unwrap_or_else(|| self.ctrl_c.clone())
+    }
+
+    pub fn cancel_turn(&self, sub_id: &str) {
+        let notify = {
+            let mut map = self.turn_cancels.lock().unwrap();
+            map.remove(sub_id)
+        };
+        if let Some(n) = notify {
+            n.notify_waiters();
+        }
     }
 }
 
@@ -296,7 +330,7 @@ impl Session {
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
-                call_id,
+                call_id: call_id.clone(),
                 command,
                 cwd,
                 reason,
@@ -305,7 +339,7 @@ impl Session {
         let _ = self.tx_event.send(event).await;
         {
             let mut state = self.state.lock().unwrap();
-            state.pending_approvals.insert(sub_id, tx_approve);
+            state.pending_approvals.insert(call_id, tx_approve);
         }
         rx_approve
     }
@@ -322,7 +356,7 @@ impl Session {
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
-                call_id,
+                call_id: call_id.clone(),
                 changes: convert_apply_patch_to_protocol(action),
                 reason,
                 grant_root,
@@ -331,14 +365,14 @@ impl Session {
         let _ = self.tx_event.send(event).await;
         {
             let mut state = self.state.lock().unwrap();
-            state.pending_approvals.insert(sub_id, tx_approve);
+            state.pending_approvals.insert(call_id, tx_approve);
         }
         rx_approve
     }
 
-    pub fn notify_approval(&self, sub_id: &str, decision: ReviewDecision) {
+    pub fn notify_approval(&self, call_id: &str, decision: ReviewDecision) {
         let mut state = self.state.lock().unwrap();
-        if let Some(tx_approve) = state.pending_approvals.remove(sub_id) {
+        if let Some(tx_approve) = state.pending_approvals.remove(call_id) {
             tx_approve.send(decision).ok();
         }
     }
@@ -657,6 +691,7 @@ pub(crate) struct AgentTask {
 
 impl AgentTask {
     fn spawn(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) -> Self {
+        sess.register_turn_cancel(&sub_id);
         let handle =
             tokio::spawn(run_task(Arc::clone(&sess), sub_id.clone(), input)).abort_handle();
         Self {
@@ -671,6 +706,7 @@ impl AgentTask {
         input: Vec<InputItem>,
         compact_instructions: String,
     ) -> Self {
+        sess.register_turn_cancel(&sub_id);
         let handle = tokio::spawn(run_compact_task(
             Arc::clone(&sess),
             sub_id.clone(),
@@ -687,6 +723,8 @@ impl AgentTask {
 
     fn abort(self) {
         if !self.handle.is_finished() {
+            // Signal turn cancellation first so waiters unblock promptly
+            self.sess.cancel_turn(&self.sub_id);
             self.handle.abort();
             let event = Event {
                 id: self.sub_id,
@@ -840,19 +878,26 @@ async fn submission_loop(
 
                 // Error messages to dispatch after SessionConfigured is sent.
                 let mut mcp_connection_errors = Vec::<Event>::new();
-                let (mcp_connection_manager, failed_clients) =
-                    match McpConnectionManager::new(config.mcp_servers.clone()).await {
-                        Ok((mgr, failures)) => (mgr, failures),
-                        Err(e) => {
-                            let message = format!("Failed to create MCP connection manager: {e:#}");
-                            error!("{message}");
-                            mcp_connection_errors.push(Event {
-                                id: sub.id.clone(),
-                                msg: EventMsg::Error(ErrorEvent { message }),
-                            });
-                            (McpConnectionManager::default(), Default::default())
-                        }
-                    };
+                let (mcp_connection_manager, failed_clients) = match McpConnectionManager::new(
+                    config.mcp_servers.clone(),
+                    config.mcp_per_server_limit,
+                )
+                .await
+                {
+                    Ok((mgr, failures)) => (mgr, failures),
+                    Err(e) => {
+                        let message = format!("Failed to create MCP connection manager: {e:#}");
+                        error!("{message}");
+                        mcp_connection_errors.push(Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::Error(ErrorEvent { message }),
+                        });
+                        // Return an empty manager in case of error
+                        McpConnectionManager::new(HashMap::new(), config.mcp_per_server_limit)
+                            .await
+                            .unwrap()
+                    }
+                };
 
                 // Surface individual client start-up failures to the user.
                 if !failed_clients.is_empty() {
@@ -892,6 +937,8 @@ async fn submission_loop(
                     disable_response_storage,
                     user_shell: default_shell,
                     show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+                    turn_cancels: Mutex::new(HashMap::new()),
+                    tool_parallel_sema: Arc::new(Semaphore::new(config.tool_parallel_limit)),
                 }));
 
                 // Patch restored state into the newly created session.
@@ -1183,13 +1230,13 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
                                     is_error,
                                     structured_content: _,
                                 }) => match serde_json::to_string(content) {
-                                    Ok(content) => (content, *is_error),
+                                    Ok(content) => (content, is_error.map(|e| !e)),
                                     Err(e) => {
                                         warn!("Failed to serialize MCP tool call output: {e}");
-                                        (e.to_string(), Some(true))
+                                        (e.to_string(), Some(false))
                                     }
                                 },
-                                Err(e) => (e.clone(), Some(true)),
+                                Err(e) => (e.clone(), Some(false)),
                             };
                             items_to_record_in_conversation_history.push(
                                 ResponseItem::FunctionCallOutput {
@@ -1257,6 +1304,8 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
         }
     }
     sess.remove_task(&sub_id);
+    // Clean up the cancellation token to avoid memory growth
+    sess.cancel_turn(&sub_id);
     let event = Event {
         id: sub_id,
         msg: EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }),
@@ -1275,17 +1324,31 @@ async fn run_turn(
         Some(sess.mcp_connection_manager.list_all_tools()),
     );
 
+    // When parallel tool calls are enabled, augment the system instructions with concise guidance
+    // so the model knows how and when to emit multiple tool calls in a single turn.
+    let base_instructions_override = if sess.client.get_config().parallel_tool_calls {
+        let guidance = "Parallel tool calls: You may emit multiple tool calls in a single response when tasks are independent and can execute concurrently. Avoid parallelizing operations with ordering dependencies (e.g., create then write). Ensure each tool call includes complete, valid JSON arguments.";
+        match &sess.base_instructions {
+            Some(b) => Some(format!("{b}\n\n{guidance}")),
+            None => Some(guidance.to_string()),
+        }
+    } else {
+        sess.base_instructions.clone()
+    };
+
     let prompt = Prompt {
         input,
         user_instructions: sess.user_instructions.clone(),
         store: !sess.disable_response_storage,
         tools,
-        base_instructions_override: sess.base_instructions.clone(),
+        base_instructions_override,
         environment_context: Some(EnvironmentContext {
             cwd: sess.cwd.clone(),
             approval_policy: sess.approval_policy,
             sandbox_policy: sess.sandbox_policy.clone(),
         }),
+        // Be explicit so providers/models reliably know whether they may batch tool calls.
+        parallel_tool_calls: Some(sess.client.get_config().parallel_tool_calls),
     };
 
     let mut retries = 0;
@@ -1335,6 +1398,402 @@ async fn run_turn(
 struct ProcessedResponseItem {
     item: ResponseItem,
     response: Option<ResponseInputItem>,
+}
+
+/// Run a batch of tool calls in parallel without spawning:
+/// - Non-apply_patch exec + MCP calls run concurrently bounded by Session.tool_parallel_sema
+/// - apply_patch calls are executed serially using the shared `main_turn_diff_tracker`
+///   Results are merged and sorted by original order to preserve stable ordering.
+async fn resolve_tool_calls_parallel(
+    sess: &Session,
+    sub_id: &str,
+    calls: Vec<ResponseItem>,
+    main_turn_diff_tracker: &mut TurnDiffTracker,
+) -> Vec<ProcessedResponseItem> {
+    // Identify and index all tool-call items in their original order.
+    #[derive(Clone)]
+    struct ExecCall {
+        idx: usize,
+        item: ResponseItem,
+        params: ExecParams,
+        call_id: String,
+        is_apply_patch: bool,
+    }
+    #[derive(Clone)]
+    enum PendingCall {
+        Exec(ExecCall),
+        Mcp {
+            idx: usize,
+            item: ResponseItem,
+            call_id: String,
+            server: String,
+            tool: String,
+            arguments: String,
+        },
+        UpdatePlan {
+            idx: usize,
+            item: ResponseItem,
+            call_id: String,
+            arguments: String,
+            sub_id: String,
+        },
+        Direct {
+            idx: usize,
+            item: ResponseItem,
+            response: ResponseInputItem,
+        },
+        Unsupported {
+            idx: usize,
+            item: ResponseItem,
+            call_id: String,
+            name: String,
+        },
+    }
+
+    let mut pending: Vec<PendingCall> = Vec::new();
+
+    for (idx, item) in calls.into_iter().enumerate() {
+        match item.clone() {
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                if name == "container.exec" || name == "shell" {
+                    match parse_container_exec_arguments(arguments.clone(), sess, &call_id) {
+                        Ok(params) => {
+                            let is_apply_patch = matches!(
+                                maybe_parse_apply_patch_verified(&params.command, &params.cwd),
+                                MaybeApplyPatchVerified::Body(_)
+                            );
+                            pending.push(PendingCall::Exec(ExecCall {
+                                idx,
+                                item,
+                                params,
+                                call_id: call_id.clone(),
+                                is_apply_patch,
+                            }));
+                        }
+                        Err(output) => {
+                            pending.push(PendingCall::Direct {
+                                idx,
+                                item,
+                                response: *output,
+                            });
+                        }
+                    }
+                } else if let Some((server, tool)) =
+                    sess.mcp_connection_manager.parse_tool_name(&name)
+                {
+                    pending.push(PendingCall::Mcp {
+                        idx,
+                        item,
+                        call_id: call_id.clone(),
+                        server,
+                        tool,
+                        arguments: arguments.clone(),
+                    });
+                } else if name == "update_plan" {
+                    // Handle update_plan asynchronously with other tools
+                    pending.push(PendingCall::UpdatePlan {
+                        idx,
+                        item,
+                        call_id: call_id.clone(),
+                        arguments: arguments.clone(),
+                        sub_id: sub_id.to_string(),
+                    });
+                } else {
+                    pending.push(PendingCall::Unsupported {
+                        idx,
+                        item,
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            ResponseItem::LocalShellCall {
+                id,
+                call_id,
+                status: _,
+                action,
+            } => {
+                let LocalShellAction::Exec(action) = action;
+                let params = ShellToolCallParams {
+                    command: action.command.clone(),
+                    workdir: action.working_directory.clone(),
+                    timeout_ms: action.timeout_ms,
+                    with_escalated_permissions: None,
+                    justification: None,
+                };
+                let effective_call_id = call_id.clone().or_else(|| id.clone()).unwrap_or_default();
+                let params = to_exec_params(params, sess);
+                let is_apply_patch = matches!(
+                    maybe_parse_apply_patch_verified(&params.command, &params.cwd),
+                    MaybeApplyPatchVerified::Body(_)
+                );
+                pending.push(PendingCall::Exec(ExecCall {
+                    idx,
+                    item,
+                    params,
+                    call_id: effective_call_id,
+                    is_apply_patch,
+                }));
+            }
+            _ => {
+                // Non-tool items are handled outside this helper.
+            }
+        }
+    }
+
+    info!(
+        "parallel tool batch: pending_calls={} session_available_permits={}",
+        pending.len(),
+        sess.tool_parallel_sema.available_permits()
+    );
+
+    // Notify about parallel batch starting if we have multiple tools
+    if pending.len() > 1 {
+        sess.notify_background_event(
+            sub_id,
+            format!(
+                "Starting parallel execution of {} tool calls",
+                pending.len()
+            ),
+        )
+        .await;
+    }
+
+    // Split serial (apply_patch) from parallelizable calls.
+    let mut serial_exec = Vec::<ExecCall>::new();
+    let mut parallel_futs = Vec::<
+        Pin<Box<dyn futures::Future<Output = (usize, ResponseItem, ResponseInputItem)> + Send>>,
+    >::new();
+    
+    // Clone pending for use in timeout handler
+    let pending_for_timeout = pending.clone();
+
+    for p in pending {
+        match p {
+            PendingCall::Exec(ec) if ec.is_apply_patch => {
+                serial_exec.push(ec);
+            }
+            PendingCall::Exec(ExecCall {
+                idx,
+                item,
+                params,
+                call_id,
+                ..
+            }) => {
+                let sem = sess.tool_parallel_sema.clone();
+                let sess_ref = sess;
+                let sub_id_s = sub_id.to_string();
+                parallel_futs.push(Box::pin(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let response = ResponseInputItem::FunctionCallOutput {
+                                call_id,
+                                output: FunctionCallOutputPayload {
+                                    content: "internal error: semaphore closed".to_string(),
+                                    success: Some(false),
+                                },
+                            };
+                            return (idx, item, response);
+                        }
+                    };
+                    let mut tracker = TurnDiffTracker::new();
+                    let response = handle_container_exec_with_params(
+                        params,
+                        sess_ref,
+                        &mut tracker,
+                        sub_id_s,
+                        call_id,
+                    )
+                    .await;
+                    (idx, item, response)
+                }));
+            }
+            PendingCall::Mcp {
+                idx,
+                item,
+                call_id,
+                server,
+                tool,
+                arguments,
+            } => {
+                let sem = sess.tool_parallel_sema.clone();
+                let sess_ref = sess;
+                let sub_id_s = sub_id.to_string();
+                parallel_futs.push(Box::pin(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let response = ResponseInputItem::FunctionCallOutput {
+                                call_id,
+                                output: FunctionCallOutputPayload {
+                                    content: "internal error: semaphore closed".to_string(),
+                                    success: Some(false),
+                                },
+                            };
+                            return (idx, item, response);
+                        }
+                    };
+                    let timeout = Some(Duration::from_millis(
+                        sess_ref.client.get_config().mcp_tool_timeout_ms,
+                    ));
+                    let response = handle_mcp_tool_call(
+                        sess_ref, &sub_id_s, call_id, server, tool, arguments, timeout,
+                    )
+                    .await;
+                    (idx, item, response)
+                }));
+            }
+            PendingCall::UpdatePlan {
+                idx,
+                item,
+                call_id,
+                arguments,
+                sub_id,
+            } => {
+                let sem = sess.tool_parallel_sema.clone();
+                let sess_ref = sess;
+                parallel_futs.push(Box::pin(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let response = ResponseInputItem::FunctionCallOutput {
+                                call_id,
+                                output: FunctionCallOutputPayload {
+                                    content: "internal error: semaphore closed".to_string(),
+                                    success: Some(false),
+                                },
+                            };
+                            return (idx, item, response);
+                        }
+                    };
+                    let response = handle_update_plan(sess_ref, arguments, sub_id, call_id).await;
+                    (idx, item, response)
+                }));
+            }
+            PendingCall::Direct {
+                idx,
+                item,
+                response,
+            } => {
+                parallel_futs.push(Box::pin(async move { (idx, item, response) }));
+            }
+            PendingCall::Unsupported {
+                idx,
+                item,
+                call_id,
+                name,
+            } => {
+                let response = ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("unsupported call: {name}"),
+                        success: None,
+                    },
+                };
+                parallel_futs.push(Box::pin(async move { (idx, item, response) }));
+            }
+        }
+    }
+
+    // Drive all futures with a batch-level timeout; concurrency is enforced by the session semaphore.
+    let batch_timeout = Duration::from_millis(sess.client.get_config().tool_batch_timeout_ms);
+    let mut results_indexed =
+        match tokio::time::timeout(batch_timeout, join_all(parallel_futs)).await {
+            Ok(results) => results,
+            Err(_) => {
+                error!("Parallel tool batch timed out after {:?}", batch_timeout);
+                // Synthesize failure outputs for all pending calls to maintain the invariant
+                // that every tool_call must receive a tool_call_output
+                pending_for_timeout
+                    .iter()
+                    .map(|pending_call| {
+                        let (idx, item, response) = match pending_call {
+                            PendingCall::Exec(ExecCall {
+                                idx, item, call_id, ..
+                            })
+                            | PendingCall::Mcp {
+                                idx, item, call_id, ..
+                            }
+                            | PendingCall::UpdatePlan {
+                                idx, item, call_id, ..
+                            } => {
+                                let response = ResponseInputItem::FunctionCallOutput {
+                                    call_id: call_id.clone(),
+                                    output: FunctionCallOutputPayload {
+                                        content: format!("Tool call timed out after {batch_timeout:?}"),
+                                        success: Some(false),
+                                    },
+                                };
+                                (*idx, item.clone(), response)
+                            }
+                            PendingCall::Direct {
+                                idx,
+                                item,
+                                response,
+                            } => (*idx, item.clone(), response.clone()),
+                            PendingCall::Unsupported {
+                                idx,
+                                item,
+                                call_id,
+                                name,
+                            } => {
+                                let response = ResponseInputItem::FunctionCallOutput {
+                                    call_id: call_id.clone(),
+                                    output: FunctionCallOutputPayload {
+                                        content: format!("Unsupported function: {name}"),
+                                        success: Some(false),
+                                    },
+                                };
+                                (*idx, item.clone(), response)
+                            }
+                        };
+                        (idx, item, response)
+                    })
+                    .collect()
+            }
+        };
+    info!(
+        "parallel tool batch resolved: results={}",
+        results_indexed.len()
+    );
+
+    // Run apply_patch serially, preserving order among patches and relative to others.
+    serial_exec.sort_by_key(|ec| ec.idx);
+    for ExecCall {
+        idx,
+        item,
+        params,
+        call_id,
+        ..
+    } in serial_exec
+    {
+        let response = handle_container_exec_with_params(
+            params,
+            sess,
+            main_turn_diff_tracker,
+            sub_id.to_string(),
+            call_id,
+        )
+        .await;
+        results_indexed.push((idx, item, response));
+    }
+
+    // Merge and sort by original order.
+    results_indexed.sort_by_key(|(idx, _, _)| *idx);
+
+    results_indexed
+        .into_iter()
+        .map(|(_, item, response)| ProcessedResponseItem {
+            item,
+            response: Some(response),
+        })
+        .collect()
 }
 
 async fn try_run_turn(
@@ -1402,6 +1861,8 @@ async fn try_run_turn(
     let mut stream = sess.client.clone().stream(&prompt).await?;
 
     let mut output = Vec::new();
+    let mut pending_tool_calls: Vec<ResponseItem> = Vec::new();
+
     loop {
         // Poll the next item from the model stream. We must inspect *both* Ok and Err
         // cases so that transient stream failures (e.g., dropped SSE connection before
@@ -1427,10 +1888,20 @@ async fn try_run_turn(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
-                let response =
-                    handle_response_item(sess, turn_diff_tracker, sub_id, item.clone()).await?;
-
-                output.push(ProcessedResponseItem { item, response });
+                // Check if parallel tool calls are enabled and if this is a tool call
+                let is_tool = matches!(
+                    item,
+                    ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. }
+                );
+                if sess.client.get_config().parallel_tool_calls && is_tool {
+                    // Buffer tool calls for batch resolution
+                    pending_tool_calls.push(item);
+                } else {
+                    // Fallback to existing per-item handling
+                    let response =
+                        handle_response_item(sess, turn_diff_tracker, sub_id, item.clone()).await?;
+                    output.push(ProcessedResponseItem { item, response });
+                }
             }
             ResponseEvent::Completed {
                 response_id: _,
@@ -1444,6 +1915,18 @@ async fn try_run_turn(
                         })
                         .await
                         .ok();
+                }
+
+                // Resolve pending tool calls in parallel if parallel_tool_calls is enabled
+                if sess.client.get_config().parallel_tool_calls && !pending_tool_calls.is_empty() {
+                    let mut resolved = resolve_tool_calls_parallel(
+                        sess,
+                        sub_id,
+                        pending_tool_calls,
+                        turn_diff_tracker,
+                    )
+                    .await;
+                    output.append(&mut resolved);
                 }
 
                 let unified_diff = turn_diff_tracker.get_unified_diff();
@@ -1517,6 +2000,7 @@ async fn run_compact_task(
         environment_context: None,
         tools: Vec::new(),
         base_instructions_override: Some(compact_instructions.clone()),
+        parallel_tool_calls: None,
     };
 
     let max_retries = sess.client.get_provider().stream_max_retries();
@@ -1721,8 +2205,9 @@ async fn handle_function_call(
         _ => {
             match sess.mcp_connection_manager.parse_tool_name(&name) {
                 Some((server, tool_name)) => {
-                    // TODO(mbolin): Determine appropriate timeout for tool call.
-                    let timeout = None;
+                    let timeout = Some(Duration::from_millis(
+                        sess.client.get_config().mcp_tool_timeout_ms,
+                    ));
                     handle_mcp_tool_call(
                         sess, &sub_id, call_id, server, tool_name, arguments, timeout,
                     )
@@ -1747,7 +2232,7 @@ fn to_exec_params(params: ShellToolCallParams, sess: &Session) -> ExecParams {
     ExecParams {
         command: params.command,
         cwd: sess.resolve_path(params.workdir.clone()),
-        timeout_ms: params.timeout_ms,
+        timeout_ms: params.timeout_ms.or(Some(sess.client.get_config().exec_tool_timeout_ms)),
         env: create_env(&sess.shell_environment_policy),
         with_escalated_permissions: params.with_escalated_permissions,
         justification: params.justification,
@@ -1908,7 +2393,15 @@ async fn handle_container_exec_with_params(
                     params.justification.clone(),
                 )
                 .await;
-            match rx_approve.await.unwrap_or_default() {
+
+            // Make approval wait cancelable via per-turn token
+            let cancel = sess.get_turn_cancel(&sub_id);
+            let decision = tokio::select! {
+                res = rx_approve => res.unwrap_or_default(),
+                _ = cancel.notified() => ReviewDecision::Abort,
+            };
+
+            match decision {
                 ReviewDecision::Approved => (),
                 ReviewDecision::ApprovedForSession => {
                     sess.add_approved_command(params.command.clone());
@@ -1923,10 +2416,7 @@ async fn handle_container_exec_with_params(
                     };
                 }
             }
-            // No sandboxing is applied because the user has given
-            // explicit approval. Often, we end up in this case because
-            // the command cannot be run in a sandbox, such as
-            // installing a new dependency that requires network access.
+            // No sandboxing when explicitly approved by the user.
             SandboxType::None
         }
         SafetyCheck::Reject { reason } => {
@@ -1964,7 +2454,7 @@ async fn handle_container_exec_with_params(
             ExecInvokeArgs {
                 params: params.clone(),
                 sandbox_type,
-                ctrl_c: sess.ctrl_c.clone(),
+                ctrl_c: sess.get_turn_cancel(&sub_id),
                 sandbox_policy: &sess.sandbox_policy,
                 codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
                 stdout_stream: Some(StdoutStream {
@@ -2076,19 +2566,20 @@ async fn handle_sandbox_error(
         )
         .await;
 
-    match rx_approve.await.unwrap_or_default() {
+    // Make retry approval wait cancelable via per-turn token
+    let cancel = sess.get_turn_cancel(&sub_id);
+    let decision = tokio::select! {
+        res = rx_approve => res.unwrap_or_default(),
+        _ = cancel.notified() => ReviewDecision::Abort,
+    };
+
+    match decision {
         ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
-            // Persist this command as pre‑approved for the
-            // remainder of the session so future
-            // executions skip the sandbox directly.
-            // TODO(ragona): Isn't this a bug? It always saves the command in an | fork?
+            // Persist approval and retry without sandbox
             sess.add_approved_command(params.command.clone());
-            // Inform UI we are retrying without sandbox.
             sess.notify_background_event(&sub_id, "retrying command without sandbox")
                 .await;
 
-            // This is an escalated retry; the policy will not be
-            // examined and the sandbox has been set to `None`.
             let retry_output_result = sess
                 .run_exec_with_events(
                     turn_diff_tracker,
@@ -2096,7 +2587,7 @@ async fn handle_sandbox_error(
                     ExecInvokeArgs {
                         params,
                         sandbox_type: SandboxType::None,
-                        ctrl_c: sess.ctrl_c.clone(),
+                        ctrl_c: sess.get_turn_cancel(&sub_id),
                         sandbox_policy: &sess.sandbox_policy,
                         codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
                         stdout_stream: Some(StdoutStream {
@@ -2111,10 +2602,8 @@ async fn handle_sandbox_error(
             match retry_output_result {
                 Ok(retry_output) => {
                     let ExecToolCallOutput { exit_code, .. } = &retry_output;
-
                     let is_success = *exit_code == 0;
                     let content = format_exec_output(&retry_output);
-
                     ResponseInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
                         output: FunctionCallOutputPayload {
@@ -2132,16 +2621,13 @@ async fn handle_sandbox_error(
                 },
             }
         }
-        ReviewDecision::Denied | ReviewDecision::Abort => {
-            // Fall through to original failure handling.
-            ResponseInputItem::FunctionCallOutput {
-                call_id,
-                output: FunctionCallOutputPayload {
-                    content: "exec command rejected by user".to_string(),
-                    success: None,
-                },
-            }
-        }
+        ReviewDecision::Denied | ReviewDecision::Abort => ResponseInputItem::FunctionCallOutput {
+            call_id,
+            output: FunctionCallOutputPayload {
+                content: "exec command rejected by user".to_string(),
+                success: None,
+            },
+        },
     }
 }
 

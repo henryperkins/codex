@@ -9,7 +9,10 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -82,7 +85,6 @@ struct ToolInfo {
 }
 
 /// A thin wrapper around a set of running [`McpClient`] instances.
-#[derive(Default)]
 pub(crate) struct McpConnectionManager {
     /// Server-name -> client instance.
     ///
@@ -92,6 +94,10 @@ pub(crate) struct McpConnectionManager {
 
     /// Fully qualified tool name -> tool instance.
     tools: HashMap<String, ToolInfo>,
+
+    /// Per-server concurrency limits for tool calls
+    per_server_limits: Mutex<HashMap<String, Arc<Semaphore>>>,
+    default_server_limit: usize,
 }
 
 impl McpConnectionManager {
@@ -105,10 +111,19 @@ impl McpConnectionManager {
     /// user should be informed about these errors.
     pub async fn new(
         mcp_servers: HashMap<String, McpServerConfig>,
+        default_server_limit: usize,
     ) -> Result<(Self, ClientStartErrors)> {
         // Early exit if no servers are configured.
         if mcp_servers.is_empty() {
-            return Ok((Self::default(), ClientStartErrors::default()));
+            return Ok((
+                Self {
+                    clients: HashMap::new(),
+                    tools: HashMap::new(),
+                    per_server_limits: Mutex::new(HashMap::new()),
+                    default_server_limit,
+                },
+                ClientStartErrors::default(),
+            ));
         }
 
         // Launch all configured servers concurrently.
@@ -188,7 +203,15 @@ impl McpConnectionManager {
 
         let tools = qualify_tools(all_tools);
 
-        Ok((Self { clients, tools }, errors))
+        Ok((
+            Self {
+                clients,
+                tools,
+                per_server_limits: Mutex::new(HashMap::new()),
+                default_server_limit,
+            },
+            errors,
+        ))
     }
 
     /// Returns a single map that contains **all** tools. Each key is the
@@ -200,6 +223,21 @@ impl McpConnectionManager {
             .collect()
     }
 
+    async fn acquire_server_permit(
+        &self,
+        server: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let sem = {
+            let mut map = self.per_server_limits.lock().await;
+            map.entry(server.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.default_server_limit)))
+                .clone()
+        };
+        sem.acquire_owned()
+            .await
+            .map_err(|_| anyhow!("MCP server semaphore closed"))
+    }
+
     /// Invoke the tool indicated by the (server, tool) pair.
     pub async fn call_tool(
         &self,
@@ -208,6 +246,8 @@ impl McpConnectionManager {
         arguments: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<mcp_types::CallToolResult> {
+        let _permit = self.acquire_server_permit(server).await?;
+
         let client = self
             .clients
             .get(server)

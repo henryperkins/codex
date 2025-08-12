@@ -61,6 +61,12 @@ pub(crate) async fn handle_create_conversation(
         include_plan_tool: None,
         disable_response_storage: None,
         show_raw_agent_reasoning: None,
+        parallel_tool_calls: None,
+        tool_parallel_limit: None,
+        mcp_per_server_limit: None,
+        mcp_tool_timeout_ms: None,
+        exec_tool_timeout_ms: None,
+        tool_batch_timeout_ms: None,
     };
 
     let cfg: CodexConfig = match CodexConfig::load_with_cli_overrides(cli_overrides, overrides) {

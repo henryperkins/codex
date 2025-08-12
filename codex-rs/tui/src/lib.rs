@@ -108,6 +108,12 @@ pub async fn run_main(
         include_plan_tool: Some(true),
         disable_response_storage: cli.oss.then_some(true),
         show_raw_agent_reasoning: cli.oss.then_some(true),
+        parallel_tool_calls: None,
+        tool_parallel_limit: None,
+        mcp_per_server_limit: None,
+        mcp_tool_timeout_ms: None,
+        exec_tool_timeout_ms: None,
+        tool_batch_timeout_ms: None,
     };
 
     // Parse `-c` overrides from the CLI.

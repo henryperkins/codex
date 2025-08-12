@@ -162,6 +162,12 @@ impl CodexToolCallParam {
             include_plan_tool,
             disable_response_storage: None,
             show_raw_agent_reasoning: None,
+            parallel_tool_calls: None,
+            tool_parallel_limit: None,
+            mcp_per_server_limit: None,
+            mcp_tool_timeout_ms: None,
+            exec_tool_timeout_ms: None,
+            tool_batch_timeout_ms: None,
         };
 
         let cli_overrides = cli_overrides

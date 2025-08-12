@@ -14,7 +14,7 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 
 // Types for the TODO tool arguments matching codex-vscode/todo-mcp/src/main.rs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     Pending,
@@ -22,14 +22,14 @@ pub enum StepStatus {
     Completed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanItemArg {
     pub step: String,
     pub status: StepStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePlanArgs {
     #[serde(default)]
@@ -82,6 +82,48 @@ When all steps are completed, call update_plan one last time with all steps mark
         },
     })
 });
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that the JSON argument order does not impact deserialization
+    /// so both the sequential `handle_function_call` path and the parallel
+    /// `resolve_tool_calls_parallel` path behave identically.  This protects
+    /// against regressions where a particular field order would succeed in one
+    /// code path but fail in the other.
+    #[test]
+    fn update_plan_argument_order_independent() {
+        let json1 = r#"{
+            "explanation": "demo",
+            "plan": [
+                { "step": "first", "status": "pending" },
+                { "step": "second", "status": "completed" }
+            ]
+        }"#;
+
+        // Same content but with the top-level fields in reverse order and the
+        // inner object keys swapped – this mirrors real-world variations the
+        // model may emit.
+        let json2 = r#"{
+            "plan": [
+                { "status": "pending", "step": "first" },
+                { "status": "completed", "step": "second" }
+            ],
+            "explanation": "demo"
+        }"#;
+
+        let args1: UpdatePlanArgs = serde_json::from_str(json1).expect("parse json1");
+        let args2: UpdatePlanArgs = serde_json::from_str(json2).expect("parse json2");
+
+        assert_eq!(args1, args2);
+    }
+}
+
 
 /// This function doesn't do anything useful. However, it gives the model a structured way to record its plan that clients can read and render.
 /// So it's the _inputs_ to this function that are useful to clients, not the outputs and neither are actually useful for the model other

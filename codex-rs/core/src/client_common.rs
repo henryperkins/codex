@@ -85,6 +85,9 @@ pub struct Prompt {
 
     /// Optional override for the built-in BASE_INSTRUCTIONS.
     pub base_instructions_override: Option<String>,
+
+    /// Whether to allow parallel tool calls.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl Prompt {

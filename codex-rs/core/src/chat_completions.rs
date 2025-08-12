@@ -110,12 +110,17 @@ pub(crate) async fn stream_chat_completions(
     }
 
     let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
-    let payload = json!({
+    let mut payload = json!({
         "model": model_family.slug,
         "messages": messages,
         "stream": true,
         "tools": tools_json,
     });
+
+    // Add parallel_tool_calls if specified
+    if let Some(parallel_tool_calls) = prompt.parallel_tool_calls {
+        payload["parallel_tool_calls"] = json!(parallel_tool_calls);
+    }
 
     debug!(
         "POST to {}: {}",

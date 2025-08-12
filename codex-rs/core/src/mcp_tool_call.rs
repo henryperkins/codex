@@ -2,6 +2,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use tracing::error;
+use tracing::info;
 
 use crate::codex::Session;
 use crate::models::FunctionCallOutputPayload;
@@ -56,15 +57,34 @@ pub(crate) async fn handle_mcp_tool_call(
     notify_mcp_tool_call_event(sess, sub_id, tool_call_begin_event).await;
 
     let start = Instant::now();
-    // Perform the tool call.
-    let result = sess
-        .call_tool(&server, &tool_name, arguments_value.clone(), timeout)
-        .await
-        .map_err(|e| format!("tool call error: {e}"));
+
+    // Make the MCP call cancellable via per-turn cancellation token
+    let cancel = sess.get_turn_cancel(sub_id);
+    let result = tokio::select! {
+        res = sess.call_tool(&server, &tool_name, arguments_value.clone(), timeout) => {
+            res.map_err(|e| format!("tool call error: {e}"))
+        }
+        _ = cancel.notified() => {
+            Err("tool call cancelled".to_string())
+        }
+    };
+
+    let duration = start.elapsed();
+    let success = match &result {
+        Ok(r) => r.is_error != Some(true),
+        Err(_) => false,
+    };
+    info!(
+        "MCP tool call finished: server={} tool={} duration_ms={} success={}",
+        server,
+        tool_name,
+        duration.as_millis(),
+        success
+    );
     let tool_call_end_event = EventMsg::McpToolCallEnd(McpToolCallEndEvent {
         call_id: call_id.clone(),
         invocation,
-        duration: start.elapsed(),
+        duration,
         result: result.clone(),
     });
 

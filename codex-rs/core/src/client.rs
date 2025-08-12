@@ -82,6 +82,11 @@ impl ModelClient {
         }
     }
 
+    /// Get a reference to the underlying Config.
+    pub fn get_config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
     /// Dispatches to either the Responses or Chat implementation depending on
     /// the provider config.  Public callers always invoke `stream()` – the
     /// specialised helpers are private to avoid accidental misuse.
@@ -164,7 +169,7 @@ impl ModelClient {
             input: &input_with_instructions,
             tools: &tools_json,
             tool_choice: "auto",
-            parallel_tool_calls: false,
+            parallel_tool_calls: self.config.parallel_tool_calls,
             reasoning,
             store,
             stream: true,

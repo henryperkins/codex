@@ -158,6 +158,25 @@ pub struct Config {
 
     /// The value for the `originator` header included with Responses API requests.
     pub internal_originator: Option<String>,
+
+    /// Enable parallel tool calling, allowing multiple tool calls to be executed concurrently in a single turn.
+    /// When enabled, Codex sends `parallel_tool_calls = true` in model requests; when disabled, it sends `false`.
+    pub parallel_tool_calls: bool,
+
+    /// Maximum number of tool calls executed concurrently within a session.
+    pub tool_parallel_limit: usize,
+
+    /// Maximum number of concurrent tool calls per MCP server.
+    pub mcp_per_server_limit: usize,
+
+    /// Default timeout for MCP tool calls in milliseconds.
+    pub mcp_tool_timeout_ms: u64,
+
+    /// Default timeout for exec tool calls in milliseconds.
+    pub exec_tool_timeout_ms: u64,
+
+    /// Batch timeout for parallel tool calls in milliseconds.
+    pub tool_batch_timeout_ms: u64,
 }
 
 impl Config {
@@ -404,6 +423,25 @@ pub struct ConfigToml {
     pub internal_originator: Option<String>,
 
     pub projects: Option<HashMap<String, ProjectConfig>>,
+
+    /// Enable parallel tool calling, allowing multiple tool calls to be executed concurrently in a single turn.
+    /// When enabled, Codex sends `parallel_tool_calls = true` in model requests; when disabled, it sends `false`.
+    pub parallel_tool_calls: Option<bool>,
+
+    /// Maximum number of tool calls executed concurrently within a session.
+    pub tool_parallel_limit: Option<usize>,
+
+    /// Maximum number of concurrent tool calls per MCP server.
+    pub mcp_per_server_limit: Option<usize>,
+
+    /// Default timeout for MCP tool calls in milliseconds.
+    pub mcp_tool_timeout_ms: Option<u64>,
+
+    /// Default timeout for exec tool calls in milliseconds.
+    pub exec_tool_timeout_ms: Option<u64>,
+
+    /// Batch timeout for parallel tool calls in milliseconds.
+    pub tool_batch_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -482,6 +520,12 @@ pub struct ConfigOverrides {
     pub include_plan_tool: Option<bool>,
     pub disable_response_storage: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
+    pub parallel_tool_calls: Option<bool>,
+    pub tool_parallel_limit: Option<usize>,
+    pub mcp_per_server_limit: Option<usize>,
+    pub mcp_tool_timeout_ms: Option<u64>,
+    pub exec_tool_timeout_ms: Option<u64>,
+    pub tool_batch_timeout_ms: Option<u64>,
 }
 
 impl Config {
@@ -507,6 +551,12 @@ impl Config {
             include_plan_tool,
             disable_response_storage,
             show_raw_agent_reasoning,
+            parallel_tool_calls,
+            tool_parallel_limit,
+            mcp_per_server_limit,
+            mcp_tool_timeout_ms,
+            exec_tool_timeout_ms,
+            tool_batch_timeout_ms,
         } = overrides;
 
         let config_profile = match config_profile_key.as_ref().or(cfg.profile.as_ref()) {
@@ -660,6 +710,22 @@ impl Config {
             experimental_resume,
             include_plan_tool: include_plan_tool.unwrap_or(false),
             internal_originator: cfg.internal_originator,
+            parallel_tool_calls: parallel_tool_calls
+                .or(cfg.parallel_tool_calls)
+                .unwrap_or(true),
+            tool_parallel_limit: tool_parallel_limit.or(cfg.tool_parallel_limit).unwrap_or(4),
+            mcp_per_server_limit: mcp_per_server_limit
+                .or(cfg.mcp_per_server_limit)
+                .unwrap_or(2),
+            mcp_tool_timeout_ms: mcp_tool_timeout_ms
+                .or(cfg.mcp_tool_timeout_ms)
+                .unwrap_or(60_000),
+            exec_tool_timeout_ms: exec_tool_timeout_ms
+                .or(cfg.exec_tool_timeout_ms)
+                .unwrap_or(120_000), // 2 minutes default
+            tool_batch_timeout_ms: tool_batch_timeout_ms
+                .or(cfg.tool_batch_timeout_ms)
+                .unwrap_or(300_000), // 5 minutes default
         };
         Ok(config)
     }
@@ -1024,6 +1090,12 @@ disable_response_storage = true
                 base_instructions: None,
                 include_plan_tool: false,
                 internal_originator: None,
+                parallel_tool_calls: true,
+                tool_parallel_limit: 4,
+                mcp_per_server_limit: 2,
+                mcp_tool_timeout_ms: 60_000,
+                exec_tool_timeout_ms: 120_000,
+                tool_batch_timeout_ms: 300_000,
             },
             o3_profile_config
         );
@@ -1075,6 +1147,12 @@ disable_response_storage = true
             base_instructions: None,
             include_plan_tool: false,
             internal_originator: None,
+            parallel_tool_calls: true,
+            tool_parallel_limit: 4,
+            mcp_per_server_limit: 2,
+            mcp_tool_timeout_ms: 60_000,
+            exec_tool_timeout_ms: 120_000,
+            tool_batch_timeout_ms: 300_000,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1141,6 +1219,12 @@ disable_response_storage = true
             base_instructions: None,
             include_plan_tool: false,
             internal_originator: None,
+            parallel_tool_calls: true,
+            tool_parallel_limit: 4,
+            mcp_per_server_limit: 2,
+            mcp_tool_timeout_ms: 60_000,
+            exec_tool_timeout_ms: 120_000,
+            tool_batch_timeout_ms: 300_000,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);

@@ -149,6 +149,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         include_plan_tool: None,
         disable_response_storage: oss.then_some(true),
         show_raw_agent_reasoning: oss.then_some(true),
+        parallel_tool_calls: None,
+        tool_parallel_limit: None,
+        mcp_per_server_limit: None,
+        mcp_tool_timeout_ms: None,
+        exec_tool_timeout_ms: None,
+        tool_batch_timeout_ms: None,
     };
     // Parse `-c` overrides.
     let cli_kv_overrides = match config_overrides.parse_overrides() {

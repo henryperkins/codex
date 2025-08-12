@@ -236,6 +236,9 @@ impl McpClient {
 
         // Send to writer task.
         if self.outgoing_tx.send(message).await.is_err() {
+            // Remove pending entry to avoid leaking the oneshot sender.
+            let mut guard = self.pending.lock().await;
+            guard.remove(&id);
             return Err(anyhow!(
                 "failed to send message to writer task - channel closed"
             ));
@@ -262,9 +265,17 @@ impl McpClient {
                     }
                 }
             }
-            None => rx
-                .await
-                .map_err(|_| anyhow!("response channel closed before a reply was received"))?,
+            None => match rx.await {
+                Ok(msg) => msg,
+                Err(_) => {
+                    // Channel closed without a reply – remove the pending entry.
+                    let mut guard = self.pending.lock().await;
+                    guard.remove(&id);
+                    return Err(anyhow!(
+                        "response channel closed before a reply was received"
+                    ));
+                }
+            },
         };
 
         match msg {
