@@ -1324,14 +1324,12 @@ async fn run_turn(
         Some(sess.mcp_connection_manager.list_all_tools()),
     );
 
-    // When parallel tool calls are enabled, augment the system instructions with concise guidance
-    // so the model knows how and when to emit multiple tool calls in a single turn.
+    // When parallel tool calls are enabled, augment instructions with concise guidance
+    // without dropping the built-in BASE_INSTRUCTIONS. If no custom base override is
+    // configured, leave `base_instructions_override` as None so the default base is used.
     let base_instructions_override = if sess.client.get_config().parallel_tool_calls {
         let guidance = "Parallel tool calls: You may emit multiple tool calls in a single response when tasks are independent and can execute concurrently. Avoid parallelizing operations with ordering dependencies (e.g., create then write). Ensure each tool call includes complete, valid JSON arguments.";
-        match &sess.base_instructions {
-            Some(b) => Some(format!("{b}\n\n{guidance}")),
-            None => Some(guidance.to_string()),
-        }
+        sess.base_instructions.as_ref().map(|b| format!("{b}\n\n{guidance}"))
     } else {
         sess.base_instructions.clone()
     };
@@ -1569,7 +1567,7 @@ async fn resolve_tool_calls_parallel(
     let mut parallel_futs = Vec::<
         Pin<Box<dyn futures::Future<Output = (usize, ResponseItem, ResponseInputItem)> + Send>>,
     >::new();
-    
+
     // Clone pending for use in timeout handler
     let pending_for_timeout = pending.clone();
 
@@ -1703,61 +1701,62 @@ async fn resolve_tool_calls_parallel(
 
     // Drive all futures with a batch-level timeout; concurrency is enforced by the session semaphore.
     let batch_timeout = Duration::from_millis(sess.client.get_config().tool_batch_timeout_ms);
-    let mut results_indexed =
-        match tokio::time::timeout(batch_timeout, join_all(parallel_futs)).await {
-            Ok(results) => results,
-            Err(_) => {
-                error!("Parallel tool batch timed out after {:?}", batch_timeout);
-                // Synthesize failure outputs for all pending calls to maintain the invariant
-                // that every tool_call must receive a tool_call_output
-                pending_for_timeout
-                    .iter()
-                    .map(|pending_call| {
-                        let (idx, item, response) = match pending_call {
-                            PendingCall::Exec(ExecCall {
-                                idx, item, call_id, ..
-                            })
-                            | PendingCall::Mcp {
-                                idx, item, call_id, ..
-                            }
-                            | PendingCall::UpdatePlan {
-                                idx, item, call_id, ..
-                            } => {
-                                let response = ResponseInputItem::FunctionCallOutput {
-                                    call_id: call_id.clone(),
-                                    output: FunctionCallOutputPayload {
-                                        content: format!("Tool call timed out after {batch_timeout:?}"),
-                                        success: Some(false),
-                                    },
-                                };
-                                (*idx, item.clone(), response)
-                            }
-                            PendingCall::Direct {
-                                idx,
-                                item,
-                                response,
-                            } => (*idx, item.clone(), response.clone()),
-                            PendingCall::Unsupported {
-                                idx,
-                                item,
-                                call_id,
-                                name,
-                            } => {
-                                let response = ResponseInputItem::FunctionCallOutput {
-                                    call_id: call_id.clone(),
-                                    output: FunctionCallOutputPayload {
-                                        content: format!("Unsupported function: {name}"),
-                                        success: Some(false),
-                                    },
-                                };
-                                (*idx, item.clone(), response)
-                            }
-                        };
-                        (idx, item, response)
-                    })
-                    .collect()
-            }
-        };
+    let mut results_indexed = match tokio::time::timeout(batch_timeout, join_all(parallel_futs))
+        .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            error!("Parallel tool batch timed out after {:?}", batch_timeout);
+            // Synthesize failure outputs for all pending calls to maintain the invariant
+            // that every tool_call must receive a tool_call_output
+            pending_for_timeout
+                .iter()
+                .map(|pending_call| {
+                    let (idx, item, response) = match pending_call {
+                        PendingCall::Exec(ExecCall {
+                            idx, item, call_id, ..
+                        })
+                        | PendingCall::Mcp {
+                            idx, item, call_id, ..
+                        }
+                        | PendingCall::UpdatePlan {
+                            idx, item, call_id, ..
+                        } => {
+                            let response = ResponseInputItem::FunctionCallOutput {
+                                call_id: call_id.clone(),
+                                output: FunctionCallOutputPayload {
+                                    content: format!("Tool call timed out after {batch_timeout:?}"),
+                                    success: Some(false),
+                                },
+                            };
+                            (*idx, item.clone(), response)
+                        }
+                        PendingCall::Direct {
+                            idx,
+                            item,
+                            response,
+                        } => (*idx, item.clone(), response.clone()),
+                        PendingCall::Unsupported {
+                            idx,
+                            item,
+                            call_id,
+                            name,
+                        } => {
+                            let response = ResponseInputItem::FunctionCallOutput {
+                                call_id: call_id.clone(),
+                                output: FunctionCallOutputPayload {
+                                    content: format!("Unsupported function: {name}"),
+                                    success: Some(false),
+                                },
+                            };
+                            (*idx, item.clone(), response)
+                        }
+                    };
+                    (idx, item, response)
+                })
+                .collect()
+        }
+    };
     info!(
         "parallel tool batch resolved: results={}",
         results_indexed.len()
@@ -2232,7 +2231,9 @@ fn to_exec_params(params: ShellToolCallParams, sess: &Session) -> ExecParams {
     ExecParams {
         command: params.command,
         cwd: sess.resolve_path(params.workdir.clone()),
-        timeout_ms: params.timeout_ms.or(Some(sess.client.get_config().exec_tool_timeout_ms)),
+        timeout_ms: params
+            .timeout_ms
+            .or(Some(sess.client.get_config().exec_tool_timeout_ms)),
         env: create_env(&sess.shell_environment_policy),
         with_escalated_permissions: params.with_escalated_permissions,
         justification: params.justification,

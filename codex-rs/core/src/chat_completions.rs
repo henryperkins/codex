@@ -110,17 +110,17 @@ pub(crate) async fn stream_chat_completions(
     }
 
     let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
-    let mut payload = json!({
+    let payload = json!({
         "model": model_family.slug,
         "messages": messages,
         "stream": true,
         "tools": tools_json,
     });
 
-    // Add parallel_tool_calls if specified
-    if let Some(parallel_tool_calls) = prompt.parallel_tool_calls {
-        payload["parallel_tool_calls"] = json!(parallel_tool_calls);
-    }
+    // Do not send `parallel_tool_calls` on Chat Completions – not part of this API.
+    // Some providers/proxies reject unknown params with 400s that can surface as generic
+    // "instructions invalid" errors. Parallelization is still supported via tool schema
+    // and batching on the client side.
 
     debug!(
         "POST to {}: {}",
