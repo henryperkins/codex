@@ -68,7 +68,7 @@ pub(crate) async fn handle_patch_approval_request(
         codex_elicitation: "patch-approval".to_string(),
         codex_mcp_tool_call_id: tool_call_id.clone(),
         codex_event_id: event_id.clone(),
-        codex_call_id: call_id,
+        codex_call_id: call_id.clone(),
         codex_reason: reason,
         codex_grant_root: grant_root,
         codex_changes: changes,
@@ -103,13 +103,14 @@ pub(crate) async fn handle_patch_approval_request(
         let codex = codex.clone();
         let event_id = event_id.clone();
         tokio::spawn(async move {
-            on_patch_approval_response(event_id, on_response, codex).await;
+            on_patch_approval_response(event_id, call_id, on_response, codex).await;
         });
     }
 }
 
 pub(crate) async fn on_patch_approval_response(
-    event_id: String,
+    _event_id: String,
+    call_id: String,
     receiver: tokio::sync::oneshot::Receiver<mcp_types::Result>,
     codex: Arc<Codex>,
 ) {
@@ -120,7 +121,7 @@ pub(crate) async fn on_patch_approval_response(
             error!("request failed: {err:?}");
             if let Err(submit_err) = codex
                 .submit(Op::PatchApproval {
-                    id: event_id.clone(),
+                    id: call_id.clone(),
                     decision: ReviewDecision::Denied,
                 })
                 .await
@@ -140,7 +141,7 @@ pub(crate) async fn on_patch_approval_response(
 
     if let Err(err) = codex
         .submit(Op::PatchApproval {
-            id: event_id,
+            id: call_id,
             decision: response.decision,
         })
         .await

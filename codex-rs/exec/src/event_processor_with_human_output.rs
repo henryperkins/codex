@@ -35,9 +35,6 @@ use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
 use codex_common::create_config_summary_entries;
 
-/// This should be configurable. When used in CI, users may not want to impose
-/// a limit so they can see the full transcript.
-const MAX_OUTPUT_LINES_FOR_EXEC_TOOL_CALL: usize = 20;
 pub(crate) struct EventProcessorWithHumanOutput {
     call_id_to_command: HashMap<String, ExecCommandBegin>,
     call_id_to_patch: HashMap<String, PatchApplyBegin>,
@@ -61,6 +58,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
     reasoning_started: bool,
     raw_reasoning_started: bool,
     last_message_path: Option<PathBuf>,
+    max_output_lines: usize,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -68,6 +66,7 @@ impl EventProcessorWithHumanOutput {
         with_ansi: bool,
         config: &Config,
         last_message_path: Option<PathBuf>,
+        max_output_lines: usize,
     ) -> Self {
         let call_id_to_command = HashMap::new();
         let call_id_to_patch = HashMap::new();
@@ -89,6 +88,7 @@ impl EventProcessorWithHumanOutput {
                 reasoning_started: false,
                 raw_reasoning_started: false,
                 last_message_path,
+                max_output_lines,
             }
         } else {
             Self {
@@ -107,6 +107,7 @@ impl EventProcessorWithHumanOutput {
                 reasoning_started: false,
                 raw_reasoning_started: false,
                 last_message_path,
+                max_output_lines,
             }
         }
     }
@@ -293,7 +294,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 let output = if exit_code == 0 { stdout } else { stderr };
                 let truncated_output = output
                     .lines()
-                    .take(MAX_OUTPUT_LINES_FOR_EXEC_TOOL_CALL)
+                    .take(self.max_output_lines)
                     .collect::<Vec<_>>()
                     .join("\n");
                 match exit_code {
@@ -344,7 +345,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     let pretty =
                         serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
 
-                    for line in pretty.lines().take(MAX_OUTPUT_LINES_FOR_EXEC_TOOL_CALL) {
+                    for line in pretty.lines().take(self.max_output_lines) {
                         println!("{}", line.style(self.dimmed));
                     }
                 }

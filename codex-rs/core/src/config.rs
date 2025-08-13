@@ -794,23 +794,38 @@ fn default_model() -> String {
     OPENAI_DEFAULT_MODEL.to_string()
 }
 
-/// Returns the path to the Codex configuration directory, which can be
-/// specified by the `CODEX_HOME` environment variable. If not set, defaults to
-/// `~/.codex`.
+//// Returns the path to the Codex configuration directory.
 ///
-/// - If `CODEX_HOME` is set, the value will be canonicalized and this
-///   function will Err if the path does not exist.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
+/// Resolution order (highest to lowest precedence):
+/// 1) If `CODEX_HOME` is set, return its canonicalized path (error if it doesn't exist).
+/// 2) Otherwise, search upwards from the current working directory for a folder
+///    containing `./.codex/config.toml` and return that `.codex` directory if found.
+/// 3) Fallback to `~/.codex`.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
-    // Honor the `CODEX_HOME` environment variable when it is set to allow users
-    // (and tests) to override the default location.
+    // 1) Honor the `CODEX_HOME` environment variable when set.
     if let Ok(val) = std::env::var("CODEX_HOME") {
         if !val.is_empty() {
             return PathBuf::from(val).canonicalize();
         }
     }
 
+    // 2) Project-local fallback: look for ./.codex/config.toml starting from the current
+    //    working directory and walking up the directory tree.
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            let candidate = dir.join(".codex");
+            let cfg = candidate.join(CONFIG_TOML_FILE);
+            if cfg.exists() {
+                return Ok(candidate);
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => break,
+            }
+        }
+    }
+
+    // 3) Fallback to ~/.codex
     let mut p = home_dir().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,

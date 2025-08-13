@@ -26,7 +26,8 @@ pub struct Cli {
     #[arg(long = "profile", short = 'p')]
     pub config_profile: Option<String>,
 
-    /// Convenience alias for low-friction sandboxed automatic execution (-a on-failure, --sandbox workspace-write).
+    /// Enable full automatic mode: executes commands without approval prompts 
+    /// but with workspace-write sandboxing for safety.
     #[arg(long = "full-auto", default_value_t = false)]
     pub full_auto: bool,
 
@@ -62,6 +63,14 @@ pub struct Cli {
     /// Specifies file where the last message from the agent should be written.
     #[arg(long = "output-last-message")]
     pub last_message_file: Option<PathBuf>,
+
+    /// Maximum number of lines to display for command output (default: 20).
+    #[arg(long = "max-lines", value_name = "N", default_value_t = 20)]
+    pub max_lines: usize,
+
+    /// Display full command output without truncation.
+    #[arg(long = "no-truncate", default_value_t = false, conflicts_with = "max_lines")]
+    pub no_truncate: bool,
 
     /// Initial instructions for the agent. If not provided as an argument (or
     /// if `-` is used), instructions are read from stdin.

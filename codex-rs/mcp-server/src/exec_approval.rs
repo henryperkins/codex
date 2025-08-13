@@ -74,7 +74,7 @@ pub(crate) async fn handle_exec_approval_request(
         codex_elicitation: "exec-approval".to_string(),
         codex_mcp_tool_call_id: tool_call_id.clone(),
         codex_event_id: event_id.clone(),
-        codex_call_id: call_id,
+        codex_call_id: call_id.clone(),
         codex_command: command,
         codex_cwd: cwd,
     };
@@ -108,13 +108,14 @@ pub(crate) async fn handle_exec_approval_request(
         let codex = codex.clone();
         let event_id = event_id.clone();
         tokio::spawn(async move {
-            on_exec_approval_response(event_id, on_response, codex).await;
+            on_exec_approval_response(event_id, call_id, on_response, codex).await;
         });
     }
 }
 
 async fn on_exec_approval_response(
-    event_id: String,
+    _event_id: String,
+    call_id: String,
     receiver: tokio::sync::oneshot::Receiver<mcp_types::Result>,
     codex: Arc<Codex>,
 ) {
@@ -139,7 +140,7 @@ async fn on_exec_approval_response(
 
     if let Err(err) = codex
         .submit(Op::ExecApproval {
-            id: event_id,
+            id: call_id,
             decision: response.decision,
         })
         .await
