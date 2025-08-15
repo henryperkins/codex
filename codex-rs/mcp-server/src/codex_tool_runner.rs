@@ -265,6 +265,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::McpToolCallEnd(_)
                     | EventMsg::ExecCommandBegin(_)
                     | EventMsg::ExecCommandOutputDelta(_)
+                    | EventMsg::WebSearch(_)
                     | EventMsg::ExecCommandEnd(_)
                     | EventMsg::BackgroundEvent(_)
                     | EventMsg::PatchApplyBegin(_)

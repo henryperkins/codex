@@ -21,6 +21,30 @@ pub struct ResponsesApiTool {
     pub(crate) parameters: JsonSchema,
 }
 
+/// User location for web search tool
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebSearchUserLocation {
+    #[serde(rename = "type")]
+    pub location_type: String, // "approximate"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>, // Two-letter ISO country code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>, // IANA timezone
+}
+
+/// Configuration for web search tool
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebSearchConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<WebSearchUserLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_context_size: Option<String>, // "low", "medium", "high"
+}
+
 /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
 /// Responses API.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -30,6 +54,11 @@ pub(crate) enum OpenAiTool {
     Function(ResponsesApiTool),
     #[serde(rename = "local_shell")]
     LocalShell {},
+    #[serde(rename = "web_search_preview")]
+    WebSearch {
+        #[serde(flatten)]
+        config: WebSearchConfig,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +72,8 @@ pub enum ConfigShellToolType {
 pub struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
     pub plan_tool: bool,
+    pub web_search: bool,
+    pub web_search_config: Option<WebSearchConfig>,
 }
 
 impl ToolsConfig {
@@ -51,6 +82,7 @@ impl ToolsConfig {
         approval_policy: AskForApproval,
         sandbox_policy: SandboxPolicy,
         include_plan_tool: bool,
+        web_search_settings: &crate::config_types::WebSearchSettings,
     ) -> Self {
         let mut shell_type = if model_family.uses_local_shell_tool {
             ConfigShellToolType::LocalShell
@@ -63,9 +95,32 @@ impl ToolsConfig {
             }
         }
 
+        let web_search_config = if web_search_settings.enabled {
+            Some(WebSearchConfig {
+                user_location: web_search_settings.user_location.as_ref().map(|loc| {
+                    WebSearchUserLocation {
+                        location_type: "approximate".to_string(),
+                        country: loc.country.clone(),
+                        city: loc.city.clone(),
+                        region: loc.region.clone(),
+                        timezone: loc.timezone.clone(),
+                    }
+                }),
+                search_context_size: match web_search_settings.context_size {
+                    crate::config_types::WebSearchContextSize::Low => Some("low".to_string()),
+                    crate::config_types::WebSearchContextSize::Medium => Some("medium".to_string()),
+                    crate::config_types::WebSearchContextSize::High => Some("high".to_string()),
+                },
+            })
+        } else {
+            None
+        };
+
         Self {
             shell_type,
             plan_tool: include_plan_tool,
+            web_search: web_search_settings.enabled,
+            web_search_config,
         }
     }
 }
@@ -455,6 +510,15 @@ pub(crate) fn get_openai_tools(
         tools.push(PLAN_TOOL.clone());
     }
 
+    if config.web_search {
+        tools.push(OpenAiTool::WebSearch {
+            config: config.web_search_config.clone().unwrap_or(WebSearchConfig {
+                user_location: None,
+                search_context_size: None,
+            }),
+        });
+    }
+
     if let Some(mcp_tools) = mcp_tools {
         for (name, tool) in mcp_tools {
             match mcp_tool_to_openai_tool(name.clone(), tool.clone()) {
@@ -483,6 +547,7 @@ mod tests {
             .map(|tool| match tool {
                 OpenAiTool::Function(ResponsesApiTool { name, .. }) => name,
                 OpenAiTool::LocalShell {} => "local_shell",
+                OpenAiTool::WebSearch { .. } => "web_search_preview",
             })
             .collect::<Vec<_>>();
 
@@ -508,6 +573,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             true,
+            &crate::config_types::WebSearchSettings::default(),
         );
         let tools = get_openai_tools(&config, Some(HashMap::new()));
 
@@ -522,6 +588,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             true,
+            &crate::config_types::WebSearchSettings::default(),
         );
         let tools = get_openai_tools(&config, Some(HashMap::new()));
 
@@ -536,6 +603,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             false,
+            &crate::config_types::WebSearchSettings::default(),
         );
         let tools = get_openai_tools(
             &config,
@@ -629,6 +697,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             false,
+            &crate::config_types::WebSearchSettings::default(),
         );
 
         let tools = get_openai_tools(
@@ -684,6 +753,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             false,
+            &crate::config_types::WebSearchSettings::default(),
         );
 
         let tools = get_openai_tools(
@@ -734,6 +804,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             false,
+            &crate::config_types::WebSearchSettings::default(),
         );
 
         let tools = get_openai_tools(
@@ -780,6 +851,45 @@ mod tests {
     }
 
     #[test]
+    fn test_web_search_tool() {
+        let model_family = find_family_for_model("o3").expect("o3 should be a valid model family");
+        let mut web_search_settings = crate::config_types::WebSearchSettings::default();
+        web_search_settings.enabled = true;
+        web_search_settings.context_size = crate::config_types::WebSearchContextSize::High;
+        web_search_settings.user_location = Some(crate::config_types::WebSearchUserLocation {
+            country: Some("US".to_string()),
+            city: Some("San Francisco".to_string()),
+            region: Some("California".to_string()),
+            timezone: Some("America/Los_Angeles".to_string()),
+        });
+
+        let config = ToolsConfig::new(
+            &model_family,
+            AskForApproval::Never,
+            SandboxPolicy::ReadOnly,
+            false,
+            &web_search_settings,
+        );
+        let tools = get_openai_tools(&config, None);
+
+        assert_eq_tool_names(&tools, &["shell", "web_search_preview"]);
+
+        // Check the web search tool configuration
+        if let OpenAiTool::WebSearch { config: ws_config } = &tools[1] {
+            assert_eq!(ws_config.search_context_size, Some("high".to_string()));
+            if let Some(location) = &ws_config.user_location {
+                assert_eq!(location.location_type, "approximate");
+                assert_eq!(location.country, Some("US".to_string()));
+                assert_eq!(location.city, Some("San Francisco".to_string()));
+            } else {
+                panic!("Expected user location in web search config");
+            }
+        } else {
+            panic!("Expected WebSearch tool");
+        }
+    }
+
+    #[test]
     fn test_mcp_tool_anyof_defaults_to_string() {
         let model_family = find_family_for_model("o3").expect("o3 should be a valid model family");
         let config = ToolsConfig::new(
@@ -787,6 +897,7 @@ mod tests {
             AskForApproval::Never,
             SandboxPolicy::ReadOnly,
             false,
+            &crate::config_types::WebSearchSettings::default(),
         );
 
         let tools = get_openai_tools(

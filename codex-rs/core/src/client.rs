@@ -27,6 +27,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::client_common::ResponsesApiRequest;
+use crate::client_common::ToolChoiceParam;
 use crate::client_common::create_reasoning_param_for_request;
 use crate::config::Config;
 use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
@@ -168,7 +169,15 @@ impl ModelClient {
             instructions: &full_instructions,
             input: &input_with_instructions,
             tools: &tools_json,
-            tool_choice: "auto",
+            tool_choice: if self.config.web_search.enabled
+                && self.config.web_search.force_tool_choice
+            {
+                ToolChoiceParam::ForceType {
+                    r#type: "web_search_preview",
+                }
+            } else {
+                ToolChoiceParam::Auto("auto")
+            },
             parallel_tool_calls: false,
             reasoning,
             store,

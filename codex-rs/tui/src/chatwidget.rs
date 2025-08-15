@@ -614,7 +614,26 @@ impl ChatWidget<'_> {
 
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => self.on_agent_message(message),
+            EventMsg::AgentMessage(AgentMessageEvent { message, citations }) => {
+                // Append URL citations (if any) to the message body so they render in history.
+                let with_citations = match citations {
+                    Some(cites) if !cites.is_empty() => {
+                        let mut s = message.clone();
+                        s.push_str("\n\nCitations:\n");
+                        for (i, c) in cites.iter().enumerate() {
+                            let title = c.title.as_deref().unwrap_or("");
+                            if title.is_empty() {
+                                s.push_str(&format!("[{}] {}\n", i + 1, c.url));
+                            } else {
+                                s.push_str(&format!("[{}] {} — {}\n", i + 1, title, c.url));
+                            }
+                        }
+                        s
+                    }
+                    _ => message,
+                };
+                self.on_agent_message(with_citations)
+            }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 self.on_agent_message_delta(delta)
             }
@@ -646,6 +665,33 @@ impl ChatWidget<'_> {
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 self.on_background_event(message)
+            }
+            // Web search progress events (optional UI surface)
+            EventMsg::WebSearch(ev) => {
+                // Render a compact status line in the history pane.
+                let action = ev
+                    .action
+                    .as_ref()
+                    .map(|a| format!("{a:?}"))
+                    .unwrap_or_else(|| "search".to_string());
+                let query = ev
+                    .query
+                    .as_deref()
+                    .map(|q| format!(" \"{q}\""))
+                    .unwrap_or_default();
+                let domains = ev
+                    .domains
+                    .as_ref()
+                    .map(|d| {
+                        if d.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {d:?}")
+                        }
+                    })
+                    .unwrap_or_default();
+                let status = format!("web_search {action}{query}{domains}");
+                self.on_background_event(status)
             }
         }
         // Coalesce redraws: issue at most one after handling the event

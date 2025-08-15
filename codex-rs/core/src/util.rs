@@ -13,7 +13,6 @@ pub(crate) fn backoff(attempt: u64) -> Duration {
     Duration::from_millis((base as f64 * jitter) as u64)
 }
 
-
 /// Return `true` if the project folder specified by the `Config` is inside a
 /// Git repository.
 ///

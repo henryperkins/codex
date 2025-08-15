@@ -300,6 +300,56 @@ By default, `reasoning` is only set on requests to OpenAI models that are known 
 model_supports_reasoning_summaries = true
 ```
 
+## web_search
+
+Codex can expose OpenAI’s built‑in web search tool (`web_search_preview`) to the model when using the Responses API. When enabled, the model may decide to perform searches and include inline URL citations in its replies.
+
+Notes:
+
+- Only applies when using providers configured for the Responses API (e.g. `openai` with `wire_api = "responses"`). Chat Completions does not support this tool.
+- The model chooses when to use search; enabling it simply makes the tool available.
+- You can guide cost/latency by adjusting the search context size.
+
+Example configuration:
+
+```toml
+[web_search]
+enabled = true                # default: false
+context_size = "medium"       # one of: "low" | "medium" | "high"
+
+# Optionally refine by approximate user location
+[web_search.user_location]
+country = "US"                # ISO 3166-1 alpha-2 (e.g., "US", "GB")
+city = "San Francisco"
+region = "California"
+timezone = "America/Los_Angeles"  # IANA timezone
+```
+
+Behavior and output:
+
+- When the model performs a search, Codex streams `web_search_call` events internally (used by UIs to show progress).
+- Assistant messages may include inline URL citations with link targets and titles.
+
+Tuning guidance:
+
+- **`context_size`**: `low` is fastest/cheapest; `high` retrieves more context and can improve answer quality at the cost of latency.
+- **`user_location`**: Helps geographic relevance (country/city/region/timezone). Deep research models may ignore location.
+
+Force tool choice
+
+If you want the model to prioritize the web search tool for a turn, you can force the `tool_choice` sent to the Responses API. This may reduce latency and improve consistency at the cost of flexibility (the model is nudged to use search first).
+
+```toml
+[web_search]
+enabled = true
+force_tool_choice = true  # sends {type = "web_search_preview"} instead of "auto"
+```
+
+Notes:
+
+- This setting only affects the Responses API. Chat Completions does not support `web_search_preview`.
+- Consider disabling it after the initial search if you want the model to freely use other tools.
+
 ## sandbox_mode
 
 Codex executes model-generated shell commands inside an OS-level sandbox.

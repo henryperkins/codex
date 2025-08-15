@@ -372,6 +372,9 @@ pub enum EventMsg {
 
     PlanUpdate(UpdatePlanArgs),
 
+    /// Web search event from the model
+    WebSearch(WebSearchEvent),
+
     /// Notification that the agent is shutting down.
     ShutdownComplete,
 }
@@ -381,6 +384,26 @@ pub enum EventMsg {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorEvent {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebSearchEvent {
+    pub id: String,
+    pub call_id: Option<String>,
+    pub status: WebSearchEventStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<crate::models::WebSearchAction>,
+    pub query: Option<String>,
+    pub domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchEventStatus {
+    Started,
+    InProgress,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -461,6 +484,8 @@ impl fmt::Display for FinalOutput {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentMessageEvent {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<crate::models::UrlCitation>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

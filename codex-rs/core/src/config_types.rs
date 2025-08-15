@@ -78,6 +78,50 @@ pub enum HistoryPersistence {
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct Tui {}
 
+/// Web search context size options
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchContextSize {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+/// User location configuration for web search
+#[derive(Deserialize, Debug, Clone, PartialEq, Default, Serialize)]
+pub struct WebSearchUserLocation {
+    /// Two-letter ISO country code (e.g., "US")
+    pub country: Option<String>,
+    /// City name (e.g., "San Francisco")
+    pub city: Option<String>,
+    /// Region/state name (e.g., "California")
+    pub region: Option<String>,
+    /// IANA timezone (e.g., "America/Los_Angeles")
+    pub timezone: Option<String>,
+}
+
+/// Configuration for web search tool
+#[derive(Deserialize, Debug, Clone, PartialEq, Default, Serialize)]
+pub struct WebSearchSettings {
+    /// Whether web search is enabled
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Search context size
+    #[serde(default)]
+    pub context_size: WebSearchContextSize,
+
+    /// User location for search refinement
+    #[serde(default)]
+    pub user_location: Option<WebSearchUserLocation>,
+
+    /// If true, force tool_choice to {"type": "web_search_preview"} when using
+    /// the Responses API so the model prioritizes web search. Defaults to false.
+    #[serde(default)]
+    pub force_tool_choice: bool,
+}
+
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize, Display)]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]

@@ -9,6 +9,7 @@ use crate::config_types::ShellEnvironmentPolicy;
 use crate::config_types::ShellEnvironmentPolicyToml;
 use crate::config_types::Tui;
 use crate::config_types::UriBasedFileOpener;
+use crate::config_types::WebSearchSettings;
 use crate::model_family::ModelFamily;
 use crate::model_family::find_family_for_model;
 use crate::model_provider_info::ModelProviderInfo;
@@ -158,6 +159,9 @@ pub struct Config {
 
     /// The value for the `originator` header included with Responses API requests.
     pub internal_originator: Option<String>,
+
+    /// Web search configuration settings.
+    pub web_search: WebSearchSettings,
 }
 
 impl Config {
@@ -404,6 +408,10 @@ pub struct ConfigToml {
     pub internal_originator: Option<String>,
 
     pub projects: Option<HashMap<String, ProjectConfig>>,
+
+    /// Web search configuration settings.
+    #[serde(default)]
+    pub web_search: Option<WebSearchSettings>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -660,6 +668,7 @@ impl Config {
             experimental_resume,
             include_plan_tool: include_plan_tool.unwrap_or(false),
             internal_originator: cfg.internal_originator,
+            web_search: cfg.web_search.unwrap_or_default(),
         };
         Ok(config)
     }
@@ -1023,6 +1032,7 @@ disable_response_storage = true
                 base_instructions: None,
                 include_plan_tool: false,
                 internal_originator: None,
+                web_search: WebSearchSettings::default(),
             },
             o3_profile_config
         );
@@ -1074,6 +1084,7 @@ disable_response_storage = true
             base_instructions: None,
             include_plan_tool: false,
             internal_originator: None,
+            web_search: WebSearchSettings::default(),
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1140,6 +1151,7 @@ disable_response_storage = true
             base_instructions: None,
             include_plan_tool: false,
             internal_originator: None,
+            web_search: WebSearchSettings::default(),
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);

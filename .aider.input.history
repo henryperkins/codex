@@ -1,0 +1,32 @@
+
+# 2025-08-12 05:19:13.860788
++yes
+
+# 2025-08-12 05:21:00.394385
++/add codex-rs/core/src/codex.rs
+
+# 2025-08-12 05:21:06.987856
++/add codex-rs/tui/src/history_cell.rs
+
+# 2025-08-12 05:21:10.789850
++/add codex-rs/core/src/client.rs
+
+# 2025-08-12 05:21:14.415898
++/add codex-rs/core/prompt.md
+
+# 2025-08-12 05:21:51.022780
++/add codex-rs/core/src/parse_command.rs
+
+# 2025-08-12 05:22:16.198238
++/add codex-rs/core/src/error.rs
+
+# 2025-08-12 05:22:38.273131
++{
+
+# 2025-08-12 05:22:46.145256
++You are an expert Rust debugging assistant. Analyze the following log line and produce a precise, step-by-step diagnostic and remediation plan:  
++
++[INFO codex_tui::chatwidget] BackgroundEvent: stream error bad request 🖐 unexpected status 400 Bad Request: {"detail":"Instructions are not valid"}
+
+# 2025-08-12 05:22:47.585130
++}

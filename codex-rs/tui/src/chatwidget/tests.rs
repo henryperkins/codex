@@ -69,6 +69,7 @@ fn final_answer_without_newline_is_flushed_immediately() {
         id: "sub-a".into(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
             message: "Hi! How can I help with codex-rs or anything else today?".into(),
+            citations: None,
         }),
     });
 
@@ -832,6 +833,7 @@ fn multiple_agent_messages_in_single_turn_emit_multiple_headers() {
         id: "s1".into(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
             message: "First message".into(),
+            citations: None,
         }),
     });
 
@@ -840,6 +842,7 @@ fn multiple_agent_messages_in_single_turn_emit_multiple_headers() {
         id: "s1".into(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
             message: "Second message".into(),
+            citations: None,
         }),
     });
 
@@ -900,6 +903,7 @@ fn final_reasoning_then_message_without_deltas_are_rendered() {
         id: "s1".into(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
             message: "Here is the result.".into(),
+            citations: None,
         }),
     });
 
@@ -960,6 +964,7 @@ fn deltas_then_same_final_message_are_rendered_snapshot() {
         id: "s1".into(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
             message: "Here is the result.".into(),
+            citations: None,
         }),
     });
 

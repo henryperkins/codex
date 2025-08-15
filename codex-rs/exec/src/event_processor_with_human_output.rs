@@ -244,20 +244,65 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 #[expect(clippy::expect_used)]
                 std::io::stdout().flush().expect("could not flush stdout");
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message, citations }) => {
                 // if answer_started is false, this means we haven't received any
                 // delta. Thus, we need to print the message as a new answer.
                 if !self.answer_started {
+                    // Prepare optional citations block
+                    let citations_str = citations
+                        .as_ref()
+                        .filter(|c| !c.is_empty())
+                        .map(|cites| {
+                            let mut out = String::from("\n\nCitations:\n");
+                            for (i, c) in cites.iter().enumerate() {
+                                let title = c.title.as_deref().unwrap_or("");
+                                if title.is_empty() {
+                                    out.push_str(&format!("[{}] {}\n", i + 1, c.url));
+                                } else {
+                                    out.push_str(&format!("[{}] {} — {}\n", i + 1, title, c.url));
+                                }
+                            }
+                            out
+                        })
+                        .unwrap_or_default();
                     ts_println!(
                         self,
-                        "{}\n{}",
+                        "{}\n{}{}",
                         "codex".style(self.italic).style(self.magenta),
                         message,
+                        citations_str,
                     );
                 } else {
                     println!();
                     self.answer_started = false;
                 }
+            }
+            EventMsg::WebSearch(ev) => {
+                // Print compact progress lines for web search calls
+                let action = ev
+                    .action
+                    .as_ref()
+                    .map(|a| format!("{a:?}"))
+                    .unwrap_or_else(|| "search".to_string());
+                let query = ev
+                    .query
+                    .as_deref()
+                    .map(|q| format!(" \"{q}\""))
+                    .unwrap_or_default();
+                let domains = ev
+                    .domains
+                    .as_ref()
+                    .map(|d| {
+                        if d.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {d:?}")
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let status = format!("web_search {action}{query}{domains}");
+                ts_println!(self, "{}", status.style(self.dimmed));
             }
             EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                 call_id,

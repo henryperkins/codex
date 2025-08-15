@@ -145,7 +145,7 @@ pub(crate) struct ResponsesApiRequest<'a> {
     // separate enum for serialization.
     pub(crate) input: &'a Vec<ResponseItem>,
     pub(crate) tools: &'a [serde_json::Value],
-    pub(crate) tool_choice: &'static str,
+    pub(crate) tool_choice: ToolChoiceParam,
     pub(crate) parallel_tool_calls: bool,
     pub(crate) reasoning: Option<Reasoning>,
     /// true when using the Responses API.
@@ -154,6 +154,15 @@ pub(crate) struct ResponsesApiRequest<'a> {
     pub(crate) include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_cache_key: Option<String>,
+}
+
+/// Tool choice parameter supports either a simple string (e.g., "auto") or a
+/// typed object (e.g., {"type": "web_search_preview"}).
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(untagged)]
+pub(crate) enum ToolChoiceParam {
+    Auto(&'static str),
+    ForceType { r#type: &'static str },
 }
 
 pub(crate) fn create_reasoning_param_for_request(

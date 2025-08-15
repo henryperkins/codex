@@ -50,7 +50,7 @@ pub(crate) async fn stream_chat_completions(
                 for c in content {
                     match c {
                         ContentItem::InputText { text: t }
-                        | ContentItem::OutputText { text: t } => {
+                        | ContentItem::OutputText { text: t, .. } => {
                             text.push_str(t);
                         }
                         _ => {}
@@ -102,7 +102,9 @@ pub(crate) async fn stream_chat_completions(
                     "content": output.content,
                 }));
             }
-            ResponseItem::Reasoning { .. } | ResponseItem::Other => {
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::Other => {
                 // Omit these items from the conversation history.
                 continue;
             }
@@ -248,6 +250,7 @@ async fn process_chat_sse<S>(
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
                         text: std::mem::take(&mut assistant_text),
+                        annotations: Vec::new(),
                     }],
                     id: None,
                 };
@@ -394,6 +397,7 @@ async fn process_chat_sse<S>(
                                 role: "assistant".to_string(),
                                 content: vec![ContentItem::OutputText {
                                     text: std::mem::take(&mut assistant_text),
+                                    annotations: Vec::new(),
                                 }],
                                 id: None,
                             };
@@ -494,7 +498,9 @@ where
                         if this.cumulative.is_empty() {
                             if let crate::models::ResponseItem::Message { content, .. } = &item {
                                 if let Some(text) = content.iter().find_map(|c| match c {
-                                    crate::models::ContentItem::OutputText { text } => Some(text),
+                                    crate::models::ContentItem::OutputText { text, .. } => {
+                                        Some(text)
+                                    }
                                     _ => None,
                                 }) {
                                     this.cumulative.push_str(text);
@@ -540,6 +546,7 @@ where
                             role: "assistant".to_string(),
                             content: vec![crate::models::ContentItem::OutputText {
                                 text: std::mem::take(&mut this.cumulative),
+                                annotations: Vec::new(),
                             }],
                         };
                         this.pending

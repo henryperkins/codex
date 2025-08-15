@@ -67,6 +67,8 @@ use crate::models::ReasoningItemReasoningSummary;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::ShellToolCallParams;
+use crate::models::WebSearchAction;
+use crate::models::WebSearchStatus;
 use crate::openai_tools::ToolsConfig;
 use crate::openai_tools::get_openai_tools;
 use crate::parse_command::parse_command;
@@ -455,6 +457,7 @@ impl Session {
                 approval_policy,
                 sandbox_policy.clone(),
                 config.include_plan_tool,
+                &config.web_search,
             ),
             tx_event: tx_event.clone(),
             user_instructions,
@@ -1138,7 +1141,7 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
             })
             .flat_map(|content| {
                 content.iter().filter_map(|item| match item {
-                    ContentItem::OutputText { text } => Some(text.clone()),
+                    ContentItem::OutputText { text, .. } => Some(text.clone()),
                     _ => None,
                 })
             })
@@ -1572,6 +1575,7 @@ async fn run_compact_task(
         id: sub_id.clone(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
             message: "Compact task completed".to_string(),
+            citations: None,
         }),
     };
     sess.send_event(event).await;
@@ -1597,10 +1601,18 @@ async fn handle_response_item(
     let output = match item {
         ResponseItem::Message { content, .. } => {
             for item in content {
-                if let ContentItem::OutputText { text } = item {
+                if let ContentItem::OutputText { text, annotations } = item {
+                    // Send the message with citations if present
                     let event = Event {
                         id: sub_id.to_string(),
-                        msg: EventMsg::AgentMessage(AgentMessageEvent { message: text }),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent {
+                            message: text,
+                            citations: if annotations.is_empty() {
+                                None
+                            } else {
+                                Some(annotations)
+                            },
+                        }),
                     };
                     sess.tx_event.send(event).await.ok();
                 }
@@ -1706,9 +1718,55 @@ async fn handle_response_item(
             debug!("unexpected FunctionCallOutput from stream");
             None
         }
+        ResponseItem::WebSearchCall {
+            id,
+            call_id,
+            status,
+            action,
+            query,
+            domains,
+        } => {
+            handle_web_search_call(sess, sub_id, id, call_id, status, action, query, domains).await;
+            None
+        }
         ResponseItem::Other => None,
     };
     Ok(output)
+}
+
+async fn handle_web_search_call(
+    sess: &Session,
+    sub_id: &str,
+    id: String,
+    call_id: Option<String>,
+    status: WebSearchStatus,
+    action: Option<WebSearchAction>,
+    query: Option<String>,
+    domains: Option<Vec<String>>,
+) {
+    use crate::protocol::WebSearchEvent;
+    use crate::protocol::WebSearchEventStatus;
+
+    let event_status = match status {
+        WebSearchStatus::Started => WebSearchEventStatus::Started,
+        WebSearchStatus::InProgress => WebSearchEventStatus::InProgress,
+        WebSearchStatus::Completed => WebSearchEventStatus::Completed,
+        WebSearchStatus::Failed => WebSearchEventStatus::Failed,
+    };
+
+    let event = Event {
+        id: sub_id.to_string(),
+        msg: EventMsg::WebSearch(WebSearchEvent {
+            id,
+            call_id,
+            status: event_status,
+            action,
+            query,
+            domains,
+        }),
+    };
+
+    sess.tx_event.send(event).await.ok();
 }
 
 async fn handle_function_call(
@@ -2206,7 +2264,7 @@ fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<St
         if let ResponseItem::Message { role, content, .. } = item {
             if role == "assistant" {
                 content.iter().rev().find_map(|ci| {
-                    if let ContentItem::OutputText { text } = ci {
+                    if let ContentItem::OutputText { text, .. } = ci {
                         Some(text.clone())
                     } else {
                         None

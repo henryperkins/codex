@@ -752,6 +752,7 @@ mod tests {
             }),
             msg: EventMsg::AgentMessage(codex_core::protocol::AgentMessageEvent {
                 message: "hi".into(),
+                citations: None,
             }),
         };
 
@@ -825,6 +826,7 @@ mod tests {
             }),
             msg: EventMsg::AgentMessage(codex_core::protocol::AgentMessageEvent {
                 message: "hi".into(),
+                citations: None,
             }),
         };
 

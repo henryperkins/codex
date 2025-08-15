@@ -68,6 +68,7 @@ impl ConversationHistory {
                     role: "assistant".to_string(),
                     content: vec![crate::models::ContentItem::OutputText {
                         text: delta.to_string(),
+                        annotations: Vec::new(),
                     }],
                 });
             }
@@ -111,7 +112,8 @@ fn is_api_message(message: &ResponseItem) -> bool {
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::Reasoning { .. } => true,
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::WebSearchCall { .. } => true,
         ResponseItem::Other => false,
     }
 }
@@ -122,7 +124,7 @@ fn append_text_content(
     src: &Vec<crate::models::ContentItem>,
 ) {
     for c in src {
-        if let crate::models::ContentItem::OutputText { text } = c {
+        if let crate::models::ContentItem::OutputText { text, .. } = c {
             append_text_delta(dst, text);
         }
     }
@@ -131,7 +133,7 @@ fn append_text_content(
 /// Append a single text delta to the last OutputText item in `content`, or
 /// push a new OutputText item if none exists.
 fn append_text_delta(content: &mut Vec<crate::models::ContentItem>, delta: &str) {
-    if let Some(crate::models::ContentItem::OutputText { text }) = content
+    if let Some(crate::models::ContentItem::OutputText { text, .. }) = content
         .iter_mut()
         .rev()
         .find(|c| matches!(c, crate::models::ContentItem::OutputText { .. }))
@@ -140,6 +142,7 @@ fn append_text_delta(content: &mut Vec<crate::models::ContentItem>, delta: &str)
     } else {
         content.push(crate::models::ContentItem::OutputText {
             text: delta.to_string(),
+            annotations: Vec::new(),
         });
     }
 }
@@ -155,6 +158,7 @@ mod tests {
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
+                annotations: Vec::new(),
             }],
         }
     }
@@ -165,6 +169,7 @@ mod tests {
             role: "user".to_string(),
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
+                annotations: Vec::new(),
             }],
         }
     }
@@ -183,7 +188,8 @@ mod tests {
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: "Hello, world!".to_string()
+                    text: "Hello, world!".to_string(),
+                    annotations: Vec::new(),
                 }]
             }]
         );
@@ -206,7 +212,8 @@ mod tests {
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: "Hello, world!".to_string()
+                    text: "Hello, world!".to_string(),
+                    annotations: Vec::new(),
                 }]
             }]
         );
@@ -221,6 +228,7 @@ mod tests {
             role: "system".to_string(),
             content: vec![ContentItem::OutputText {
                 text: "ignored".to_string(),
+                annotations: Vec::new(),
             }],
         };
         h.record_items([&system, &ResponseItem::Other]);
@@ -238,14 +246,16 @@ mod tests {
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::OutputText {
-                        text: "hi".to_string()
+                        text: "hi".to_string(),
+                        annotations: Vec::new(),
                     }]
                 },
                 ResponseItem::Message {
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
-                        text: "hello".to_string()
+                        text: "hello".to_string(),
+                        annotations: Vec::new(),
                     }]
                 }
             ]

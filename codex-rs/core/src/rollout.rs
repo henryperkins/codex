@@ -133,6 +133,10 @@ impl RolloutRecorder {
                 | ResponseItem::FunctionCall { .. }
                 | ResponseItem::FunctionCallOutput { .. }
                 | ResponseItem::Reasoning { .. } => filtered.push(item.clone()),
+                ResponseItem::WebSearchCall { .. } => {
+                    // Ephemeral streaming event; omit from persisted rollout.
+                    continue;
+                }
                 ResponseItem::Other => {
                     // These should never be serialized.
                     continue;
@@ -195,7 +199,7 @@ impl RolloutRecorder {
                     | ResponseItem::FunctionCall { .. }
                     | ResponseItem::FunctionCallOutput { .. }
                     | ResponseItem::Reasoning { .. } => items.push(item),
-                    ResponseItem::Other => {}
+                    ResponseItem::WebSearchCall { .. } | ResponseItem::Other => {}
                 },
                 Err(e) => {
                     warn!("failed to parse item: {v:?}, error: {e}");
@@ -320,7 +324,7 @@ async fn rollout_writer(
                         | ResponseItem::Reasoning { .. } => {
                             writer.write_line(&item).await?;
                         }
-                        ResponseItem::Other => {}
+                        ResponseItem::WebSearchCall { .. } | ResponseItem::Other => {}
                     }
                 }
             }

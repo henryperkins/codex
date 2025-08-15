@@ -10,6 +10,23 @@ use serde::ser::Serializer;
 use crate::protocol::InputItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchStatus {
+    Started,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchAction {
+    Search,
+    OpenPage,
+    FindInPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputItem {
     Message {
@@ -29,9 +46,27 @@ pub enum ResponseInputItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentItem {
-    InputText { text: String },
-    InputImage { image_url: String },
-    OutputText { text: String },
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+    },
+    OutputText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<UrlCitation>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UrlCitation {
+    #[serde(rename = "type")]
+    pub citation_type: String, // "url_citation"
+    pub start_index: usize,
+    pub end_index: usize,
+    pub url: String,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,6 +111,14 @@ pub enum ResponseItem {
     FunctionCallOutput {
         call_id: String,
         output: FunctionCallOutputPayload,
+    },
+    WebSearchCall {
+        id: String,
+        call_id: Option<String>,
+        status: WebSearchStatus,
+        action: Option<WebSearchAction>,
+        query: Option<String>,
+        domains: Option<Vec<String>>,
     },
     #[serde(other)]
     Other,
