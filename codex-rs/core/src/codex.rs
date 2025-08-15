@@ -680,7 +680,10 @@ impl Session {
                 call_id,
                 command: command_for_display.clone(),
                 cwd,
-                parsed_cmd: parse_command(&command_for_display),
+                parsed_cmd: parse_command(&command_for_display)
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             }),
         };
         let event = Event {
@@ -1034,8 +1037,8 @@ async fn submission_loop(
                         Arc::new(per_turn_config),
                         None,
                         provider,
-                        effort,
-                        summary,
+                        effort.into(),
+                        summary.into(),
                         sess.session_id,
                     );
 
@@ -1106,7 +1109,13 @@ async fn submission_loop(
                             crate::protocol::GetHistoryEntryResponseEvent {
                                 offset,
                                 log_id,
-                                entry: entry_opt,
+                                entry: entry_opt.map(|e| {
+                                    codex_protocol::message_history::HistoryEntry {
+                                        session_id: e.session_id,
+                                        ts: e.ts,
+                                        text: e.text,
+                                    }
+                                }),
                             },
                         ),
                     };
@@ -1163,6 +1172,9 @@ async fn submission_loop(
                     warn!("failed to send Shutdown event: {e}");
                 }
                 break;
+            }
+            _ => {
+                // Ignore unknown ops; enum is non_exhaustive to allow extensions.
             }
         }
     }
