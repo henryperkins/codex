@@ -4,8 +4,8 @@
   "description": "Tools for repo-wide maintenance.",
   "version": "0.1.2505172129",
   "scripts": {
-    "format": "prettier --check *.json *.md .github/workflows/*.yml",
-    "format:fix": "prettier --write *.json *.md .github/workflows/*.yml"
+    "format": "prettier --check *.json *.md .github/workflows/*.yml **/*.js",
+    "format:fix": "prettier --write *.json *.md .github/workflows/*.yml **/*.js"
   },
   "devDependencies": {
     "prettier": "^3.5.3"

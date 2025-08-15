@@ -1,31 +1,10 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
-use tokio::sync::Notify;
-use tracing::debug;
 
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
-
-/// Make a CancellationToken that is fulfilled when SIGINT occurs.
-pub fn notify_on_sigint() -> Arc<Notify> {
-    let notify = Arc::new(Notify::new());
-
-    tokio::spawn({
-        let notify = Arc::clone(&notify);
-        async move {
-            loop {
-                tokio::signal::ctrl_c().await.ok();
-                debug!("Keyboard interrupt");
-                notify.notify_waiters();
-            }
-        }
-    });
-
-    notify
-}
 
 pub(crate) fn backoff(attempt: u64) -> Duration {
     let exp = BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
@@ -34,13 +13,6 @@ pub(crate) fn backoff(attempt: u64) -> Duration {
     Duration::from_millis((base as f64 * jitter) as u64)
 }
 
-/// Backoff with a minimum floor duration. Useful when the upstream signaled a
-/// rate limit and we should wait a bit longer than the standard exponential
-/// schedule to give the provider time to recover.
-pub(crate) fn backoff_with_floor(attempt: u64, floor: Duration) -> Duration {
-    let d = backoff(attempt);
-    if d < floor { floor } else { d }
-}
 
 /// Return `true` if the project folder specified by the `Config` is inside a
 /// Git repository.
