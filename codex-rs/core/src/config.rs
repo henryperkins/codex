@@ -601,9 +601,21 @@ impl Config {
         });
 
         let openai_model_info = get_model_info(&model_family);
-        let model_context_window = cfg
+        let mut model_context_window = cfg
             .model_context_window
             .or_else(|| openai_model_info.as_ref().map(|info| info.context_window));
+        // Enforce the 128k token context limit when web search is enabled,
+        // per OpenAI web search constraints (even for larger-window models).
+        if cfg
+            .web_search
+            .as_ref()
+            .map(|ws| ws.enabled)
+            .unwrap_or(false)
+        {
+            if let Some(val) = model_context_window {
+                model_context_window = Some(val.min(128_000));
+            }
+        }
         let model_max_output_tokens = cfg.model_max_output_tokens.or_else(|| {
             openai_model_info
                 .as_ref()

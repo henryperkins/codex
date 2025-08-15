@@ -172,9 +172,10 @@ impl ModelClient {
             tool_choice: if self.config.web_search.enabled
                 && self.config.web_search.force_tool_choice
             {
-                ToolChoiceParam::ForceType {
-                    r#type: "web_search_preview",
-                }
+                let t = crate::openai_tools::web_search_tool_type_from_settings(
+                    &self.config.web_search,
+                );
+                ToolChoiceParam::ForceType { r#type: t }
             } else {
                 ToolChoiceParam::Auto("auto")
             },
@@ -357,6 +358,9 @@ impl From<ResponseCompletedUsage> for TokenUsage {
             output_tokens: val.output_tokens,
             reasoning_output_tokens: val.output_tokens_details.map(|d| d.reasoning_tokens),
             total_tokens: val.total_tokens,
+            web_search_tokens: None,
+            web_search_queries: None,
+            web_search_cost: None,
         }
     }
 }

@@ -871,6 +871,7 @@ mod tests {
             output_tokens: 5,
             reasoning_output_tokens: Some(1),
             total_tokens: 16,
+            ..Default::default()
         };
         let params = CodexEventNotificationParams {
             meta: None,

@@ -22,6 +22,7 @@ use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TurnDiffEvent;
+use codex_core::protocol::WebSearchResultEvent;
 use owo_colors::OwoColorize;
 use owo_colors::Style;
 use shlex::try_join;
@@ -33,6 +34,7 @@ use std::time::Instant;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
+use crate::ts_println;
 use codex_common::create_config_summary_entries;
 
 /// This should be configurable. When used in CI, users may not want to impose
@@ -109,6 +111,59 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
             }
         }
+    }
+
+    fn handle_web_search_result(&mut self, event: &WebSearchResultEvent) {
+        // Print search results header
+        ts_println!(self, "{}", "=".repeat(80));
+        ts_println!(
+            self,
+            "🔍 {} {}",
+            "Web Search Results for:".style(self.bold),
+            event.query.style(self.cyan)
+        );
+        ts_println!(self, "{}", "=".repeat(80));
+
+        if event.results.is_empty() {
+            ts_println!(self, "\n{}", "No results found.".style(self.dimmed));
+        } else {
+            for (idx, result) in event.results.iter().enumerate() {
+                println!();
+                ts_println!(
+                    self,
+                    "{}. {}",
+                    format!("{}", idx + 1).style(self.bold),
+                    result.title.style(self.bold)
+                );
+                ts_println!(
+                    self,
+                    "   📍 {} - {}",
+                    result.domain.style(self.green),
+                    result.url.style(self.cyan)
+                );
+
+                if !result.snippet.is_empty() {
+                    ts_println!(self, "   {}", result.snippet.style(self.dimmed));
+                }
+
+                if let Some(score) = result.relevance_score {
+                    ts_println!(
+                        self,
+                        "   📊 Relevance: {:.2}",
+                        score.to_string().style(self.magenta)
+                    );
+                }
+            }
+        }
+
+        println!();
+        ts_println!(self, "{}", "-".repeat(80));
+        ts_println!(
+            self,
+            "Search completed at: {}",
+            event.timestamp.style(self.dimmed)
+        );
+        ts_println!(self, "{}", "=".repeat(80));
     }
 }
 
@@ -254,12 +309,12 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                         .filter(|c| !c.is_empty())
                         .map(|cites| {
                             let mut out = String::from("\n\nCitations:\n");
-                            for (i, c) in cites.iter().enumerate() {
-                                let title = c.title.as_deref().unwrap_or("");
+                            for c in cites.iter() {
+                                let title = c.title.as_deref().unwrap_or("").trim();
                                 if title.is_empty() {
-                                    out.push_str(&format!("[{}] {}\n", i + 1, c.url));
+                                    out.push_str(&format!("- {}\n", c.url));
                                 } else {
-                                    out.push_str(&format!("[{}] {} — {}\n", i + 1, title, c.url));
+                                    out.push_str(&format!("- [{}]({})\n", title, c.url));
                                 }
                             }
                             out
@@ -303,6 +358,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 
                 let status = format!("web_search {action}{query}{domains}");
                 ts_println!(self, "{}", status.style(self.dimmed));
+            }
+            EventMsg::WebSearchResult(ev) => {
+                self.handle_web_search_result(&ev);
             }
             EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                 call_id,

@@ -158,11 +158,11 @@ pub(crate) struct ResponsesApiRequest<'a> {
 
 /// Tool choice parameter supports either a simple string (e.g., "auto") or a
 /// typed object (e.g., {"type": "web_search_preview"}).
-#[derive(Debug, Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum ToolChoiceParam {
     Auto(&'static str),
-    ForceType { r#type: &'static str },
+    ForceType { r#type: String },
 }
 
 pub(crate) fn create_reasoning_param_for_request(

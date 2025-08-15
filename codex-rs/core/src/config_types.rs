@@ -120,6 +120,100 @@ pub struct WebSearchSettings {
     /// the Responses API so the model prioritizes web search. Defaults to false.
     #[serde(default)]
     pub force_tool_choice: bool,
+
+    /// Optional dated version for the web search tool (e.g., "2025_03_11" or
+    /// "2025-03-11"). When set, Codex will request the corresponding
+    /// versioned tool (e.g., "web_search_preview_2025_03_11"). If unset,
+    /// falls back to the generic "web_search_preview" identifier.
+    #[serde(default)]
+    pub tool_version: Option<String>,
+
+    /// Whether to enforce the 128k token context limit when web search is enabled
+    /// Defaults to true for compatibility with web search requirements
+    #[serde(default = "default_enforce_context_limit")]
+    pub enforce_context_limit: bool,
+
+    /// Whether to display cost tracking for web search operations
+    #[serde(default)]
+    pub show_search_costs: bool,
+
+    /// Whether to render citations with enhanced formatting (inline annotations)
+    #[serde(default = "default_render_citations")]
+    pub render_citations: bool,
+
+    /// Display options for search results
+    #[serde(default)]
+    pub display: WebSearchDisplaySettings,
+
+    /// Rate limiting configuration
+    #[serde(default)]
+    pub rate_limiting: WebSearchRateLimitSettings,
+}
+
+/// Display configuration for web search results
+#[derive(Deserialize, Debug, Clone, PartialEq, Default, Serialize)]
+pub struct WebSearchDisplaySettings {
+    /// Whether to always show source attribution for search results
+    #[serde(default = "default_show_attribution")]
+    pub show_attribution: bool,
+
+    /// Maximum number of search results to display (0 = unlimited)
+    #[serde(default = "default_max_results")]
+    pub max_results: u32,
+
+    /// Whether to highlight cited text in search results
+    #[serde(default = "default_highlight_citations")]
+    pub highlight_citations: bool,
+
+    /// Whether to show relevance scores when available
+    #[serde(default)]
+    pub show_relevance_scores: bool,
+}
+
+/// Rate limiting configuration for web search
+#[derive(Deserialize, Debug, Clone, PartialEq, Default, Serialize)]
+pub struct WebSearchRateLimitSettings {
+    /// Whether to enable rate limiting (recommended)
+    #[serde(default = "default_enable_rate_limiting")]
+    pub enabled: bool,
+
+    /// Custom rate limit tier ("tier-1", "tier-2", "tier-3", or "default")
+    /// If not specified, will be auto-detected based on model
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    /// Custom requests per minute limit (overrides tier setting)
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
+
+    /// Custom minimum interval between requests in milliseconds
+    #[serde(default)]
+    pub min_interval_ms: Option<u64>,
+}
+
+// Default value functions
+fn default_enforce_context_limit() -> bool {
+    true
+}
+
+fn default_render_citations() -> bool {
+    true
+}
+
+fn default_show_attribution() -> bool {
+    true
+}
+
+fn default_max_results() -> u32 {
+    10
+}
+
+fn default_highlight_citations() -> bool {
+    true
+}
+
+fn default_enable_rate_limiting() -> bool {
+    true
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize, Display)]

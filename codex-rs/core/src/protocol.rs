@@ -424,6 +424,8 @@ pub enum EventMsg {
 
     /// Web search event from the model
     WebSearch(WebSearchEvent),
+    /// Web search results event
+    WebSearchResult(WebSearchResultEvent),
 
     /// Notification that the agent is shutting down.
     ShutdownComplete,
@@ -457,6 +459,22 @@ pub enum WebSearchEventStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebSearchResultEvent {
+    pub query: String,
+    pub results: Vec<SearchResult>,
+    pub timestamp: String, // ISO 8601 formatted timestamp
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub domain: String,
+    pub relevance_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TaskCompleteEvent {
     pub last_agent_message: Option<String>,
 }
@@ -468,6 +486,14 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub reasoning_output_tokens: Option<u64>,
     pub total_tokens: u64,
+
+    // Web search specific fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_search_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_search_queries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_search_cost: Option<f64>,
 }
 
 impl TokenUsage {
@@ -495,6 +521,47 @@ impl TokenUsage {
     pub fn tokens_in_context_window(&self) -> u64 {
         self.total_tokens
             .saturating_sub(self.reasoning_output_tokens.unwrap_or(0))
+    }
+
+    /// Calculate web search cost based on model and token usage
+    pub fn calculate_web_search_cost(&mut self, model: &str) {
+        if let Some(search_tokens) = self.web_search_tokens {
+            // Pricing per 1M tokens (example rates - should be updated with actual rates)
+            let rate = match model {
+                m if m.contains("gpt-4o-search") => 2.50,
+                m if m.contains("gpt-4o-mini-search") => 0.60,
+                _ => 0.0,
+            };
+
+            self.web_search_cost = Some((search_tokens as f64 / 1_000_000.0) * rate);
+        }
+    }
+
+    /// Get the effective context window limit for web search enabled models
+    pub fn get_effective_context_window(base_window: usize, web_search_enabled: bool) -> usize {
+        if web_search_enabled {
+            // When web search is enabled, cap at 128k tokens
+            std::cmp::min(base_window, 128_000)
+        } else {
+            base_window
+        }
+    }
+
+    /// Validate that current token usage doesn't exceed context window
+    pub fn validate_context_usage(
+        current_tokens: usize,
+        effective_window: usize,
+        web_search_enabled: bool,
+    ) -> Result<(), crate::error::CodexErr> {
+        if current_tokens > effective_window {
+            return Err(crate::error::CodexErr::ContextWindowExceeded {
+                used: current_tokens,
+                limit: effective_window,
+                web_search_limited: web_search_enabled,
+            });
+        }
+
+        Ok(())
     }
 }
 

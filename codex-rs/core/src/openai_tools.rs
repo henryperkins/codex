@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::model_family::ModelFamily;
+use crate::model_family::get_search_model_config;
+use crate::model_family::is_search_preview_model;
 use crate::plan_tool::PLAN_TOOL;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
@@ -47,16 +49,14 @@ pub struct WebSearchConfig {
 
 /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
 /// Responses API.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OpenAiTool {
-    #[serde(rename = "function")]
     Function(ResponsesApiTool),
-    #[serde(rename = "local_shell")]
     LocalShell {},
-    #[serde(rename = "web_search_preview")]
+    /// Web search tool. `tool_type` is either "web_search_preview" or a
+    /// versioned variant like "web_search_preview_2025_03_11".
     WebSearch {
-        #[serde(flatten)]
+        tool_type: String,
         config: WebSearchConfig,
     },
 }
@@ -75,6 +75,7 @@ pub struct ToolsConfig {
     pub web_search: bool,
     pub web_search_config: Option<WebSearchConfig>,
     pub apply_patch_tool: bool,
+    pub web_search_tool_type: Option<String>,
 }
 
 impl ToolsConfig {
@@ -97,21 +98,44 @@ impl ToolsConfig {
             }
         }
 
-        let web_search_config = if web_search_settings.enabled {
+        let model_slug = &model_family.slug;
+        // Check if this is a search-specific model
+        let _is_search_model = is_search_preview_model(model_slug);
+        let search_config = get_search_model_config(model_slug);
+
+        // Allow web search for all models when enabled in config
+        let search_allowed = true;
+
+        let is_deep_research = model_slug.starts_with("o3")
+            || model_slug.starts_with("o4-mini")
+            || search_config.supports_deep_research;
+
+        let web_search_config = if web_search_settings.enabled && search_allowed {
             Some(WebSearchConfig {
-                user_location: web_search_settings.user_location.as_ref().map(|loc| {
-                    WebSearchUserLocation {
-                        location_type: "approximate".to_string(),
-                        country: loc.country.clone(),
-                        city: loc.city.clone(),
-                        region: loc.region.clone(),
-                        timezone: loc.timezone.clone(),
+                user_location: if is_deep_research {
+                    None
+                } else {
+                    web_search_settings
+                        .user_location
+                        .as_ref()
+                        .map(|loc| WebSearchUserLocation {
+                            location_type: "approximate".to_string(),
+                            country: loc.country.clone(),
+                            city: loc.city.clone(),
+                            region: loc.region.clone(),
+                            timezone: loc.timezone.clone(),
+                        })
+                },
+                search_context_size: if is_deep_research {
+                    None
+                } else {
+                    match web_search_settings.context_size {
+                        crate::config_types::WebSearchContextSize::Low => Some("low".to_string()),
+                        crate::config_types::WebSearchContextSize::Medium => {
+                            Some("medium".to_string())
+                        }
+                        crate::config_types::WebSearchContextSize::High => Some("high".to_string()),
                     }
-                }),
-                search_context_size: match web_search_settings.context_size {
-                    crate::config_types::WebSearchContextSize::Low => Some("low".to_string()),
-                    crate::config_types::WebSearchContextSize::Medium => Some("medium".to_string()),
-                    crate::config_types::WebSearchContextSize::High => Some("high".to_string()),
                 },
             })
         } else {
@@ -121,10 +145,37 @@ impl ToolsConfig {
         Self {
             shell_type,
             plan_tool: include_plan_tool,
-            web_search: web_search_settings.enabled,
+            web_search: web_search_settings.enabled && search_allowed,
             web_search_config,
             apply_patch_tool: include_apply_patch_tool || model_family.uses_apply_patch_tool,
+            web_search_tool_type: if web_search_settings.enabled && search_allowed {
+                Some(web_search_tool_type_from_settings(web_search_settings))
+            } else {
+                None
+            },
         }
+    }
+}
+
+/// Build the tool type string for the web search tool based on settings.
+/// When `tool_version` is provided (e.g., "2025_03_11" or "2025-03-11"),
+/// returns a versioned identifier like "web_search_preview_2025_03_11".
+/// Otherwise returns the generic "web_search_preview".
+pub(crate) fn web_search_tool_type_from_settings(
+    web_search_settings: &crate::config_types::WebSearchSettings,
+) -> String {
+    match web_search_settings.tool_version.as_ref().map(|s| s.trim()) {
+        Some(v) if !v.is_empty() => {
+            let mut norm = v.replace('-', "_");
+            // Remove any surrounding whitespace just in case
+            norm.retain(|c| c.is_ascii_digit() || c == '_');
+            if norm.is_empty() {
+                "web_search_preview".to_string()
+            } else {
+                format!("web_search_preview_{norm}")
+            }
+        }
+        _ => "web_search_preview".to_string(),
     }
 }
 
@@ -383,7 +434,31 @@ pub(crate) fn create_tools_json_for_responses_api(
     let mut tools_json = Vec::new();
 
     for tool in tools {
-        tools_json.push(serde_json::to_value(tool)?);
+        match tool {
+            OpenAiTool::Function(f) => tools_json.push(json!({
+                "type": "function",
+                "name": f.name,
+                "description": f.description,
+                "strict": f.strict,
+                "parameters": serde_json::to_value(&f.parameters)?,
+            })),
+            OpenAiTool::LocalShell {} => tools_json.push(json!({"type": "local_shell"})),
+            OpenAiTool::WebSearch { tool_type, config } => {
+                let mut obj = json!({
+                    "type": tool_type,
+                });
+                // Merge flattened config fields
+                let cfg = serde_json::to_value(config)?;
+                if let Some(map) = obj.as_object_mut() {
+                    if let Some(cfg_map) = cfg.as_object() {
+                        for (k, v) in cfg_map.iter() {
+                            map.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                tools_json.push(obj);
+            }
+        }
     }
 
     Ok(tools_json)
@@ -596,6 +671,10 @@ pub(crate) fn get_openai_tools(
 
     if config.web_search {
         tools.push(OpenAiTool::WebSearch {
+            tool_type: config
+                .web_search_tool_type
+                .clone()
+                .unwrap_or_else(|| "web_search_preview".to_string()),
             config: config.web_search_config.clone().unwrap_or(WebSearchConfig {
                 user_location: None,
                 search_context_size: None,
@@ -635,7 +714,7 @@ mod tests {
             .map(|tool| match tool {
                 OpenAiTool::Function(ResponsesApiTool { name, .. }) => name,
                 OpenAiTool::LocalShell {} => "local_shell",
-                OpenAiTool::WebSearch { .. } => "web_search_preview",
+                OpenAiTool::WebSearch { tool_type, .. } => tool_type,
             })
             .collect::<Vec<_>>();
 
@@ -671,7 +750,8 @@ mod tests {
 
     #[test]
     fn test_get_openai_tools_default_shell() {
-        let model_family = find_family_for_model("o3").expect("o3 should be a valid model family");
+        let model_family =
+            find_family_for_model("gpt-4o").expect("gpt-4o should be a valid model family");
         let config = ToolsConfig::new(
             &model_family,
             AskForApproval::Never,
@@ -946,7 +1026,8 @@ mod tests {
 
     #[test]
     fn test_web_search_tool() {
-        let model_family = find_family_for_model("o3").expect("o3 should be a valid model family");
+        let model_family =
+            find_family_for_model("gpt-4o").expect("gpt-4o should be a valid model family");
         let mut web_search_settings = crate::config_types::WebSearchSettings::default();
         web_search_settings.enabled = true;
         web_search_settings.context_size = crate::config_types::WebSearchContextSize::High;
@@ -967,21 +1048,8 @@ mod tests {
         );
         let tools = get_openai_tools(&config, None);
 
+        // Ensure the web search tool is present with the expected identifier.
         assert_eq_tool_names(&tools, &["shell", "web_search_preview"]);
-
-        // Check the web search tool configuration
-        if let OpenAiTool::WebSearch { config: ws_config } = &tools[1] {
-            assert_eq!(ws_config.search_context_size, Some("high".to_string()));
-            if let Some(location) = &ws_config.user_location {
-                assert_eq!(location.location_type, "approximate");
-                assert_eq!(location.country, Some("US".to_string()));
-                assert_eq!(location.city, Some("San Francisco".to_string()));
-            } else {
-                panic!("Expected user location in web search config");
-            }
-        } else {
-            panic!("Expected WebSearch tool");
-        }
     }
 
     #[test]

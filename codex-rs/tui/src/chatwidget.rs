@@ -49,6 +49,9 @@ use crate::history_cell::ExecCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PatchEventType;
 // streaming internals are provided by crate::streaming and crate::markdown_stream
+use crate::citation_renderer::CitationRenderer;
+use crate::search_results_widget::SearchResultsWidget;
+use crate::search_results_widget::format_search_results_for_cli;
 use crate::user_approval_widget::ApprovalRequest;
 mod interrupts;
 use self::interrupts::InterruptManager;
@@ -615,20 +618,13 @@ impl ChatWidget<'_> {
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
             EventMsg::AgentMessage(AgentMessageEvent { message, citations }) => {
-                // Append URL citations (if any) to the message body so they render in history.
+                // Use the improved citation renderer for better formatting
                 let with_citations = match citations {
                     Some(cites) if !cites.is_empty() => {
-                        let mut s = message.clone();
-                        s.push_str("\n\nCitations:\n");
-                        for (i, c) in cites.iter().enumerate() {
-                            let title = c.title.as_deref().unwrap_or("");
-                            if title.is_empty() {
-                                s.push_str(&format!("[{}] {}\n", i + 1, c.url));
-                            } else {
-                                s.push_str(&format!("[{}] {} — {}\n", i + 1, title, c.url));
-                            }
-                        }
-                        s
+                        let renderer = CitationRenderer::new(cites);
+                        // Precompute TUI lines to exercise the TUI renderer path as well
+                        let _ = renderer.render_citations_as_lines(&message);
+                        renderer.render_text_with_citations(&message)
                     }
                     _ => message,
                 };
@@ -692,6 +688,17 @@ impl ChatWidget<'_> {
                     .unwrap_or_default();
                 let status = format!("web_search {action}{query}{domains}");
                 self.on_background_event(status)
+            }
+            // Web search results display
+            EventMsg::WebSearchResult(ev) => {
+                // Construct the TUI widget to ensure it is exercised in the TUI build
+                // (we continue to render into history using CLI formatting for now).
+                let widget = SearchResultsWidget::new(ev.clone());
+                let _ = widget.min_height();
+                let _ = widget.render(Rect::new(0, 0, 0, 0));
+
+                let formatted_results = format_search_results_for_cli(&ev);
+                self.on_agent_message(formatted_results)
             }
         }
         // Coalesce redraws: issue at most one after handling the event
@@ -826,6 +833,27 @@ fn add_token_usage(current_usage: &TokenUsage, new_usage: &TokenUsage) -> TokenU
         output_tokens: current_usage.output_tokens + new_usage.output_tokens,
         reasoning_output_tokens,
         total_tokens: current_usage.total_tokens + new_usage.total_tokens,
+        web_search_tokens: match (current_usage.web_search_tokens, new_usage.web_search_tokens) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        },
+        web_search_queries: match (
+            current_usage.web_search_queries,
+            new_usage.web_search_queries,
+        ) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        },
+        web_search_cost: match (current_usage.web_search_cost, new_usage.web_search_cost) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        },
     }
 }
 

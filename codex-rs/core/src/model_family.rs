@@ -65,6 +65,41 @@ macro_rules! simple_model_family {
     }};
 }
 
+/// Configuration for search-specific models
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SearchModelConfig {
+    pub supports_deep_research: bool,
+    pub max_search_queries: Option<u32>,
+    pub requires_web_search: bool,
+    pub context_window: Option<usize>,
+}
+
+/// Returns true if the model is a search-preview model
+pub fn is_search_preview_model(model_slug: &str) -> bool {
+    model_slug.contains("search-preview")
+}
+
+/// Returns search-specific configuration for the given model
+pub fn get_search_model_config(model_slug: &str) -> SearchModelConfig {
+    if model_slug.contains("gpt-4o-search-preview") {
+        SearchModelConfig {
+            supports_deep_research: true,
+            max_search_queries: Some(10),
+            requires_web_search: true,
+            context_window: Some(128_000),
+        }
+    } else if model_slug.contains("gpt-4o-mini-search-preview") {
+        SearchModelConfig {
+            supports_deep_research: false,
+            max_search_queries: Some(5),
+            requires_web_search: true,
+            context_window: Some(128_000),
+        }
+    } else {
+        SearchModelConfig::default()
+    }
+}
+
 /// Returns a `ModelFamily` for the given model slug, or `None` if the slug
 /// does not match any known model family.
 pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {

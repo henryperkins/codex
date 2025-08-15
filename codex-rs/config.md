@@ -316,6 +316,8 @@ Example configuration:
 [web_search]
 enabled = true                # default: false
 context_size = "medium"       # one of: "low" | "medium" | "high"
+# Optionally pin a dated tool version (falls back to generic when unset)
+# tool_version = "2025_03_11"   # also accepts "2025-03-11"
 
 # Optionally refine by approximate user location
 [web_search.user_location]
@@ -335,6 +337,12 @@ Tuning guidance:
 - **`context_size`**: `low` is fastest/cheapest; `high` retrieves more context and can improve answer quality at the cost of latency.
 - **`user_location`**: Helps geographic relevance (country/city/region/timezone). Deep research models may ignore location.
 
+Versioning and model notes:
+
+- **Versioned tool support**: If `tool_version` is set, Codex requests the corresponding dated tool (e.g., `web_search_preview_2025_03_11`). Otherwise it requests the generic `web_search_preview`.
+- **Deep research models**: For families like `o3` and `o4-mini`, `user_location` and `context_size` are not sent because these models ignore or do not support them.
+- **Context limit when using search**: Even on larger-window models, effective context is capped at 128k when web search is enabled.
+
 Force tool choice
 
 If you want the model to prioritize the web search tool for a turn, you can force the `tool_choice` sent to the Responses API. This may reduce latency and improve consistency at the cost of flexibility (the model is nudged to use search first).
@@ -342,7 +350,7 @@ If you want the model to prioritize the web search tool for a turn, you can forc
 ```toml
 [web_search]
 enabled = true
-force_tool_choice = true  # sends {type = "web_search_preview"} instead of "auto"
+force_tool_choice = true  # sends {type = "web_search_preview[_YYYY_MM_DD]"} instead of "auto"
 ```
 
 Notes:

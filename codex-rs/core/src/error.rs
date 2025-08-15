@@ -98,6 +98,18 @@ pub enum CodexErr {
     #[error("codex-linux-sandbox was required but not provided")]
     LandlockSandboxExecutableNotProvided,
 
+    /// Context window limit exceeded
+    #[error("Context window exceeded: {used} tokens used, limit is {limit} tokens{}", if *.web_search_limited { " (limited due to web search)" } else { "" })]
+    ContextWindowExceeded {
+        used: usize,
+        limit: usize,
+        web_search_limited: bool,
+    },
+
+    /// Rate limit exceeded for web search
+    #[error("Web search rate limit exceeded: {limit} requests per {window}")]
+    RateLimitExceeded { limit: u32, window: String },
+
     // -----------------------------------------------------------------
     // Automatic conversions for common external error types
     // -----------------------------------------------------------------

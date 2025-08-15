@@ -1,0 +1,17 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_demo"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws1","call_id":"call_ws1","status":"started","action":"search","query":"latest Rust stable version","domains":["blog.rust-lang.org","doc.rust-lang.org"]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws1","call_id":"call_ws1","status":"in_progress","action":"open_page","query":"Rust 1.80 release blog","domains":["blog.rust-lang.org"]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws1","call_id":"call_ws1","status":"completed","action":"find_in_page","query":"What's new","domains":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust 1.80.0 stabilized new features and tooling improvements. See the official blog post for details.","annotations":[{"type":"url_citation","start_index":0,"end_index":29,"url":"https://blog.rust-lang.org/2025/07/25/Rust-1.80.0.html","title":"Announcing Rust 1.80.0"},{"type":"url_citation","start_index":72,"end_index":90,"url":"https://doc.rust-lang.org/","title":"Rust Documentation"}]}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_demo","output":[]}}
