@@ -57,7 +57,7 @@ struct Error {
     message: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ModelClient {
     config: Arc<Config>,
     auth: Option<CodexAuth>,
