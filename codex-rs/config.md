@@ -314,7 +314,7 @@ Example configuration:
 
 ```toml
 [web_search]
-enabled = true                # default: false
+enabled = true                # default: true
 context_size = "medium"       # one of: "low" | "medium" | "high"
 # Optionally pin a dated tool version (falls back to generic when unset)
 # tool_version = "2025_03_11"   # also accepts "2025-03-11"

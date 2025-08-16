@@ -102,10 +102,10 @@ pub struct WebSearchUserLocation {
 }
 
 /// Configuration for web search tool
-#[derive(Deserialize, Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Serialize)]
 pub struct WebSearchSettings {
     /// Whether web search is enabled
-    #[serde(default)]
+    #[serde(default = "default_web_search_enabled")]
     pub enabled: bool,
 
     /// Search context size
@@ -214,6 +214,27 @@ fn default_highlight_citations() -> bool {
 
 fn default_enable_rate_limiting() -> bool {
     true
+}
+
+fn default_web_search_enabled() -> bool {
+    true
+}
+
+impl Default for WebSearchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            context_size: WebSearchContextSize::Medium,
+            user_location: None,
+            force_tool_choice: false,
+            tool_version: None,
+            enforce_context_limit: default_enforce_context_limit(),
+            show_search_costs: false,
+            render_citations: default_render_citations(),
+            display: WebSearchDisplaySettings::default(),
+            rate_limiting: WebSearchRateLimitSettings::default(),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize, Display)]

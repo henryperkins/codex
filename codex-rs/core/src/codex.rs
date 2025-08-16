@@ -1851,7 +1851,18 @@ async fn handle_response_item(
             query,
             domains,
         } => {
-            handle_web_search_call(sess, sub_id, id, call_id, status, action, query, domains).await;
+            handle_web_search_call(
+                sess,
+                turn_context,
+                sub_id,
+                id,
+                call_id,
+                status,
+                action,
+                query,
+                domains,
+            )
+            .await;
             None
         }
         ResponseItem::Other => None,
@@ -1861,6 +1872,7 @@ async fn handle_response_item(
 
 async fn handle_web_search_call(
     sess: &Session,
+    turn_context: &TurnContext,
     sub_id: &str,
     id: String,
     call_id: Option<String>,
@@ -1878,6 +1890,70 @@ async fn handle_web_search_call(
         WebSearchStatus::Completed => WebSearchEventStatus::Completed,
         WebSearchStatus::Failed => WebSearchEventStatus::Failed,
     };
+
+    // If approvals are on-request and network access is restricted, ask the user
+    // to approve web search before proceeding on the first Started event.
+    if matches!(event_status, WebSearchEventStatus::Started) {
+        let safety = {
+            let state = sess.state.lock_unchecked();
+            crate::safety::assess_web_search_safety(
+                turn_context.approval_policy,
+                &turn_context.sandbox_policy,
+                &state.approved_commands,
+            )
+        };
+
+        if let crate::safety::SafetyCheck::AskUser = safety {
+            let call_id_str = call_id.clone().unwrap_or_else(|| id.clone());
+
+            let mut command = vec!["web_search".to_string()];
+            if let Some(q) = &query {
+                command.push(q.clone());
+            }
+            if let Some(ds) = &domains {
+                if !ds.is_empty() {
+                    command.push(format!("domains={}", ds.join(",")));
+                }
+            }
+
+            let reason = Some(match (&query, &domains) {
+                (Some(q), Some(ds)) if !ds.is_empty() => {
+                    format!(
+                        "Web search requires network access for `{}` on {}",
+                        q,
+                        ds.join(",")
+                    )
+                }
+                (Some(q), _) => format!("Web search requires network access for `{q}`"),
+                _ => "Web search requires network access".to_string(),
+            });
+
+            let rx = sess
+                .request_command_approval(
+                    sub_id.to_string(),
+                    call_id_str.clone(),
+                    command,
+                    turn_context.cwd.clone(),
+                    reason,
+                )
+                .await;
+
+            match rx.await.unwrap_or_default() {
+                crate::protocol::ReviewDecision::Approved => { /* proceed */ }
+                crate::protocol::ReviewDecision::ApprovedForSession => {
+                    // Persist approval marker for this session so future searches are auto-approved.
+                    sess.add_approved_command(vec!["web_search".to_string()]);
+                }
+                crate::protocol::ReviewDecision::Denied
+                | crate::protocol::ReviewDecision::Abort => {
+                    // Inform the user that the search was rejected and stop propagating this event.
+                    sess.notify_background_event(sub_id, "web search rejected by user")
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
 
     let event = Event {
         id: sub_id.to_string(),

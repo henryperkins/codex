@@ -45,6 +45,13 @@ pub struct WebSearchConfig {
     pub user_location: Option<WebSearchUserLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_context_size: Option<String>, // "low", "medium", "high"
+    /// When present and true, indicates the model is explicitly requesting to use
+    /// web search with escalated permissions (i.e., user approval).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_escalated_permissions: Option<bool>,
+    /// Optional 1‑sentence explanation for why web search should run with escalated permissions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
 }
 
 /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
@@ -137,6 +144,8 @@ impl ToolsConfig {
                         crate::config_types::WebSearchContextSize::High => Some("high".to_string()),
                     }
                 },
+                with_escalated_permissions: None,
+                justification: None,
             })
         } else {
             None
@@ -678,6 +687,8 @@ pub(crate) fn get_openai_tools(
             config: config.web_search_config.clone().unwrap_or(WebSearchConfig {
                 user_location: None,
                 search_context_size: None,
+                with_escalated_permissions: None,
+                justification: None,
             }),
         });
     }
@@ -745,7 +756,10 @@ mod tests {
         );
         let tools = get_openai_tools(&config, Some(HashMap::new()));
 
-        assert_eq_tool_names(&tools, &["local_shell", "update_plan"]);
+        assert_eq_tool_names(
+            &tools,
+            &["local_shell", "update_plan", "web_search_preview"],
+        );
     }
 
     #[test]
@@ -762,7 +776,7 @@ mod tests {
         );
         let tools = get_openai_tools(&config, Some(HashMap::new()));
 
-        assert_eq_tool_names(&tools, &["shell", "update_plan"]);
+        assert_eq_tool_names(&tools, &["shell", "update_plan", "web_search_preview"]);
     }
 
     #[test]
@@ -814,10 +828,17 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "test_server/do_something_cool"]);
+        assert_eq_tool_names(
+            &tools,
+            &[
+                "shell",
+                "web_search_preview",
+                "test_server/do_something_cool",
+            ],
+        );
 
         assert_eq!(
-            tools[1],
+            tools[2],
             OpenAiTool::Function(ResponsesApiTool {
                 name: "test_server/do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
@@ -895,10 +916,10 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "dash/search"]);
+        assert_eq_tool_names(&tools, &["shell", "web_search_preview", "dash/search"]);
 
         assert_eq!(
-            tools[1],
+            tools[2],
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/search".to_string(),
                 parameters: JsonSchema::Object {
@@ -950,9 +971,9 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "dash/paginate"]);
+        assert_eq_tool_names(&tools, &["shell", "web_search_preview", "dash/paginate"]);
         assert_eq!(
-            tools[1],
+            tools[2],
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/paginate".to_string(),
                 parameters: JsonSchema::Object {
@@ -1002,9 +1023,9 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "dash/tags"]);
+        assert_eq_tool_names(&tools, &["shell", "web_search_preview", "dash/tags"]);
         assert_eq!(
-            tools[1],
+            tools[2],
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/tags".to_string(),
                 parameters: JsonSchema::Object {
@@ -1085,9 +1106,9 @@ mod tests {
             )])),
         );
 
-        assert_eq_tool_names(&tools, &["shell", "dash/value"]);
+        assert_eq_tool_names(&tools, &["shell", "web_search_preview", "dash/value"]);
         assert_eq!(
-            tools[1],
+            tools[2],
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/value".to_string(),
                 parameters: JsonSchema::Object {

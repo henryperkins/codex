@@ -23,6 +23,25 @@ use crate::message_history::HistoryEntry;
 use crate::parse_command::ParsedCommand;
 use crate::plan_tool::UpdatePlanArgs;
 
+// Types needed for web search events
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchAction {
+    Search,
+    OpenPage,
+    FindInPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UrlCitation {
+    #[serde(rename = "type")]
+    pub citation_type: String, // "url_citation"
+    pub start_index: usize,
+    pub end_index: usize,
+    pub url: String,
+    pub title: Option<String>,
+}
+
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Submission {
@@ -444,7 +463,7 @@ pub struct WebSearchEvent {
     pub call_id: Option<String>,
     pub status: WebSearchEventStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<crate::models::WebSearchAction>,
+    pub action: Option<WebSearchAction>,
     pub query: Option<String>,
     pub domains: Option<Vec<String>>,
 }
@@ -546,23 +565,6 @@ impl TokenUsage {
             base_window
         }
     }
-
-    /// Validate that current token usage doesn't exceed context window
-    pub fn validate_context_usage(
-        current_tokens: usize,
-        effective_window: usize,
-        web_search_enabled: bool,
-    ) -> Result<(), crate::error::CodexErr> {
-        if current_tokens > effective_window {
-            return Err(crate::error::CodexErr::ContextWindowExceeded {
-                used: current_tokens,
-                limit: effective_window,
-                web_search_limited: web_search_enabled,
-            });
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -602,7 +604,7 @@ impl fmt::Display for FinalOutput {
 pub struct AgentMessageEvent {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub citations: Option<Vec<crate::models::UrlCitation>>,
+    pub citations: Option<Vec<UrlCitation>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

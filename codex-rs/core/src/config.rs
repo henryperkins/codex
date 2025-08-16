@@ -606,11 +606,13 @@ impl Config {
             .or_else(|| openai_model_info.as_ref().map(|info| info.context_window));
         // Enforce the 128k token context limit when web search is enabled,
         // per OpenAI web search constraints (even for larger-window models).
+        // Default behavior matches WebSearchSettings::default() (enabled = true).
+        let ws_default_enabled = WebSearchSettings::default().enabled;
         if cfg
             .web_search
             .as_ref()
             .map(|ws| ws.enabled)
-            .unwrap_or(false)
+            .unwrap_or(ws_default_enabled)
         {
             if let Some(val) = model_context_window {
                 model_context_window = Some(val.min(128_000));
@@ -1028,7 +1030,7 @@ disable_response_storage = true
             Config {
                 model: "o3".to_string(),
                 model_family: find_family_for_model("o3").expect("known model slug"),
-                model_context_window: Some(200_000),
+                model_context_window: Some(128_000),
                 model_max_output_tokens: Some(100_000),
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
@@ -1149,7 +1151,7 @@ disable_response_storage = true
         let expected_zdr_profile_config = Config {
             model: "o3".to_string(),
             model_family: find_family_for_model("o3").expect("known model slug"),
-            model_context_window: Some(200_000),
+            model_context_window: Some(128_000),
             model_max_output_tokens: Some(100_000),
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),

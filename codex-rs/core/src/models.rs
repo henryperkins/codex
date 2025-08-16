@@ -18,13 +18,8 @@ pub enum WebSearchStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum WebSearchAction {
-    Search,
-    OpenPage,
-    FindInPage,
-}
+// Re-export from protocol crate
+pub use codex_protocol::WebSearchAction;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -59,15 +54,8 @@ pub enum ContentItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct UrlCitation {
-    #[serde(rename = "type")]
-    pub citation_type: String, // "url_citation"
-    pub start_index: usize,
-    pub end_index: usize,
-    pub url: String,
-    pub title: Option<String>,
-}
+// Re-export from protocol crate
+pub use codex_protocol::UrlCitation;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]

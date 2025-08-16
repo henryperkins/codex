@@ -159,6 +159,49 @@ pub(crate) fn assess_safety_for_untrusted_command(
     }
 }
 
+/// Assess whether a web search should require user approval based on approval
+/// policy and sandbox policy (i.e., whether network access is permitted).
+pub fn assess_web_search_safety(
+    approval_policy: AskForApproval,
+    sandbox_policy: &SandboxPolicy,
+    approved: &HashSet<Vec<String>>,
+) -> SafetyCheck {
+    // If the user has already approved web search for this session, auto-approve.
+    if approved.contains(&vec!["web_search".to_string()]) {
+        return SafetyCheck::AutoApprove {
+            sandbox_type: SandboxType::None,
+        };
+    }
+
+    use AskForApproval::*;
+    use SandboxPolicy::*;
+
+    match (approval_policy, sandbox_policy) {
+        // Non-interactive and on-failure modes: allow web search without prompting.
+        (Never, _) | (OnFailure, _) => SafetyCheck::AutoApprove {
+            sandbox_type: SandboxType::None,
+        },
+        // DangerFullAccess implies no approval needed.
+        (OnRequest, DangerFullAccess) => SafetyCheck::AutoApprove {
+            sandbox_type: SandboxType::None,
+        },
+        // If WorkspaceWrite permits network, allow; otherwise request approval.
+        (OnRequest, WorkspaceWrite { network_access, .. }) => {
+            if *network_access {
+                SafetyCheck::AutoApprove {
+                    sandbox_type: SandboxType::None,
+                }
+            } else {
+                SafetyCheck::AskUser
+            }
+        }
+        // ReadOnly always requires approval for web search in OnRequest mode.
+        (OnRequest, ReadOnly) => SafetyCheck::AskUser,
+        // The user wants to be asked for untrusted actions.
+        (UnlessTrusted, _) => SafetyCheck::AskUser,
+    }
+}
+
 pub fn get_platform_sandbox() -> Option<SandboxType> {
     if cfg!(target_os = "macos") {
         Some(SandboxType::MacosSeatbelt)
