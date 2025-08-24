@@ -226,6 +226,8 @@ impl ModelProviderInfo {
 const DEFAULT_OLLAMA_PORT: u32 = 11434;
 
 pub const BUILT_IN_OSS_MODEL_PROVIDER_ID: &str = "oss";
+pub const BUILT_IN_AZURE_RESPONSES_PROVIDER_ID: &str = "azure-responses";
+pub const BUILT_IN_AZURE_CHAT_PROVIDER_ID: &str = "azure-chat";
 
 /// Built-in default provider list.
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
@@ -235,6 +237,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
     // providers are bundled with Codex CLI, so we only include the OpenAI and
     // open source ("oss") providers by default. Users are encouraged to add to
     // `model_providers` in config.toml to add their own providers.
+    // Azure providers are included due to their widespread enterprise adoption.
     [
         (
             "openai",
@@ -276,6 +279,8 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
             },
         ),
         (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
+        (BUILT_IN_AZURE_RESPONSES_PROVIDER_ID, create_azure_responses_provider()),
+        (BUILT_IN_AZURE_CHAT_PROVIDER_ID, create_azure_chat_provider()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -316,6 +321,78 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         request_max_retries: None,
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+    }
+}
+
+pub fn create_azure_responses_provider() -> ModelProviderInfo {
+    // Azure Responses API provider for stateful conversations
+    // Users must set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+    let azure_endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    
+    ModelProviderInfo {
+        name: "Azure OpenAI Responses API".into(),
+        base_url: azure_endpoint.or_else(|| {
+            // If no endpoint is set, provide a placeholder
+            // Users will need to configure this in config.toml
+            Some("https://YOUR-RESOURCE.openai.azure.com/openai/v1".into())
+        }),
+        env_key: Some("AZURE_OPENAI_API_KEY".into()),
+        env_key_instructions: Some(
+            "Set AZURE_OPENAI_API_KEY with your Azure OpenAI API key. \
+            Also set AZURE_OPENAI_ENDPOINT with your resource endpoint. \
+            See: https://learn.microsoft.com/azure/ai-services/openai/quickstart"
+                .into(),
+        ),
+        wire_api: WireApi::Responses,
+        query_params: Some(
+            [("api-version".to_string(), "preview".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(5),
+        stream_max_retries: Some(10),
+        stream_idle_timeout_ms: Some(300_000),
+        requires_openai_auth: false,
+    }
+}
+
+pub fn create_azure_chat_provider() -> ModelProviderInfo {
+    // Azure Chat Completions API provider for standard chat
+    // Users must set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+    let azure_endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    
+    ModelProviderInfo {
+        name: "Azure OpenAI Chat Completions".into(),
+        base_url: azure_endpoint.or_else(|| {
+            // If no endpoint is set, provide a placeholder
+            // Users will need to configure this in config.toml
+            Some("https://YOUR-RESOURCE.openai.azure.com/openai".into())
+        }),
+        env_key: Some("AZURE_OPENAI_API_KEY".into()),
+        env_key_instructions: Some(
+            "Set AZURE_OPENAI_API_KEY with your Azure OpenAI API key. \
+            Also set AZURE_OPENAI_ENDPOINT with your resource endpoint. \
+            See: https://learn.microsoft.com/azure/ai-services/openai/quickstart"
+                .into(),
+        ),
+        wire_api: WireApi::Chat,
+        query_params: Some(
+            [("api-version".to_string(), "2025-04-01-preview".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(5),
+        stream_max_retries: Some(10),
+        stream_idle_timeout_ms: Some(300_000),
         requires_openai_auth: false,
     }
 }
@@ -409,5 +486,83 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
         assert_eq!(expected_provider, provider);
+    }
+
+    #[test]
+    fn test_deserialize_azure_responses_provider_toml() {
+        let azure_responses_toml = r#"
+name = "Azure Responses API"
+base_url = "https://myresource.openai.azure.com/openai/v1"
+env_key = "AZURE_OPENAI_API_KEY"
+wire_api = "responses"
+query_params = { api-version = "preview" }
+stream_max_retries = 10
+stream_idle_timeout_ms = 600000
+        "#;
+        let expected_provider = ModelProviderInfo {
+            name: "Azure Responses API".into(),
+            base_url: Some("https://myresource.openai.azure.com/openai/v1".into()),
+            env_key: Some("AZURE_OPENAI_API_KEY".into()),
+            env_key_instructions: None,
+            wire_api: WireApi::Responses,
+            query_params: Some(maplit::hashmap! {
+                "api-version".to_string() => "preview".to_string(),
+            }),
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: Some(10),
+            stream_idle_timeout_ms: Some(600000),
+            requires_openai_auth: false,
+        };
+
+        let provider: ModelProviderInfo = toml::from_str(azure_responses_toml).unwrap();
+        assert_eq!(expected_provider, provider);
+    }
+
+    #[test]
+    fn test_azure_responses_provider_url_construction() {
+        let provider = ModelProviderInfo {
+            name: "Azure Responses".into(),
+            base_url: Some("https://test.openai.azure.com/openai/v1".into()),
+            env_key: Some("AZURE_OPENAI_API_KEY".into()),
+            env_key_instructions: None,
+            wire_api: WireApi::Responses,
+            query_params: Some(maplit::hashmap! {
+                "api-version".to_string() => "preview".to_string(),
+            }),
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+        };
+
+        let url = provider.get_full_url(&None);
+        assert_eq!(url, "https://test.openai.azure.com/openai/v1/responses?api-version=preview");
+    }
+
+    #[test]
+    fn test_azure_chat_provider_url_construction() {
+        let provider = ModelProviderInfo {
+            name: "Azure Chat".into(),
+            base_url: Some("https://test.openai.azure.com/openai".into()),
+            env_key: Some("AZURE_OPENAI_API_KEY".into()),
+            env_key_instructions: None,
+            wire_api: WireApi::Chat,
+            query_params: Some(maplit::hashmap! {
+                "api-version".to_string() => "2025-04-01-preview".to_string(),
+            }),
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+        };
+
+        let url = provider.get_full_url(&None);
+        assert_eq!(url, "https://test.openai.azure.com/openai/chat/completions?api-version=2025-04-01-preview");
     }
 }

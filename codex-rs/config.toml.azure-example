@@ -1,0 +1,186 @@
+# Codex CLI Configuration for Azure OpenAI o3 and GPT-5 Models
+# 
+# This file should be placed at ~/.codex/config.toml
+# 
+# Prerequisites:
+# 1. Set environment variables:
+#    export AZURE_OPENAI_API_KEY="your-azure-api-key"
+#    export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
+# 2. Ensure you have access to o3 and gpt-5 models in your Azure subscription
+
+# ==============================================================================
+# OPTION 1: Simple Configuration (Using Built-in Azure Providers)
+# ==============================================================================
+
+# For GPT-5 (recommended for most tasks)
+model_provider = "azure-responses"
+model = "gpt-5"  # Replace with your actual deployment name
+model_reasoning_effort = "medium"  # Options: minimal, low, medium, high
+model_reasoning_summary = "detailed"  # Options: auto, detailed (GPT-5 doesn't support concise)
+
+# For o3 (uncomment to use instead of GPT-5)
+# model_provider = "azure-responses"
+# model = "o3"  # Replace with your actual deployment name
+# model_reasoning_effort = "high"  # o3 benefits from higher reasoning effort
+# stream_idle_timeout_ms = 1800000  # 30 minutes for o3-pro long-running tasks
+
+# ==============================================================================
+# OPTION 2: Custom Configuration (Full Control)
+# ==============================================================================
+
+# Custom Azure Responses API provider for GPT-5
+[model_providers.azure-gpt5]
+name = "Azure GPT-5"
+base_url = "https://YOUR-RESOURCE.openai.azure.com/openai/v1"  # Replace YOUR-RESOURCE
+env_key = "AZURE_OPENAI_API_KEY"
+wire_api = "responses"  # Must use Responses API for reasoning models
+query_params = { api-version = "preview" }  # Or "2025-04-01-preview"
+stream_max_retries = 10
+stream_idle_timeout_ms = 600000  # 10 minutes
+request_max_retries = 5
+
+# Custom Azure Responses API provider for o3
+[model_providers.azure-o3]
+name = "Azure o3"
+base_url = "https://YOUR-RESOURCE.openai.azure.com/openai/v1"  # Replace YOUR-RESOURCE
+env_key = "AZURE_OPENAI_API_KEY"
+wire_api = "responses"  # Must use Responses API for o3
+query_params = { api-version = "preview" }
+stream_max_retries = 15  # Higher for o3's longer processing
+stream_idle_timeout_ms = 1800000  # 30 minutes for o3
+request_max_retries = 5
+
+# Custom Azure Responses API provider for o3-pro (if you have access)
+[model_providers.azure-o3-pro]
+name = "Azure o3-pro"
+base_url = "https://YOUR-RESOURCE.openai.azure.com/openai/v1"  # Replace YOUR-RESOURCE
+env_key = "AZURE_OPENAI_API_KEY"
+wire_api = "responses"
+query_params = { api-version = "preview" }
+stream_max_retries = 20
+stream_idle_timeout_ms = 3600000  # 60 minutes for o3-pro
+request_max_retries = 5
+
+# To use custom providers, set:
+# model_provider = "azure-gpt5"  # or "azure-o3" or "azure-o3-pro"
+# model = "your-deployment-name"
+
+# ==============================================================================
+# PROFILES: Quick Switching Between Models
+# ==============================================================================
+
+# Define profiles for easy model switching
+[profiles.gpt5]
+model_provider = "azure-responses"
+model = "gpt-5"  # Replace with your deployment name
+model_reasoning_effort = "medium"
+model_reasoning_summary = "detailed"
+approval_policy = "on-failure"
+
+[profiles.gpt5-quick]
+model_provider = "azure-responses"
+model = "gpt-5"  # Replace with your deployment name
+model_reasoning_effort = "minimal"  # Faster responses
+model_reasoning_summary = "auto"
+approval_policy = "on-failure"
+
+[profiles.gpt5-deep]
+model_provider = "azure-responses"
+model = "gpt-5"  # Replace with your deployment name
+model_reasoning_effort = "high"  # Maximum reasoning
+model_reasoning_summary = "detailed"
+approval_policy = "on-failure"
+
+[profiles.o3]
+model_provider = "azure-responses"
+model = "o3"  # Replace with your deployment name
+model_reasoning_effort = "high"
+model_reasoning_summary = "detailed"
+stream_idle_timeout_ms = 1800000
+approval_policy = "on-failure"
+
+[profiles.o3-mini]
+model_provider = "azure-responses"
+model = "o3-mini"  # Replace with your deployment name
+model_reasoning_effort = "medium"
+model_reasoning_summary = "auto"
+approval_policy = "on-failure"
+
+[profiles.o4-mini]
+model_provider = "azure-responses"
+model = "o4-mini"  # Replace with your deployment name
+model_reasoning_effort = "medium"
+model_reasoning_summary = "auto"
+approval_policy = "on-failure"
+
+# Set default profile
+profile = "gpt5"  # Change to your preferred default
+
+# ==============================================================================
+# ADDITIONAL SETTINGS
+# ==============================================================================
+
+# Sandbox mode for code execution
+sandbox_mode = "workspace-write"  # Allow writing in workspace
+approval_policy = "on-failure"  # Ask for approval on command failures
+
+# File opener for code citations
+file_opener = "vscode"  # or "cursor", "windsurf", "none"
+
+# History persistence
+[history]
+persistence = "save-all"  # Save conversation history
+
+# Network tuning (global defaults, can be overridden per provider)
+# These are applied if not specified in the provider config
+[tui]
+# TUI-specific settings if needed
+
+# Shell environment policy
+[shell_environment_policy]
+inherit = "all"  # Pass full environment to subprocesses
+ignore_default_excludes = false  # Filter out KEY/TOKEN variables
+
+# ==============================================================================
+# USAGE EXAMPLES
+# ==============================================================================
+
+# Command line usage:
+# 
+# 1. Use GPT-5 with default profile:
+#    codex "Explain quantum computing"
+# 
+# 2. Use o3 profile for complex reasoning:
+#    codex --profile o3 "Solve this complex algorithm problem..."
+# 
+# 3. Use GPT-5 with minimal reasoning for quick responses:
+#    codex --profile gpt5-quick "What is 2+2?"
+# 
+# 4. Override model on the fly:
+#    codex --model o3 "Complex task..."
+# 
+# 5. Use high reasoning effort:
+#    codex --config model_reasoning_effort=high "Deep analysis required..."
+
+# ==============================================================================
+# TROUBLESHOOTING
+# ==============================================================================
+
+# If you encounter issues:
+# 
+# 1. Verify environment variables are set:
+#    echo $AZURE_OPENAI_API_KEY
+#    echo $AZURE_OPENAI_ENDPOINT
+# 
+# 2. Check your deployment names match exactly
+# 
+# 3. For timeout errors with o3/o3-pro, increase stream_idle_timeout_ms
+# 
+# 4. For "model not found" errors, verify:
+#    - Your deployment name is correct (not the model name)
+#    - You have access to the model in your Azure subscription
+#    - The region supports the model
+# 
+# 5. API version issues:
+#    - Try "preview" for latest features
+#    - Use specific version like "2025-04-01-preview" if required

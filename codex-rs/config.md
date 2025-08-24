@@ -65,15 +65,72 @@ base_url = "https://api.mistral.ai/v1"
 env_key = "MISTRAL_API_KEY"
 ```
 
-Note that Azure requires `api-version` to be passed as a query parameter, so be sure to specify it as part of `query_params` when defining the Azure provider:
+## Azure OpenAI Provider Configuration
 
+Azure OpenAI offers two API types: Chat Completions and the newer Responses API (preview). Codex CLI now includes built-in support for both.
+
+### Using Built-in Azure Providers
+
+Codex CLI includes two built-in Azure providers that you can use immediately:
+
+#### Azure Responses API (for stateful conversations and reasoning models)
 ```toml
-[model_providers.azure]
-name = "Azure"
-# Make sure you set the appropriate subdomain for this URL.
+model_provider = "azure-responses"
+model = "gpt-5"  # or "o3", "o4-mini", etc.
+```
+
+#### Azure Chat Completions API (for standard chat)
+```toml
+model_provider = "azure-chat"  
+model = "gpt-4o"  # Your deployment name
+```
+
+Both providers require setting these environment variables:
+- `AZURE_OPENAI_API_KEY`: Your Azure OpenAI API key
+- `AZURE_OPENAI_ENDPOINT`: Your resource endpoint (e.g., `https://myresource.openai.azure.com`)
+
+### Custom Azure Configuration
+
+You can also configure Azure providers manually for more control:
+
+#### Azure Responses API Configuration
+```toml
+[model_providers.my-azure-responses]
+name = "My Azure Responses"
+base_url = "https://YOUR_PROJECT_NAME.openai.azure.com/openai/v1"
+env_key = "AZURE_OPENAI_API_KEY"
+wire_api = "responses"  # Important: Use Responses API
+query_params = { api-version = "preview" }  # Or specific version like "2025-04-01-preview"
+# Optional: Tune network settings for long-running reasoning models
+stream_max_retries = 10
+stream_idle_timeout_ms = 600000  # 10 minutes for o3-pro
+```
+
+#### Azure Chat Completions Configuration  
+```toml
+[model_providers.my-azure-chat]
+name = "My Azure Chat"
 base_url = "https://YOUR_PROJECT_NAME.openai.azure.com/openai"
-env_key = "AZURE_OPENAI_API_KEY"  # Or "OPENAI_API_KEY", whichever you use.
+env_key = "AZURE_OPENAI_API_KEY"
+wire_api = "chat"  # Uses Chat Completions API
 query_params = { api-version = "2025-04-01-preview" }
+```
+
+### Azure-Specific Features
+
+When using Azure Responses API with reasoning models (gpt-5, o3, o4-mini), you get access to:
+- **Reasoning effort control**: Configure thinking depth with `model_reasoning_effort`
+- **Reasoning summaries**: Get insights into the model's thought process
+- **Stateful conversations**: Chain responses with `previous_response_id`
+- **Background tasks**: Run long operations asynchronously (recommended for o3-pro)
+- **Extended context windows**: Up to 400K tokens for GPT-5 series
+
+Example configuration for reasoning models:
+```toml
+model_provider = "azure-responses"
+model = "gpt-5"
+model_reasoning_effort = "medium"  # minimal, low, medium, high
+model_reasoning_summary = "detailed"  # auto, detailed (GPT-5 doesn't support concise)
 ```
 
 It is also possible to configure a provider to include extra HTTP headers with a request. These can be hardcoded values (`http_headers`) or values read from environment variables (`env_http_headers`):

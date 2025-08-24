@@ -1,0 +1,33 @@
+# Minimal config.toml for Azure OpenAI with Codex CLI
+# Copy this file to ~/.codex/config.toml
+
+# STEP 1: Set these environment variables first:
+# export AZURE_OPENAI_API_KEY="your-api-key-here"
+# export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
+
+# STEP 2: Replace "gpt-5" and "o3" below with your actual deployment names
+
+# Default to GPT-5
+model_provider = "azure-responses"
+model = "gpt-5"  # ← REPLACE with your deployment name
+model_reasoning_effort = "medium"
+model_reasoning_summary = "detailed"
+
+# Quick profile switching
+[profiles.gpt5]
+model_provider = "azure-responses"
+model = "gpt-5"  # ← REPLACE with your deployment name
+model_reasoning_effort = "medium"
+
+[profiles.o3]
+model_provider = "azure-responses"
+model = "o3"  # ← REPLACE with your deployment name
+model_reasoning_effort = "high"
+stream_idle_timeout_ms = 1800000  # 30 min for o3
+
+# Set default profile
+profile = "gpt5"
+
+# Usage:
+# codex "Your prompt"           # Uses GPT-5
+# codex --profile o3 "Prompt"   # Uses o3
