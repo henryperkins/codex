@@ -21,6 +21,7 @@ use tracing::trace;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::azure_rate_limiter::AzureOpenAIRateLimiter;
 use crate::chat_completions::AggregateStreamExt;
 use crate::chat_completions::stream_chat_completions;
 use crate::client_common::Prompt;
@@ -67,6 +68,7 @@ pub struct ModelClient {
     session_id: Uuid,
     effort: ReasoningEffortConfig,
     summary: ReasoningSummaryConfig,
+    rate_limiter: Option<Arc<AzureOpenAIRateLimiter>>,
 }
 
 impl ModelClient {
@@ -78,6 +80,29 @@ impl ModelClient {
         summary: ReasoningSummaryConfig,
         session_id: Uuid,
     ) -> Self {
+        // Initialize rate limiter for Azure providers
+        let rate_limiter = if provider.name.to_lowercase().contains("azure")
+            || provider
+                .base_url
+                .as_ref()
+                .map(|url| url.contains("azure.com"))
+                .unwrap_or(false)
+        {
+            // Use the config directly if present, otherwise use defaults
+            let rate_limit_config = config.azure_rate_limit.clone().unwrap_or_default();
+
+            // Only create rate limiter if enabled
+            if rate_limit_config.enabled {
+                Some(Arc::new(AzureOpenAIRateLimiter::with_config(
+                    rate_limit_config,
+                )))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             auth_manager,
@@ -86,6 +111,7 @@ impl ModelClient {
             session_id,
             effort,
             summary,
+            rate_limiter,
         }
     }
 
@@ -102,6 +128,8 @@ impl ModelClient {
                     &self.config.model_family,
                     &self.client,
                     &self.provider,
+                    self.rate_limiter.clone(),
+                    Some(&self.config.model),
                 )
                 .await?;
 
@@ -217,8 +245,49 @@ impl ModelClient {
             serde_json::to_string(&payload)?
         );
 
+        // Estimate token count for rate limiting using tiktoken. Use model family slug as encoding hint.
+        let estimated_tokens = if let Some(ref _limiter) = self.rate_limiter {
+            let input_json = serde_json::to_string(&input_with_instructions).unwrap_or_default();
+            let enc_model = &self.config.model_family.slug;
+            let input_tokens =
+                AzureOpenAIRateLimiter::estimate_tokens_for_model(enc_model, &input_json);
+            let instruction_tokens = AzureOpenAIRateLimiter::estimate_tokens_for_model(
+                enc_model,
+                full_instructions.as_ref(),
+            );
+            input_tokens + instruction_tokens + 1000 // Buffer for response
+        } else {
+            0
+        };
+
         loop {
             attempt += 1;
+
+            // Apply rate limiting before making the request
+            if let Some(ref limiter) = self.rate_limiter {
+                match limiter
+                    .acquire_for_deployment(
+                        &self.config.model,             // deployment key
+                        &self.config.model_family.slug, // model hint for capacity
+                        estimated_tokens,
+                    )
+                    .await
+                {
+                    Ok(_) => debug!(
+                        "Rate limiter permits acquired for {} tokens",
+                        estimated_tokens
+                    ),
+                    Err(e) => {
+                        warn!("Rate limiter error: {}", e);
+                        if attempt > max_retries {
+                            return Err(CodexErr::RetryLimit(StatusCode::TOO_MANY_REQUESTS));
+                        }
+                        let delay = backoff(attempt);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                }
+            }
 
             let mut req_builder = self
                 .provider
@@ -256,14 +325,29 @@ impl ModelClient {
 
             match res {
                 Ok(resp) if resp.status().is_success() => {
+                    // Update rate limiter with response headers
+                    if let Some(ref limiter) = self.rate_limiter {
+                        limiter.update_from_response(resp.headers()).await;
+                        limiter.record_success().await;
+                    }
+
                     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
 
                     // spawn task to process SSE
                     let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
+                    let reconcile = self.rate_limiter.as_ref().map(|limiter| {
+                        (
+                            limiter.clone(),
+                            self.config.model.clone(),
+                            self.config.model_family.slug.clone(),
+                            estimated_tokens,
+                        )
+                    });
                     tokio::spawn(process_sse(
                         stream,
                         tx_event,
                         self.provider.stream_idle_timeout(),
+                        reconcile,
                     ));
 
                     return Ok(ResponseStream { rx_event });
@@ -271,10 +355,24 @@ impl ModelClient {
                 Ok(res) => {
                     let status = res.status();
 
-                    // Pull out Retry‑After header if present.
+                    // Update rate limiter with response headers (even on errors)
+                    if let Some(ref limiter) = self.rate_limiter {
+                        limiter.update_from_response(res.headers()).await;
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            limiter.record_failure().await;
+                        }
+                    }
+
+                    // Pull out Retry‑After headers if present (seconds or milliseconds).
+                    use reqwest::header::HeaderName;
                     let retry_after_secs = res
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let retry_after_ms = res
+                        .headers()
+                        .get(HeaderName::from_static("retry-after-ms"))
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
 
@@ -329,12 +427,19 @@ impl ModelClient {
                         return Err(CodexErr::RetryLimit(status));
                     }
 
-                    let delay = retry_after_secs
-                        .map(|s| Duration::from_millis(s * 1_000))
-                        .unwrap_or_else(|| backoff(attempt));
+                    let delay = match (retry_after_ms, retry_after_secs) {
+                        (Some(ms), _) => Duration::from_millis(ms),
+                        (None, Some(s)) => Duration::from_millis(s * 1_000),
+                        (None, None) => backoff(attempt),
+                    };
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
+                    // Record failure in rate limiter
+                    if let Some(ref limiter) = self.rate_limiter {
+                        limiter.record_failure().await;
+                    }
+
                     if attempt > max_retries {
                         return Err(e.into());
                     }
@@ -427,6 +532,7 @@ async fn process_sse<S>(
     stream: S,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
+    reconcile: Option<(Arc<AzureOpenAIRateLimiter>, String, String, u32)>,
 ) where
     S: Stream<Item = Result<Bytes>> + Unpin,
 {
@@ -448,10 +554,32 @@ async fn process_sse<S>(
             }
             Ok(None) => {
                 match response_completed {
-                    Some(ResponseCompleted {
-                        id: response_id,
-                        usage,
-                    }) => {
+                    Some(ResponseCompleted { id: response_id, usage }) => {
+                        if let (Some(usage_ref), Some((limiter, bucket_key, model_hint, est))) =
+                            (usage.as_ref(), reconcile.clone())
+                        {
+                            let token_usage = TokenUsage {
+                                input_tokens: usage_ref.input_tokens,
+                                cached_input_tokens: usage_ref
+                                    .input_tokens_details
+                                    .as_ref()
+                                    .map(|d| d.cached_tokens),
+                                output_tokens: usage_ref.output_tokens,
+                                reasoning_output_tokens: usage_ref
+                                    .output_tokens_details
+                                    .as_ref()
+                                    .map(|d| d.reasoning_tokens),
+                                total_tokens: usage_ref.total_tokens,
+                            };
+                            limiter
+                                .reconcile_after_completed(
+                                    &bucket_key,
+                                    &model_hint,
+                                    est,
+                                    token_usage,
+                                )
+                                .await;
+                        }
                         let event = ResponseEvent::Completed {
                             response_id,
                             token_usage: usage.map(Into::into),
@@ -649,6 +777,7 @@ async fn stream_from_fixture(
         stream,
         tx_event,
         provider.stream_idle_timeout(),
+        None,
     ));
     Ok(ResponseStream { rx_event })
 }
@@ -660,27 +789,52 @@ fn rate_limit_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"Please try again in (\d+(?:\.\d+)?)(s|ms)").unwrap())
 }
 
+fn azure_rate_limit_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+
+    #[expect(clippy::unwrap_used)]
+    RE.get_or_init(|| Regex::new(r"[Tt]ry again in (\d+(?:\.\d+)?)\s*(seconds?|s|ms)?").unwrap())
+}
+
 fn try_parse_retry_after(err: &Error) -> Option<Duration> {
     if err.code != Some("rate_limit_exceeded".to_string()) {
         return None;
     }
 
-    // parse the Please try again in 1.898s format using regex
-    let re = rate_limit_regex();
-    if let Some(message) = &err.message
-        && let Some(captures) = re.captures(message)
-    {
-        let seconds = captures.get(1);
-        let unit = captures.get(2);
+    if let Some(message) = &err.message {
+        // Try standard OpenAI format first: "Please try again in 1.898s"
+        let re = rate_limit_regex();
+        if let Some(captures) = re.captures(message) {
+            let seconds = captures.get(1);
+            let unit = captures.get(2);
 
-        if let (Some(value), Some(unit)) = (seconds, unit) {
-            let value = value.as_str().parse::<f64>().ok()?;
-            let unit = unit.as_str();
+            if let (Some(value), Some(unit)) = (seconds, unit) {
+                let value = value.as_str().parse::<f64>().ok()?;
+                let unit = unit.as_str();
 
-            if unit == "s" {
+                if unit == "s" {
+                    return Some(Duration::from_secs_f64(value));
+                } else if unit == "ms" {
+                    return Some(Duration::from_millis(value as u64));
+                }
+            }
+        }
+
+        // Try Azure format: "Rate limit is exceeded. Try again in 25 seconds."
+        let azure_re = azure_rate_limit_regex();
+        if let Some(captures) = azure_re.captures(message) {
+            if let Some(value_match) = captures.get(1) {
+                let value = value_match.as_str().parse::<f64>().ok()?;
+
+                // Check if unit is specified
+                if let Some(unit_match) = captures.get(2) {
+                    let unit = unit_match.as_str();
+                    if unit == "ms" {
+                        return Some(Duration::from_millis(value as u64));
+                    }
+                }
+                // Default to seconds for Azure format (including "seconds", "second", "s")
                 return Some(Duration::from_secs_f64(value));
-            } else if unit == "ms" {
-                return Some(Duration::from_millis(value as u64));
             }
         }
     }
@@ -713,7 +867,12 @@ mod tests {
         let reader = builder.build();
         let stream = ReaderStream::new(reader).map_err(CodexErr::Io);
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent>>(16);
-        tokio::spawn(process_sse(stream, tx, provider.stream_idle_timeout()));
+        tokio::spawn(process_sse(
+            stream,
+            tx,
+            provider.stream_idle_timeout(),
+            None,
+        ));
 
         let mut events = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -743,7 +902,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent>>(8);
         let stream = ReaderStream::new(std::io::Cursor::new(body)).map_err(CodexErr::Io);
-        tokio::spawn(process_sse(stream, tx, provider.stream_idle_timeout()));
+        tokio::spawn(process_sse(
+            stream,
+            tx,
+            provider.stream_idle_timeout(),
+            None,
+        ));
 
         let mut out = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -1033,5 +1197,35 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
+    }
+
+    #[test]
+    fn test_try_parse_retry_after_azure_format() {
+        // Test Azure format: "Rate limit is exceeded. Try again in 25 seconds."
+        let err = Error {
+            r#type: None,
+            message: Some("Rate limit is exceeded. Try again in 25 seconds.".to_string()),
+            code: Some("rate_limit_exceeded".to_string()),
+        };
+        let delay = try_parse_retry_after(&err);
+        assert_eq!(delay, Some(Duration::from_secs(25)));
+
+        // Test with decimal seconds
+        let err2 = Error {
+            r#type: None,
+            message: Some("Rate limit is exceeded. Try again in 10.5 seconds.".to_string()),
+            code: Some("rate_limit_exceeded".to_string()),
+        };
+        let delay2 = try_parse_retry_after(&err2);
+        assert_eq!(delay2, Some(Duration::from_secs_f64(10.5)));
+
+        // Test without unit (should default to seconds)
+        let err3 = Error {
+            r#type: None,
+            message: Some("Rate limit is exceeded. Try again in 30.".to_string()),
+            code: Some("rate_limit_exceeded".to_string()),
+        };
+        let delay3 = try_parse_retry_after(&err3);
+        assert_eq!(delay3, Some(Duration::from_secs(30)));
     }
 }

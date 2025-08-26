@@ -178,6 +178,9 @@ pub struct Config {
     pub preferred_auth_method: AuthMode,
 
     pub use_experimental_streamable_shell_tool: bool,
+
+    /// Azure OpenAI rate limiting configuration
+    pub azure_rate_limit: Option<crate::azure_rate_limiter::AzureRateLimitConfig>,
 }
 
 impl Config {
@@ -472,6 +475,9 @@ pub struct ConfigToml {
 
     /// Experimental path to a file whose contents replace the built-in BASE_INSTRUCTIONS.
     pub experimental_instructions_file: Option<PathBuf>,
+
+    /// Azure OpenAI rate limiting configuration
+    pub azure_rate_limit: Option<crate::azure_rate_limiter::AzureRateLimitConfig>,
 
     pub experimental_use_exec_command_tool: Option<bool>,
 
@@ -784,6 +790,7 @@ impl Config {
             use_experimental_streamable_shell_tool: cfg
                 .experimental_use_exec_command_tool
                 .unwrap_or(false),
+            azure_rate_limit: cfg.azure_rate_limit.clone(),
         };
         Ok(config)
     }
@@ -1152,6 +1159,7 @@ disable_response_storage = true
                 responses_originator_header: "codex_cli_rs".to_string(),
                 preferred_auth_method: AuthMode::ChatGPT,
                 use_experimental_streamable_shell_tool: false,
+                azure_rate_limit: None,
             },
             o3_profile_config
         );
@@ -1208,6 +1216,7 @@ disable_response_storage = true
             responses_originator_header: "codex_cli_rs".to_string(),
             preferred_auth_method: AuthMode::ChatGPT,
             use_experimental_streamable_shell_tool: false,
+            azure_rate_limit: None,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1279,6 +1288,7 @@ disable_response_storage = true
             responses_originator_header: "codex_cli_rs".to_string(),
             preferred_auth_method: AuthMode::ChatGPT,
             use_experimental_streamable_shell_tool: false,
+            azure_rate_limit: None,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);

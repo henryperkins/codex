@@ -16,6 +16,7 @@ use tracing::debug;
 use tracing::trace;
 
 use crate::ModelProviderInfo;
+use crate::azure_rate_limiter::AzureOpenAIRateLimiter;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -27,6 +28,7 @@ use crate::util::backoff;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
+use std::sync::Arc;
 
 /// Implementation for the classic Chat Completions API.
 pub(crate) async fn stream_chat_completions(
@@ -34,6 +36,8 @@ pub(crate) async fn stream_chat_completions(
     model_family: &ModelFamily,
     client: &reqwest::Client,
     provider: &ModelProviderInfo,
+    rate_limiter: Option<Arc<AzureOpenAIRateLimiter>>,
+    rate_limiter_key: Option<&str>,
 ) -> Result<ResponseStream> {
     // Build messages array
     let mut messages = Vec::<serde_json::Value>::new();
@@ -155,6 +159,32 @@ pub(crate) async fn stream_chat_completions(
     loop {
         attempt += 1;
 
+        // Apply rate limiting before making the request (Azure providers only)
+        if let Some(ref limiter) = rate_limiter {
+            // Estimate tokens conservatively using tiktoken on the payload parts we control
+            let msgs_json = serde_json::to_string(&payload["messages"]).unwrap_or_default();
+            let instructions_tokens = AzureOpenAIRateLimiter::estimate_tokens_for_model(
+                &model_family.slug,
+                &full_instructions,
+            );
+            let input_tokens =
+                AzureOpenAIRateLimiter::estimate_tokens_for_model(&model_family.slug, &msgs_json);
+            let estimated_tokens = instructions_tokens + input_tokens + 1000;
+            let deploy_key = rate_limiter_key.unwrap_or(&model_family.slug);
+            if let Err(_e) = limiter
+                .acquire_for_deployment(deploy_key, &model_family.slug, estimated_tokens)
+                .await
+            {
+                // Respect retry policy on limiter errors
+                if attempt > max_retries {
+                    return Err(CodexErr::RetryLimit(StatusCode::TOO_MANY_REQUESTS));
+                }
+                let delay = backoff(attempt);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        }
+
         let req_builder = provider.create_request_builder(client, &None).await?;
 
         let res = req_builder
@@ -165,6 +195,10 @@ pub(crate) async fn stream_chat_completions(
 
         match res {
             Ok(resp) if resp.status().is_success() => {
+                if let Some(ref limiter) = rate_limiter {
+                    limiter.update_from_response(resp.headers()).await;
+                    limiter.record_success().await;
+                }
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
                 let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
                 tokio::spawn(process_chat_sse(
@@ -181,19 +215,34 @@ pub(crate) async fn stream_chat_completions(
                     return Err(CodexErr::UnexpectedStatus(status, body));
                 }
 
+                if let Some(ref limiter) = rate_limiter {
+                    limiter.update_from_response(res.headers()).await;
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        limiter.record_failure().await;
+                    }
+                }
+
                 if attempt > max_retries {
                     return Err(CodexErr::RetryLimit(status));
                 }
 
+                use reqwest::header::HeaderName;
                 let retry_after_secs = res
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
+                let retry_after_ms = res
+                    .headers()
+                    .get(HeaderName::from_static("retry-after-ms"))
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
 
-                let delay = retry_after_secs
-                    .map(|s| Duration::from_millis(s * 1_000))
-                    .unwrap_or_else(|| backoff(attempt));
+                let delay = match (retry_after_ms, retry_after_secs) {
+                    (Some(ms), _) => Duration::from_millis(ms),
+                    (None, Some(s)) => Duration::from_millis(s * 1_000),
+                    (None, None) => backoff(attempt),
+                };
                 tokio::time::sleep(delay).await;
             }
             Err(e) => {

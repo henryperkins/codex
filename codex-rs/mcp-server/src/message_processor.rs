@@ -35,10 +35,21 @@ use tokio::sync::Mutex;
 use tokio::task;
 use uuid::Uuid;
 
+/// State of the MCP initialization handshake
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitializationState {
+    /// No initialization request received yet
+    Uninitialized,
+    /// Server has responded to initialize request, waiting for client's initialized notification
+    InitializeResponseSent,
+    /// Client has sent initialized notification, handshake complete
+    ClientInitialized,
+}
+
 pub(crate) struct MessageProcessor {
     codex_message_processor: CodexMessageProcessor,
     outgoing: Arc<OutgoingMessageSender>,
-    initialized: bool,
+    initialization_state: InitializationState,
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, Uuid>>>,
@@ -66,7 +77,7 @@ impl MessageProcessor {
         Self {
             codex_message_processor,
             outgoing,
-            initialized: false,
+            initialization_state: InitializationState::Uninitialized,
             codex_linux_sandbox_exe,
             conversation_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
@@ -149,37 +160,66 @@ impl MessageProcessor {
 
     /// Handle a fire-and-forget JSON-RPC notification.
     pub(crate) async fn process_notification(&mut self, notification: JSONRPCNotification) {
-        let server_notification = match ServerNotification::try_from(notification) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!("Failed to convert notification: {e}");
-                return;
+        // Try to parse as a ServerNotification first (server-to-client notifications)
+        if let Ok(server_notification) = ServerNotification::try_from(notification.clone()) {
+            // Similar to requests, route each notification type to its own stub
+            // handler so additional logic can be implemented incrementally.
+            match server_notification {
+                ServerNotification::CancelledNotification(params) => {
+                    self.handle_cancelled_notification(params).await;
+                }
+                ServerNotification::ProgressNotification(params) => {
+                    self.handle_progress_notification(params);
+                }
+                ServerNotification::ResourceListChangedNotification(params) => {
+                    self.handle_resource_list_changed(params);
+                }
+                ServerNotification::ResourceUpdatedNotification(params) => {
+                    self.handle_resource_updated(params);
+                }
+                ServerNotification::PromptListChangedNotification(params) => {
+                    self.handle_prompt_list_changed(params);
+                }
+                ServerNotification::ToolListChangedNotification(params) => {
+                    self.handle_tool_list_changed(params);
+                }
+                ServerNotification::LoggingMessageNotification(params) => {
+                    self.handle_logging_message(params);
+                }
             }
-        };
+            return;
+        }
 
-        // Similar to requests, route each notification type to its own stub
-        // handler so additional logic can be implemented incrementally.
-        match server_notification {
-            ServerNotification::CancelledNotification(params) => {
-                self.handle_cancelled_notification(params).await;
+        // Try to parse as a ClientNotification (client-to-server notifications)
+        match notification.method.as_str() {
+            "notifications/cancelled" => {
+                // Client cancelled a request - same handler as server cancellation
+                let params = notification.params.and_then(|v| {
+                    serde_json::from_value::<mcp_types::CancelledNotificationParams>(v).ok()
+                });
+                if let Some(params) = params {
+                    self.handle_cancelled_notification(params).await;
+                }
             }
-            ServerNotification::ProgressNotification(params) => {
-                self.handle_progress_notification(params);
+            "notifications/initialized" => {
+                // Client has finished initialization
+                self.handle_initialized_notification().await;
             }
-            ServerNotification::ResourceListChangedNotification(params) => {
-                self.handle_resource_list_changed(params);
+            "notifications/progress" => {
+                // Client progress update - same handler as server progress
+                let params = notification.params.and_then(|v| {
+                    serde_json::from_value::<mcp_types::ProgressNotificationParams>(v).ok()
+                });
+                if let Some(params) = params {
+                    self.handle_progress_notification(params);
+                }
             }
-            ServerNotification::ResourceUpdatedNotification(params) => {
-                self.handle_resource_updated(params);
+            "notifications/roots/list_changed" => {
+                // Client's roots have changed
+                self.handle_roots_list_changed_notification().await;
             }
-            ServerNotification::PromptListChangedNotification(params) => {
-                self.handle_prompt_list_changed(params);
-            }
-            ServerNotification::ToolListChangedNotification(params) => {
-                self.handle_tool_list_changed(params);
-            }
-            ServerNotification::LoggingMessageNotification(params) => {
-                self.handle_logging_message(params);
+            _ => {
+                tracing::debug!("Ignoring unknown notification: {}", notification.method);
             }
         }
     }
@@ -196,7 +236,7 @@ impl MessageProcessor {
     ) {
         tracing::info!("initialize -> params: {:?}", params);
 
-        if self.initialized {
+        if self.initialization_state != InitializationState::Uninitialized {
             // Already initialised: send JSON-RPC error response.
             let error = JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
@@ -207,7 +247,7 @@ impl MessageProcessor {
             return;
         }
 
-        self.initialized = true;
+        self.initialization_state = InitializationState::InitializeResponseSent;
 
         // Build a minimal InitializeResult. Fill with placeholders.
         let result = mcp_types::InitializeResult {
@@ -644,5 +684,28 @@ impl MessageProcessor {
         params: <mcp_types::LoggingMessageNotification as mcp_types::ModelContextProtocolNotification>::Params,
     ) {
         tracing::info!("notifications/message -> params: {:?}", params);
+    }
+
+    // Client notification handlers
+
+    async fn handle_initialized_notification(&mut self) {
+        tracing::info!("Client sent initialized notification");
+
+        if self.initialization_state != InitializationState::InitializeResponseSent {
+            tracing::warn!(
+                "Received initialized notification in unexpected state: {:?}",
+                self.initialization_state
+            );
+            return;
+        }
+
+        self.initialization_state = InitializationState::ClientInitialized;
+        tracing::info!("MCP initialization handshake complete");
+    }
+
+    async fn handle_roots_list_changed_notification(&mut self) {
+        tracing::info!("Client roots list changed");
+        // In the future, this could trigger a re-fetch of available roots
+        // For now, just log the event
     }
 }

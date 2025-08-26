@@ -279,8 +279,14 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
             },
         ),
         (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
-        (BUILT_IN_AZURE_RESPONSES_PROVIDER_ID, create_azure_responses_provider()),
-        (BUILT_IN_AZURE_CHAT_PROVIDER_ID, create_azure_chat_provider()),
+        (
+            BUILT_IN_AZURE_RESPONSES_PROVIDER_ID,
+            create_azure_responses_provider(),
+        ),
+        (
+            BUILT_IN_AZURE_CHAT_PROVIDER_ID,
+            create_azure_chat_provider(),
+        ),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -331,7 +337,7 @@ pub fn create_azure_responses_provider() -> ModelProviderInfo {
     let azure_endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
         .ok()
         .filter(|v| !v.trim().is_empty());
-    
+
     ModelProviderInfo {
         name: "Azure OpenAI Responses API".into(),
         base_url: azure_endpoint.or_else(|| {
@@ -353,7 +359,14 @@ pub fn create_azure_responses_provider() -> ModelProviderInfo {
                 .collect(),
         ),
         http_headers: None,
-        env_http_headers: None,
+        env_http_headers: Some(
+            [(
+                "x-ms-oai-image-generation-deployment".to_string(),
+                "AZURE_IMAGE_GENERATION_DEPLOYMENT".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
         request_max_retries: Some(5),
         stream_max_retries: Some(10),
         stream_idle_timeout_ms: Some(300_000),
@@ -367,7 +380,7 @@ pub fn create_azure_chat_provider() -> ModelProviderInfo {
     let azure_endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
         .ok()
         .filter(|v| !v.trim().is_empty());
-    
+
     ModelProviderInfo {
         name: "Azure OpenAI Chat Completions".into(),
         base_url: azure_endpoint.or_else(|| {
@@ -389,7 +402,14 @@ pub fn create_azure_chat_provider() -> ModelProviderInfo {
                 .collect(),
         ),
         http_headers: None,
-        env_http_headers: None,
+        env_http_headers: Some(
+            [(
+                "x-ms-oai-image-generation-deployment".to_string(),
+                "AZURE_IMAGE_GENERATION_DEPLOYMENT".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
         request_max_retries: Some(5),
         stream_max_retries: Some(10),
         stream_idle_timeout_ms: Some(300_000),
@@ -540,7 +560,10 @@ stream_idle_timeout_ms = 600000
         };
 
         let url = provider.get_full_url(&None);
-        assert_eq!(url, "https://test.openai.azure.com/openai/v1/responses?api-version=preview");
+        assert_eq!(
+            url,
+            "https://test.openai.azure.com/openai/v1/responses?api-version=preview"
+        );
     }
 
     #[test]
@@ -563,6 +586,9 @@ stream_idle_timeout_ms = 600000
         };
 
         let url = provider.get_full_url(&None);
-        assert_eq!(url, "https://test.openai.azure.com/openai/chat/completions?api-version=2025-04-01-preview");
+        assert_eq!(
+            url,
+            "https://test.openai.azure.com/openai/chat/completions?api-version=2025-04-01-preview"
+        );
     }
 }
