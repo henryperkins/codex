@@ -1,6 +1,5 @@
 use std::io::BufRead;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -8,7 +7,6 @@ use codex_login::AuthManager;
 use codex_login::AuthMode;
 use eventsource_stream::Eventsource;
 use futures::prelude::*;
-use regex_lite::Regex;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -55,8 +53,12 @@ struct ErrorResponse {
 #[derive(Debug, Deserialize)]
 struct Error {
     r#type: Option<String>,
-    code: Option<String>,
     message: Option<String>,
+    code: Option<String>,
+
+    // Optional fields available on "usage_limit_reached" and "usage_not_included" errors
+    plan_type: Option<String>,
+    resets_in_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,9 +172,12 @@ impl ModelClient {
         }
 
         let auth_manager = self.auth_manager.clone();
-        let auth = auth_manager.as_ref().and_then(|m| m.auth());
 
-        let auth_mode = auth.as_ref().map(|a| a.mode);
+        let auth_mode = auth_manager
+            .as_ref()
+            .and_then(|m| m.auth())
+            .as_ref()
+            .map(|a| a.mode);
 
         let store = prompt.store && auth_mode != Some(AuthMode::ChatGPT);
 
@@ -239,12 +244,6 @@ impl ModelClient {
         let mut attempt = 0;
         let max_retries = self.provider.request_max_retries();
 
-        trace!(
-            "POST to {}: {}",
-            self.provider.get_full_url(&auth),
-            serde_json::to_string(&payload)?
-        );
-
         // Estimate token count for rate limiting using tiktoken. Use model family slug as encoding hint.
         let estimated_tokens = if let Some(ref _limiter) = self.rate_limiter {
             let input_json = serde_json::to_string(&input_with_instructions).unwrap_or_default();
@@ -262,6 +261,15 @@ impl ModelClient {
 
         loop {
             attempt += 1;
+
+            // Always fetch the latest auth in case a prior attempt refreshed the token.
+            let auth = auth_manager.as_ref().and_then(|m| m.auth());
+
+            trace!(
+                "POST to {}: {}",
+                self.provider.get_full_url(&auth),
+                serde_json::to_string(&payload)?
+            );
 
             // Apply rate limiting before making the request
             if let Some(ref limiter) = self.rate_limiter {
@@ -401,19 +409,20 @@ impl ModelClient {
 
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let body = res.json::<ErrorResponse>().await.ok();
-                        if let Some(ErrorResponse {
-                            error:
-                                Error {
-                                    r#type: Some(error_type),
-                                    ..
-                                },
-                        }) = body
-                        {
-                            if error_type == "usage_limit_reached" {
+                        if let Some(ErrorResponse { error }) = body {
+                            if error.r#type.as_deref() == Some("usage_limit_reached") {
+                                // Prefer the plan_type provided in the error message if present
+                                // because it's more up to date than the one encoded in the auth
+                                // token.
+                                let plan_type = error
+                                    .plan_type
+                                    .or_else(|| auth.and_then(|a| a.get_plan_type()));
+                                let resets_in_seconds = error.resets_in_seconds;
                                 return Err(CodexErr::UsageLimitReached(UsageLimitReachedError {
-                                    plan_type: auth.and_then(|a| a.get_plan_type()),
+                                    plan_type,
+                                    resets_in_seconds,
                                 }));
-                            } else if error_type == "usage_not_included" {
+                            } else if error.r#type.as_deref() == Some("usage_not_included") {
                                 return Err(CodexErr::UsageNotIncluded);
                             }
                         }
@@ -691,9 +700,8 @@ async fn process_sse<S>(
                     if let Some(error) = error {
                         match serde_json::from_value::<Error>(error.clone()) {
                             Ok(error) => {
-                                let delay = try_parse_retry_after(&error);
                                 let message = error.message.unwrap_or_default();
-                                response_error = Some(CodexErr::Stream(message, delay));
+                                response_error = Some(CodexErr::Stream(message, None));
                             }
                             Err(e) => {
                                 debug!("failed to parse ErrorResponse: {e}");
@@ -782,14 +790,20 @@ async fn stream_from_fixture(
     Ok(ResponseStream { rx_event })
 }
 
-fn rate_limit_regex() -> &'static Regex {
+fn rate_limit_regex() -> &'static regex_lite::Regex {
+    use regex_lite::Regex;
+    use std::sync::OnceLock;
+    
     static RE: OnceLock<Regex> = OnceLock::new();
 
     #[expect(clippy::unwrap_used)]
     RE.get_or_init(|| Regex::new(r"Please try again in (\d+(?:\.\d+)?)(s|ms)").unwrap())
 }
 
-fn azure_rate_limit_regex() -> &'static Regex {
+fn azure_rate_limit_regex() -> &'static regex_lite::Regex {
+    use regex_lite::Regex;
+    use std::sync::OnceLock;
+    
     static RE: OnceLock<Regex> = OnceLock::new();
 
     #[expect(clippy::unwrap_used)]
@@ -1071,7 +1085,7 @@ mod tests {
                     msg,
                     "Rate limit reached for gpt-5 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."
                 );
-                assert_eq!(*delay, Some(Duration::from_secs_f64(11.054)));
+                assert_eq!(*delay, None);
             }
             other => panic!("unexpected second event: {other:?}"),
         }
@@ -1182,6 +1196,8 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            plan_type: None,
+            resets_in_seconds: None,
         };
 
         let delay = try_parse_retry_after(&err);
@@ -1194,6 +1210,8 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            plan_type: None,
+            resets_in_seconds: None,
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
@@ -1206,6 +1224,8 @@ mod tests {
             r#type: None,
             message: Some("Rate limit is exceeded. Try again in 25 seconds.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            plan_type: None,
+            resets_in_seconds: None,
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs(25)));
@@ -1215,6 +1235,8 @@ mod tests {
             r#type: None,
             message: Some("Rate limit is exceeded. Try again in 10.5 seconds.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            plan_type: None,
+            resets_in_seconds: None,
         };
         let delay2 = try_parse_retry_after(&err2);
         assert_eq!(delay2, Some(Duration::from_secs_f64(10.5)));
@@ -1224,6 +1246,8 @@ mod tests {
             r#type: None,
             message: Some("Rate limit is exceeded. Try again in 30.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            plan_type: None,
+            resets_in_seconds: None,
         };
         let delay3 = try_parse_retry_after(&err3);
         assert_eq!(delay3, Some(Duration::from_secs(30)));
