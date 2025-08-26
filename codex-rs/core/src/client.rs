@@ -246,7 +246,7 @@ impl ModelClient {
 
         // Estimate token count for rate limiting using tiktoken. Use model family slug as encoding hint.
         let estimated_tokens = if let Some(ref _limiter) = self.rate_limiter {
-            let input_json = serde_json::to_string(&input_with_instructions).unwrap_or_default();
+            let input_json = serde_json::to_string(&input_with_instructions)?;
             let enc_model = &self.config.model_family.slug;
             let input_tokens =
                 AzureOpenAIRateLimiter::estimate_tokens_for_model(enc_model, &input_json);
