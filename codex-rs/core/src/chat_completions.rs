@@ -162,7 +162,7 @@ pub(crate) async fn stream_chat_completions(
         // Apply rate limiting before making the request (Azure providers only)
         if let Some(ref limiter) = rate_limiter {
             // Estimate tokens conservatively using tiktoken on the payload parts we control
-            let msgs_json = serde_json::to_string(&payload["messages"]).unwrap_or_default();
+            let msgs_json = serde_json::to_string(&payload["messages"])?;
             let instructions_tokens = AzureOpenAIRateLimiter::estimate_tokens_for_model(
                 &model_family.slug,
                 &full_instructions,
