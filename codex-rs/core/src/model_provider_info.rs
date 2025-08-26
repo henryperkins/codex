@@ -373,6 +373,7 @@ pub fn create_azure_responses_provider() -> ModelProviderInfo {
             .into_iter()
             .collect(),
         ),
+
         request_max_retries: Some(5),
         stream_max_retries: Some(10),
         stream_idle_timeout_ms: Some(300_000),
@@ -416,6 +417,7 @@ pub fn create_azure_chat_provider() -> ModelProviderInfo {
             .into_iter()
             .collect(),
         ),
+
         request_max_retries: Some(5),
         stream_max_retries: Some(10),
         stream_idle_timeout_ms: Some(300_000),
