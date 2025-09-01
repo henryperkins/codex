@@ -264,6 +264,7 @@ struct State {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_input: Vec<ResponseInputItem>,
     history: ConversationHistory,
+    last_response_id: Option<String>,
 }
 
 /// Context for an initialized model agent
@@ -1618,11 +1619,21 @@ async fn run_turn(
         Some(sess.mcp_connection_manager.list_all_tools()),
     );
 
+    let prev_id_for_turn = {
+        let state = sess.state.lock_unchecked();
+        if turn_context.disable_response_storage {
+            None
+        } else {
+            state.last_response_id.clone()
+        }
+    };
+    tracing::trace!("Building Prompt; previous_response_id={:?}, store={}", prev_id_for_turn, !turn_context.disable_response_storage);
     let prompt = Prompt {
         input,
         store: !turn_context.disable_response_storage,
         tools,
         base_instructions_override: turn_context.base_instructions.clone(),
+        previous_response_id: prev_id_for_turn,
     };
 
     let mut retries = 0;
@@ -1789,9 +1800,15 @@ async fn try_run_turn(
                     .await;
             }
             ResponseEvent::Completed {
-                response_id: _,
+                response_id,
                 token_usage,
             } => {
+                {
+                    let mut state = sess.state.lock_unchecked();
+                    if !response_id.is_empty() {
+                        state.last_response_id = Some(response_id);
+                    }
+                }
                 if let Some(token_usage) = token_usage {
                     sess.tx_event
                         .send(Event {
@@ -1877,6 +1894,14 @@ async fn run_compact_task(
         store: !turn_context.disable_response_storage,
         tools: Vec::new(),
         base_instructions_override: Some(compact_instructions.clone()),
+        previous_response_id: {
+            let state = sess.state.lock_unchecked();
+            if turn_context.disable_response_storage {
+                None
+            } else {
+                state.last_response_id.clone()
+            }
+        },
     };
 
     let max_retries = turn_context.client.get_provider().stream_max_retries();

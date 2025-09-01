@@ -1,6 +1,7 @@
 use std::io::BufRead;
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use codex_login::AuthManager;
@@ -69,6 +70,9 @@ pub struct ModelClient {
     session_id: Uuid,
     effort: ReasoningEffortConfig,
     summary: ReasoningSummaryConfig,
+    /// Tracks the last completed `response_id` for chaining when server-side
+    /// storage is enabled (e.g., Azure Responses API).
+    last_response_id: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl ModelClient {
@@ -88,6 +92,7 @@ impl ModelClient {
             session_id,
             effort,
             summary,
+            last_response_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -136,7 +141,24 @@ impl ModelClient {
                     }
                 });
 
-                Ok(ResponseStream { rx_event: rx })
+                // Intercept Completed events to capture the response id (if any).
+                let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(16);
+                let last_id = self.last_response_id.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    while let Some(ev) = rx.recv().await {
+                        if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
+                            let mut guard = last_id.lock().await;
+                            if !response_id.is_empty() {
+                                *guard = Some(response_id.clone());
+                            }
+                        }
+                        if tx2.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(ResponseStream { rx_event: rx2 })
             }
         }
     }
@@ -190,6 +212,23 @@ impl ModelClient {
             None
         };
 
+        // Capture the previous response id for chaining (only when storing server‑side).
+        // Prefer the explicit id provided by higher layers (Session state) and
+        // fall back to the client‑tracked last id.
+        let previous_response_id = if store {
+            prompt
+                .previous_response_id
+                .clone()
+                .or(self.last_response_id.lock().await.clone())
+        } else {
+            None
+        };
+
+        let background = match std::env::var("CODEX_ENABLE_BACKGROUND") {
+            Ok(v) if v == "1" => Some(true),
+            _ => None,
+        };
+
         let payload = ResponsesApiRequest {
             model: &self.config.model,
             instructions: &full_instructions,
@@ -201,6 +240,8 @@ impl ModelClient {
             store,
             stream: true,
             include,
+            previous_response_id,
+            background,
             prompt_cache_key: Some(self.session_id.to_string()),
             text,
         };
@@ -258,15 +299,103 @@ impl ModelClient {
                 Ok(resp) if resp.status().is_success() => {
                     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
 
-                    // spawn task to process SSE
-                    let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
-                    tokio::spawn(process_sse(
-                        stream,
-                        tx_event,
-                        self.provider.stream_idle_timeout(),
-                    ));
+                    let is_sse = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|ct| ct.starts_with("text/event-stream"))
+                        .unwrap_or(false);
 
-                    return Ok(ResponseStream { rx_event });
+                    if is_sse {
+                        // spawn task to process SSE
+                        let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
+                        tokio::spawn(process_sse(
+                            stream,
+                            tx_event,
+                            self.provider.stream_idle_timeout(),
+                        ));
+
+                        // Intercept Completed to track response id for chaining.
+                        let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(1600);
+                        let last_id = self.last_response_id.clone();
+                        tokio::spawn(async move {
+                            let mut rx = rx_event;
+                            while let Some(ev) = rx.recv().await {
+                                if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
+                                    let mut guard = last_id.lock().await;
+                                    if !response_id.is_empty() {
+                                        *guard = Some(response_id.clone());
+                                    }
+                                }
+                                if tx2.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        return Ok(ResponseStream { rx_event: rx2 });
+                    }
+
+                    // Not SSE: background envelope -> poll GET /responses/{id}
+                    let v: serde_json::Value = match resp.json().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx_event
+                                .send(Err(CodexErr::Stream(
+                                    format!("invalid JSON response: {e}"),
+                                    None,
+                                )))
+                                .await;
+                            return Ok(ResponseStream { rx_event });
+                        }
+                    };
+                    let id = v
+                        .get("response")
+                        .and_then(|r| r.get("id"))
+                        .or_else(|| v.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if id.is_empty() {
+                        let _ = tx_event
+                            .send(Err(CodexErr::Stream(
+                                "missing id in background response".to_string(),
+                                None,
+                            )))
+                            .await;
+                        return Ok(ResponseStream { rx_event });
+                    }
+                    let manager = BackgroundTaskManager::new(
+                        self.client.clone(),
+                        self.provider.clone(),
+                        self.auth_manager.clone(),
+                    );
+                    tokio::spawn(manager.poll_until_complete(id, tx_event.clone()));
+
+                    // Emit a lightweight Created marker so upstream callers
+                    // know the background job has been accepted before the
+                    // first poll result arrives. This mirrors the SSE path
+                    // which starts with `response.created`.
+                    let _ = tx_event.send(Ok(ResponseEvent::Created {})).await;
+
+                    let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(1600);
+                    let last_id = self.last_response_id.clone();
+                    tokio::spawn(async move {
+                        let mut rx = rx_event;
+                        while let Some(ev) = rx.recv().await {
+                            if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
+                                let mut guard = last_id.lock().await;
+                                if !response_id.is_empty() {
+                                    *guard = Some(response_id.clone());
+                                }
+                            }
+                            if tx2.send(ev).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    return Ok(ResponseStream { rx_event: rx2 });
                 }
                 Ok(res) => {
                     let status = res.status();
@@ -296,8 +425,11 @@ impl ModelClient {
                         || status == StatusCode::UNAUTHORIZED
                         || status.is_server_error())
                     {
-                        // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
                         let body = res.text().await.unwrap_or_default();
+                        if self.provider.is_probably_azure() {
+                            let msg = parse_azure_error_message(&body).unwrap_or(body);
+                            return Err(CodexErr::UnexpectedStatus(status, msg));
+                        }
                         return Err(CodexErr::UnexpectedStatus(status, body));
                     }
 
@@ -373,6 +505,38 @@ impl ModelClient {
     pub fn get_auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
     }
+
+    /// Attempts to cancel a background response by issuing
+    /// `DELETE /v1/responses/{id}`. Returns Ok on HTTP 2xx.
+    pub async fn cancel_background(&self, response_id: &str) -> Result<()> {
+        let auth = self.auth_manager.as_ref().and_then(|m| m.auth());
+        let url = self.provider.get_response_url(&auth, response_id);
+        let mut req = self.client.delete(url);
+        if let Some(auth) = auth.as_ref() {
+            match self.provider.auth_type {
+                crate::model_provider_info::AuthType::ApiKey => {
+                    req = req.header("api-key", auth.get_token().await?);
+                }
+                _ => {
+                    req = req.bearer_auth(auth.get_token().await?);
+                }
+            }
+        }
+        req = self.provider.apply_http_headers(req);
+        let resp = req.send().await.map_err(CodexErr::Reqwest)?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let msg = if self.provider.is_probably_azure() {
+                parse_azure_error_message(&body).unwrap_or(body)
+            } else {
+                body
+            };
+            Err(CodexErr::UnexpectedStatus(status, msg))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -424,6 +588,200 @@ struct ResponseCompletedOutputTokensDetails {
     reasoning_tokens: u64,
 }
 
+/// Minimal background task poller for providers (e.g., Azure) that process
+/// Responses asynchronously when `background: true` is requested.
+struct BackgroundTaskManager {
+    client: reqwest::Client,
+    provider: ModelProviderInfo,
+    auth_manager: Option<Arc<AuthManager>>,
+}
+
+impl BackgroundTaskManager {
+    fn new(
+        client: reqwest::Client,
+        provider: ModelProviderInfo,
+        auth_manager: Option<Arc<AuthManager>>,
+    ) -> Self {
+        Self {
+            client,
+            provider,
+            auth_manager,
+        }
+    }
+
+    async fn poll_until_complete(
+        self,
+        response_id: String,
+        tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    ) {
+        let mut attempt = 0u64;
+        let start = Instant::now();
+
+        loop {
+            attempt += 1;
+            let auth = self.auth_manager.as_ref().and_then(|m| m.auth());
+            let url = self.provider.get_response_url(&auth, &response_id);
+
+            let mut req = self.client.get(&url);
+            if let Some(auth) = auth.as_ref() {
+                // Use the same header semantics as POST.
+                match self.provider.auth_type {
+                    crate::model_provider_info::AuthType::ApiKey => match auth.get_token().await {
+                        Ok(t) => {
+                            req = req.header("api-key", t);
+                        }
+                        Err(e) => {
+                            let _ = tx_event.send(Err(e.into())).await;
+                            return;
+                        }
+                    },
+                    _ => match auth.get_token().await {
+                        Ok(t) => {
+                            req = req.bearer_auth(t);
+                        }
+                        Err(e) => {
+                            let _ = tx_event.send(Err(e.into())).await;
+                            return;
+                        }
+                    },
+                }
+            }
+            req = self.provider.apply_http_headers(req);
+
+            let res = req.send().await;
+            match res {
+                Ok(resp) if resp.status().is_success() => {
+                    let v: serde_json::Value = match resp.json().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx_event
+                                .send(Err(CodexErr::Stream(
+                                    format!("invalid JSON from poll: {e}"),
+                                    None,
+                                )))
+                                .await;
+                            return;
+                        }
+                    };
+                    let r = v.get("response").cloned().unwrap_or(v);
+                    let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    match status {
+                        "queued" | "in_progress" => {
+                            // brief pause to avoid tight-loop hammering
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        "completed" => {
+                            // Emit output items, then Completed
+                            if let Some(items) = r.get("output").and_then(|o| o.as_array()) {
+                                for it in items {
+                                    if let Ok(item) =
+                                        serde_json::from_value::<ResponseItem>(it.clone())
+                                        && tx_event
+                                            .send(Ok(ResponseEvent::OutputItemDone(item)))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            let usage = r
+                                .get("usage")
+                                .cloned()
+                                .and_then(|u| {
+                                    serde_json::from_value::<ResponseCompletedUsage>(u).ok()
+                                })
+                                .map(TokenUsage::from);
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::Completed {
+                                    response_id: response_id.clone(),
+                                    token_usage: usage,
+                                }))
+                                .await;
+                            return;
+                        }
+                        "failed" | "canceled" | "cancelled" => {
+                            // Surface the error message when available.
+                            let msg = r
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("background task failed");
+                            let _ = tx_event
+                                .send(Err(CodexErr::Stream(msg.to_string(), None)))
+                                .await;
+                            return;
+                        }
+                        other => {
+                            let _ = tx_event
+                                .send(Err(CodexErr::Stream(
+                                    format!("unknown background status: {other}"),
+                                    None,
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
+
+                    // Backoff between polls; prefer small delays in tests.
+                    let delay = backoff(attempt).min(Duration::from_secs(5));
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(resp) => {
+                    // Non-success – attempt to extract a friendly message.
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let msg = if self.provider.is_probably_azure() {
+                        parse_azure_error_message(&body).unwrap_or(body)
+                    } else {
+                        body
+                    };
+                    let _ = tx_event
+                        .send(Err(CodexErr::UnexpectedStatus(status, msg)))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx_event.send(Err(CodexErr::Reqwest(e))).await;
+                    return;
+                }
+            }
+
+            if start.elapsed() > Duration::from_secs(300) {
+                let _ = tx_event
+                    .send(Err(CodexErr::Stream(
+                        "background task timed out (5m)".into(),
+                        None,
+                    )))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+fn parse_azure_error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let err = v.get("error")?;
+    let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    let msg = err
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            err.get("innererror")
+                .and_then(|ie| ie.get("message").and_then(|m| m.as_str()))
+        })
+        .unwrap_or("");
+    if code.is_empty() && msg.is_empty() {
+        None
+    } else if code.is_empty() {
+        Some(msg.to_string())
+    } else if msg.is_empty() {
+        Some(code.to_string())
+    } else {
+        Some(format!("{code}: {msg}"))
+    }
+}
 async fn process_sse<S>(
     stream: S,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
@@ -493,6 +851,24 @@ async fn process_sse<S>(
         };
 
         match event.kind.as_str() {
+            // Azure: reasoning content delta (alias of response.reasoning_text.delta)
+            "response.reasoning.delta" => {
+                if let Some(delta) = event.delta {
+                    let event = ResponseEvent::ReasoningContentDelta(delta);
+                    if tx_event.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // Azure: preamble (treat as a reasoning summary style area)
+            "response.preamble.delta" => {
+                if let Some(delta) = event.delta {
+                    let event = ResponseEvent::ReasoningSummaryDelta(delta);
+                    if tx_event.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
             // Individual output item finalised. Forward immediately so the
             // rest of the agent can stream assistant text/functions *live*
             // instead of waiting for the final `response.completed` envelope.
@@ -620,6 +996,9 @@ async fn process_sse<S>(
                 }
             }
             "response.reasoning_summary_text.done" => {}
+            // Azure image generation partials and MCP approval requests are
+            // not yet surfaced via a dedicated UI event. Ignore gracefully.
+            "response.image_generation_call.partial_image" | "response.mcp_approval_request" => {}
             _ => {}
         }
     }
@@ -758,6 +1137,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             wire_api: WireApi::Responses,
+            auth_type: Default::default(),
             query_params: None,
             http_headers: None,
             env_http_headers: None,
@@ -818,6 +1198,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             wire_api: WireApi::Responses,
+            auth_type: Default::default(),
             query_params: None,
             http_headers: None,
             env_http_headers: None,
@@ -852,6 +1233,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             wire_api: WireApi::Responses,
+            auth_type: Default::default(),
             query_params: None,
             http_headers: None,
             env_http_headers: None,
@@ -957,6 +1339,7 @@ mod tests {
                 env_key: Some("TEST_API_KEY".to_string()),
                 env_key_instructions: None,
                 wire_api: WireApi::Responses,
+                auth_type: Default::default(),
                 query_params: None,
                 http_headers: None,
                 env_http_headers: None,
