@@ -1713,32 +1713,43 @@ async fn try_run_turn(
     // call_ids that were pending but are not part of this response.
     // This usually happens because the user interrupted the model before we responded to one of its tool calls
     // and then the user sent a follow-up message.
-    let missing_calls = {
-        prompt
-            .input
-            .iter()
-            .filter_map(|ri| match ri {
-                ResponseItem::FunctionCall { call_id, .. } => Some(call_id),
-                ResponseItem::LocalShellCall {
-                    call_id: Some(call_id),
-                    ..
-                } => Some(call_id),
-                ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
-                _ => None,
-            })
-            .filter_map(|call_id| {
-                if completed_call_ids.contains(&call_id) {
-                    None
-                } else {
-                    Some(call_id.clone())
-                }
-            })
-            .map(|call_id| ResponseItem::CustomToolCallOutput {
-                call_id: call_id.clone(),
-                output: "aborted".to_string(),
-            })
-            .collect::<Vec<_>>()
-    };
+    let mut missing_calls: Vec<ResponseItem> = Vec::new();
+    for ri in prompt.input.iter() {
+        match ri {
+            ResponseItem::FunctionCall { call_id, .. }
+                if !completed_call_ids.contains(call_id) =>
+            {
+                missing_calls.push(ResponseItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: FunctionCallOutputPayload {
+                        content: "aborted".to_string(),
+                        success: None,
+                    },
+                });
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } if !completed_call_ids.contains(call_id) => {
+                missing_calls.push(ResponseItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: FunctionCallOutputPayload {
+                        content: "aborted".to_string(),
+                        success: None,
+                    },
+                });
+            }
+            ResponseItem::CustomToolCall { call_id, .. }
+                if !completed_call_ids.contains(call_id) =>
+            {
+                missing_calls.push(ResponseItem::CustomToolCallOutput {
+                    call_id: call_id.clone(),
+                    output: "aborted".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
     let prompt: Cow<Prompt> = if missing_calls.is_empty() {
         Cow::Borrowed(prompt)
     } else {

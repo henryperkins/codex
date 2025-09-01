@@ -266,8 +266,10 @@ impl ModelClient {
                 .create_request_builder(&self.client, &auth)
                 .await?;
 
+            if !self.provider.is_probably_azure() {
+                req_builder = req_builder.header("OpenAI-Beta", "responses=experimental");
+            }
             req_builder = req_builder
-                .header("OpenAI-Beta", "responses=experimental")
                 .header("session_id", self.session_id.to_string())
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .json(&payload);
@@ -930,18 +932,18 @@ async fn process_sse<S>(
             }
             "response.failed" => {
                 if let Some(resp_val) = event.response {
+                    // Default if no error object present.
                     response_error = Some(CodexErr::Stream(
                         "response.failed event received".to_string(),
                         None,
                     ));
 
-                    let error = resp_val.get("error");
-
-                    if let Some(error) = error {
-                        match serde_json::from_value::<Error>(error.clone()) {
+                    if let Some(error_val) = resp_val.get("error") {
+                        match serde_json::from_value::<Error>(error_val.clone()) {
                             Ok(error) => {
                                 let message = error.message.unwrap_or_default();
-                                response_error = Some(CodexErr::Stream(message, None));
+                                let delay = error.resets_in_seconds.map(Duration::from_secs);
+                                response_error = Some(CodexErr::Stream(message, delay));
                             }
                             Err(e) => {
                                 debug!("failed to parse ErrorResponse: {e}");
