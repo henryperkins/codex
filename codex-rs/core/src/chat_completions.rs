@@ -77,24 +77,6 @@ pub(crate) async fn stream_chat_completions(
                     }]
                 }));
             }
-            ResponseItem::LocalShellCall {
-                id,
-                call_id: _,
-                status,
-                action,
-            } => {
-                // Confirm with API team.
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": id.clone().unwrap_or_else(|| "".to_string()),
-                        "type": "local_shell_call",
-                        "status": status,
-                        "action": action,
-                    }]
-                }));
-            }
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 messages.push(json!({
                     "role": "tool",
@@ -102,37 +84,20 @@ pub(crate) async fn stream_chat_completions(
                     "content": output.content,
                 }));
             }
-            ResponseItem::CustomToolCall {
-                id,
-                call_id: _,
-                name,
-                input,
-                status: _,
-            } => {
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": id,
-                        "type": "custom",
-                        "custom": {
-                            "name": name,
-                            "input": input,
-                        }
-                    }]
-                }));
-            }
-            ResponseItem::CustomToolCallOutput { call_id, output } => {
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": output,
-                }));
-            }
             ResponseItem::Reasoning { .. }
             | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::Other => {
+            | ResponseItem::Other
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. } => {
                 // Omit these items from the conversation history.
+                //
+                // NOTE: Chat Completions only supports "function" tool calls.
+                // Local/Custom tool calls and their outputs are handled via the
+                // Responses API path (response.output_item.done / background
+                // polling) and must not be serialized into the Chat `messages`
+                // array. Keeping them out here ensures strict conformance to the
+                // Chat schema.
                 continue;
             }
         }
