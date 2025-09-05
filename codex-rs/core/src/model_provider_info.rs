@@ -362,7 +362,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 base_url: std::env::var("AZURE_OPENAI_ENDPOINT")
                     .ok()
                     .filter(|v| !v.trim().is_empty())
-                    .map(|ep| format!("{ep}/openai")),
+                    .map(|ep| format!("{ep}/openai/v1")),
                 // Use API key auth via header; read from standard env var.
                 env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
                 env_key_instructions: None,
@@ -396,7 +396,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 base_url: std::env::var("AZURE_OPENAI_ENDPOINT")
                     .ok()
                     .filter(|v| !v.trim().is_empty())
-                    .map(|ep| format!("{ep}/openai")),
+                    .map(|ep| format!("{ep}/openai/v1")),
                 env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
                 env_key_instructions: None,
                 wire_api: WireApi::Chat,
@@ -407,7 +407,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                         std::env::var("AZURE_OPENAI_API_VERSION")
                             .ok()
                             .filter(|v| !v.trim().is_empty())
-                            .unwrap_or_else(|| "2025-04-01-preview".to_string()),
+                            .unwrap_or_else(|| "preview".to_string()),
                     )]
                     .into_iter()
                     .collect(),
