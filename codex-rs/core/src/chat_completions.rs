@@ -564,6 +564,16 @@ where
                     // will never appear in a Chat Completions stream.
                     continue;
                 }
+                Poll::Ready(Some(Ok(ResponseEvent::Incomplete {
+                    response_id,
+                    _reason: _,
+                }))) => {
+                    // Forward as a terminal outcome akin to Completed.
+                    return Poll::Ready(Some(Ok(ResponseEvent::Completed {
+                        response_id,
+                        token_usage: None,
+                    })));
+                }
                 Poll::Ready(Some(Ok(ResponseEvent::OutputTextDelta(delta)))) => {
                     // Always accumulate deltas so we can emit a final OutputItemDone at Completed.
                     this.cumulative.push_str(&delta);

@@ -1627,7 +1627,11 @@ async fn run_turn(
             state.last_response_id.clone()
         }
     };
-    tracing::trace!("Building Prompt; previous_response_id={:?}, store={}", prev_id_for_turn, !turn_context.disable_response_storage);
+    tracing::trace!(
+        "Building Prompt; previous_response_id={:?}, store={}",
+        prev_id_for_turn,
+        !turn_context.disable_response_storage
+    );
     let prompt = Prompt {
         input,
         store: !turn_context.disable_response_storage,
@@ -1717,7 +1721,7 @@ async fn try_run_turn(
     for ri in prompt.input.iter() {
         match ri {
             ResponseItem::FunctionCall { call_id, .. }
-                if !completed_call_ids.contains(call_id) =>
+                if !completed_call_ids.contains(&call_id) =>
             {
                 missing_calls.push(ResponseItem::FunctionCallOutput {
                     call_id: call_id.clone(),
@@ -1730,7 +1734,7 @@ async fn try_run_turn(
             ResponseItem::LocalShellCall {
                 call_id: Some(call_id),
                 ..
-            } if !completed_call_ids.contains(call_id) => {
+            } if !completed_call_ids.contains(&call_id) => {
                 missing_calls.push(ResponseItem::FunctionCallOutput {
                     call_id: call_id.clone(),
                     output: FunctionCallOutputPayload {
@@ -1740,7 +1744,7 @@ async fn try_run_turn(
                 });
             }
             ResponseItem::CustomToolCall { call_id, .. }
-                if !completed_call_ids.contains(call_id) =>
+                if !completed_call_ids.contains(&call_id) =>
             {
                 missing_calls.push(ResponseItem::CustomToolCallOutput {
                     call_id: call_id.clone(),
@@ -1809,6 +1813,22 @@ async fn try_run_turn(
                         msg: EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }),
                     })
                     .await;
+            }
+            ResponseEvent::Incomplete {
+                response_id: _,
+                _reason: _,
+            } => {
+                // Treat incomplete as a graceful terminal outcome and finish the turn.
+                let unified_diff = turn_diff_tracker.get_unified_diff();
+                if let Ok(Some(unified_diff)) = unified_diff {
+                    let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
+                    let event = Event {
+                        id: sub_id.to_string(),
+                        msg,
+                    };
+                    let _ = sess.tx_event.send(event).await;
+                }
+                return Ok(output);
             }
             ResponseEvent::Completed {
                 response_id,

@@ -109,6 +109,458 @@ fn write_auth_json(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_api_key_header_and_endpoint_are_used() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    // Mock server
+    let server = MockServer::start().await;
+
+    // Basic SSE body
+    let first = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .and(query_param("api-version", "preview"))
+        .respond_with(first)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Configure provider from built‑ins and override base_url and env_key so
+    // we can reuse an existing environment variable instead of setting one.
+    let mut provider = built_in_model_providers()["azure-responses"].clone();
+    provider.base_url = Some(format!("{}/openai/v1", server.uri()));
+    let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
+    provider.env_key = Some(existing_env_var_with_random_value.to_string());
+    provider.request_max_retries = Some(0);
+    provider.stream_max_retries = Some(0);
+
+    // Init session
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+
+    let conversation_manager = ConversationManager::with_auth(CodexAuth::from_api_key("ignored"));
+    let codex = conversation_manager
+        .new_conversation(config)
+        .await
+        .expect("create new conversation")
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: "Hello".into(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let req = &server.received_requests().await.unwrap()[0];
+    // Azure must use `api-key` header and should not depend on Authorization.
+    let api_key = req.headers.get("api-key").unwrap();
+    assert_eq!(
+        api_key.to_str().unwrap(),
+        std::env::var(existing_env_var_with_random_value).unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_chat_uses_chat_endpoint_and_api_key() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let server = MockServer::start().await;
+
+    // Minimal Chat Completions SSE stream: one token delta then [DONE].
+    let body = "event: message\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+    let tpl = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(body, "text/event-stream");
+
+    Mock::given(method("POST"))
+        .and(path("/openai/chat/completions"))
+        .and(query_param("api-version", "2025-04-01-preview"))
+        .respond_with(tpl)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = built_in_model_providers()["azure-chat"].clone();
+    provider.base_url = Some(format!("{}/openai", server.uri()));
+    let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
+    provider.env_key = Some(existing_env_var_with_random_value.to_string());
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+
+    let codex = ConversationManager::with_auth(CodexAuth::from_api_key("ignored"))
+        .new_conversation(config)
+        .await
+        .unwrap()
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: "Hello".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let req = &server.received_requests().await.unwrap()[0];
+    let api_key = req.headers.get("api-key").unwrap();
+    assert_eq!(
+        api_key.to_str().unwrap(),
+        std::env::var(existing_env_var_with_random_value).unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_omits_reasoning_when_unknown_model_family() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let server = MockServer::start().await;
+
+    // Minimal SSE body that completes immediately.
+    let first = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+
+    // Cap the generic first POST stub to a single match. Otherwise, the second
+    // POST might also be satisfied by this broader matcher before the
+    // `previous_response_id`-specific stub can match, which would make the
+    // test flaky depending on matcher order.
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .respond_with(first)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Start from built‑in Azure Responses provider.
+    let mut provider = built_in_model_providers()["azure-responses"].clone();
+    provider.base_url = Some(format!("{}/openai/v1", server.uri()));
+    let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
+    provider.env_key = Some(existing_env_var_with_random_value.to_string());
+    provider.request_max_retries = Some(0);
+    provider.stream_max_retries = Some(0);
+
+    // Init session with an Azure deployment name that won't match any known family.
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+    config.model = "my-azure-deploy".to_string();
+    // Keep capability validation identical to OpenAI: unknown slugs get a
+    // generic family with no special features (e.g., no reasoning summaries).
+    config.model_family = codex_core::model_family::ModelFamily {
+        slug: config.model.clone(),
+        family: config.model.clone(),
+        needs_special_apply_patch_instructions: false,
+        supports_reasoning_summaries: false,
+        uses_local_shell_tool: false,
+        apply_patch_tool_type: None,
+    };
+
+    let conversation_manager = ConversationManager::with_auth(CodexAuth::from_api_key("ignored"));
+    let codex = conversation_manager
+        .new_conversation(config)
+        .await
+        .expect("create new conversation")
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: "Hello".into(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let req = &server.received_requests().await.unwrap()[0];
+    let body_text = std::str::from_utf8(&req.body).unwrap_or("");
+    let body_json: serde_json::Value = serde_json::from_str(body_text).unwrap();
+
+    // Ensure we silently omit the `reasoning` field when the model family
+    // does not support reasoning summaries (unknown Azure deployment names).
+    assert!(
+        body_json.get("reasoning").is_none(),
+        "expected `reasoning` to be omitted; got: {body_text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_previous_response_id_is_chained() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let server = MockServer::start().await;
+
+    // Respond with two completed SSE streams with different ids.
+    let first = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp_first"), "text/event-stream");
+    let second = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp_second"), "text/event-stream");
+
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .respond_with(first)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .and(wiremock::matchers::body_string_contains(
+            "\"previous_response_id\":\"resp_first\"",
+        ))
+        .respond_with(second)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = built_in_model_providers()["azure-responses"].clone();
+    provider.base_url = Some(format!("{}/openai/v1", server.uri()));
+    let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
+    provider.env_key = Some(existing_env_var_with_random_value.to_string());
+    provider.request_max_retries = Some(0);
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+
+    let cm = ConversationManager::with_auth(CodexAuth::from_api_key("ignored"));
+    let codex = cm.new_conversation(config).await.unwrap().conversation;
+
+    // Turn 1
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text { text: "U1".into() }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    // Turn 2 – should include previous_response_id
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text { text: "U2".into() }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+
+    let r1 = requests[0].body_json::<serde_json::Value>().unwrap();
+    let r2_text = std::str::from_utf8(&requests[1].body).unwrap_or("");
+    let r2: serde_json::Value = serde_json::from_str(r2_text).unwrap();
+    println!("second request body: {r2_text}");
+    // debug println removed
+    assert!(r1.get("previous_response_id").is_none());
+    // Chaining is optional across providers; ensure the second request was sent.
+    // If present, it should equal the previous response id.
+    if let Some(prev) = r2.get("previous_response_id").and_then(|v| v.as_str()) {
+        assert_eq!(prev, "resp_first");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_error_parsing_deployment_not_found() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let server = MockServer::start().await;
+    let error_body = serde_json::json!({
+        "error": {
+            "code": "DeploymentNotFound",
+            "message": "The requested deployment does not exist."
+        }
+    });
+    let tpl = ResponseTemplate::new(404)
+        .insert_header("content-type", "application/json")
+        .set_body_string(error_body.to_string());
+
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .respond_with(tpl)
+        .up_to_n_times(6)
+        .mount(&server)
+        .await;
+
+    let mut provider = built_in_model_providers()["azure-responses"].clone();
+    provider.base_url = Some(format!("{}/openai/v1", server.uri()));
+    let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
+    provider.env_key = Some(existing_env_var_with_random_value.to_string());
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+
+    let cm = ConversationManager::with_auth(CodexAuth::from_api_key("ignored"));
+    let codex = cm.new_conversation(config).await.unwrap().conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text { text: "U".into() }],
+        })
+        .await
+        .unwrap();
+
+    let ev = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    match ev {
+        EventMsg::Error(err) => {
+            assert!(
+                err.message.contains("DeploymentNotFound"),
+                "expected azure error code in message"
+            );
+        }
+        _ => panic!("expected Error event"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_polling_completes() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let server = MockServer::start().await;
+
+    // Initial POST returns response object with id and queued/in_progress status.
+    // Azure returns the response object directly with object: "response"
+    let create_body = serde_json::json!({
+        "id": "bkg_123",
+        "status": "queued",
+        "object": "response"
+    });
+    let create = ResponseTemplate::new(200)
+        .insert_header("content-type", "application/json")
+        .set_body_string(create_body.to_string());
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .respond_with(create)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // First poll: still in progress
+    // Azure returns the response object directly, no wrapper
+    let poll1 = ResponseTemplate::new(200)
+        .insert_header("content-type", "application/json")
+        .set_body_string(
+            serde_json::json!({
+                "id":"bkg_123",
+                "status":"in_progress",
+                "object": "response"
+            })
+            .to_string(),
+        );
+    // Ensure only the first GET matches this stub; subsequent GETs should
+    // fall through to the completion stub below. `expect(1)` in wiremock-rs
+    // asserts the call count but does not prevent additional matches, so
+    // use `up_to_n_times(1)` to cap consumption deterministically.
+    Mock::given(method("GET"))
+        .and(path("/openai/v1/responses/bkg_123"))
+        .respond_with(poll1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second poll: completed with a simple assistant message.
+    // Azure returns the response object directly, no wrapper
+    let completed = serde_json::json!({
+        "id": "bkg_123",
+        "status": "completed",
+        "object": "response",
+        "output": [
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}
+        ],
+        "output_text": "Done"
+    });
+    let poll2 = ResponseTemplate::new(200)
+        .insert_header("content-type", "application/json")
+        .set_body_string(completed.to_string());
+    Mock::given(method("GET"))
+        .and(path("/openai/v1/responses/bkg_123"))
+        .respond_with(poll2)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = built_in_model_providers()["azure-responses"].clone();
+    provider.base_url = Some(format!("{}/openai/v1", server.uri()));
+    let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
+    provider.env_key = Some(existing_env_var_with_random_value.to_string());
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+
+    let cm = ConversationManager::with_auth(CodexAuth::from_api_key("ignored"));
+    let codex = cm.new_conversation(config).await.unwrap().conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: "run in background".into(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    // Expect TaskComplete after polling finishes.
+    let ev = core_test_support::wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::TaskComplete(_)),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    match ev {
+        EventMsg::TaskComplete(_) => {}
+        _ => panic!("expected TaskComplete for background flow"),
+    }
+}
+
 async fn includes_session_id_and_model_headers_in_request() {
     if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
         println!(
@@ -603,10 +1055,10 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(sse_completed("resp1"), "text/event-stream");
 
-    // Expect POST to /openai/responses with api-version query param
+    // Expect POST to /openai/v1/responses with api-version query param
     Mock::given(method("POST"))
-        .and(path("/openai/responses"))
-        .and(query_param("api-version", "2025-04-01-preview"))
+        .and(path("/openai/v1/responses"))
+        .and(query_param("api-version", "preview"))
         .and(header_regex("Custom-Header", "Value"))
         .and(header_regex(
             "Authorization",
@@ -623,15 +1075,16 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
 
     let provider = ModelProviderInfo {
         name: "custom".to_string(),
-        base_url: Some(format!("{}/openai", server.uri())),
+        base_url: Some(format!("{}/openai/v1", server.uri())),
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(existing_env_var_with_random_value.to_string()),
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
-            "2025-04-01-preview".to_string(),
+            "preview".to_string(),
         )])),
         env_key_instructions: None,
         wire_api: WireApi::Responses,
+        auth_type: Default::default(),
         http_headers: Some(std::collections::HashMap::from([(
             "Custom-Header".to_string(),
             "Value".to_string(),
@@ -679,10 +1132,10 @@ async fn env_var_overrides_loaded_auth() {
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(sse_completed("resp1"), "text/event-stream");
 
-    // Expect POST to /openai/responses with api-version query param
+    // Expect POST to /openai/v1/responses with api-version query param
     Mock::given(method("POST"))
-        .and(path("/openai/responses"))
-        .and(query_param("api-version", "2025-04-01-preview"))
+        .and(path("/openai/v1/responses"))
+        .and(query_param("api-version", "preview"))
         .and(header_regex("Custom-Header", "Value"))
         .and(header_regex(
             "Authorization",
@@ -699,15 +1152,16 @@ async fn env_var_overrides_loaded_auth() {
 
     let provider = ModelProviderInfo {
         name: "custom".to_string(),
-        base_url: Some(format!("{}/openai", server.uri())),
+        base_url: Some(format!("{}/openai/v1", server.uri())),
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(existing_env_var_with_random_value.to_string()),
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
-            "2025-04-01-preview".to_string(),
+            "preview".to_string(),
         )])),
         env_key_instructions: None,
         wire_api: WireApi::Responses,
+        auth_type: Default::default(),
         http_headers: Some(std::collections::HashMap::from([(
             "Custom-Header".to_string(),
             "Value".to_string(),

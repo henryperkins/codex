@@ -1,0 +1,196 @@
+# Example Codex configuration for Azure OpenAI users
+# Copy this to ~/.codex/config.toml and customize for your setup
+
+# ============================================================================
+# QUICK START FOR AZURE USERS
+# ============================================================================
+# 1. Set environment variables:
+#    export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
+#    export AZURE_OPENAI_API_KEY="your-api-key"
+#
+# 2. Update these two lines with your deployment name:
+model = "gpt-4o-deployment"      # Your Azure deployment name
+model_provider = "azure-responses"  # Use built-in Azure provider
+#
+# 3. That's it! Run: codex
+# ============================================================================
+
+# --- Core Settings ---
+approval_policy = "on-failure"      # Ask before running failed commands
+sandbox_mode = "workspace-write"    # Allow writes in workspace
+model_context_window = 128000       # Adjust based on your model
+model_max_output_tokens = 16384     # Adjust based on your model
+
+# --- Reasoning Settings (for o3/gpt-5 models) ---
+model_reasoning_effort = "medium"   # minimal | low | medium | high
+model_reasoning_summary = "auto"    # auto | concise | detailed | none
+
+# --- History ---
+[history]
+persistence = "save-all"            # Save all conversations
+
+# --- File Opener ---
+file_opener = "vscode"              # Open files in VS Code from TUI
+
+# ============================================================================
+# OPTION 1: Use Built-in Azure Providers (Recommended)
+# ============================================================================
+# No configuration needed! Just use one of these provider IDs:
+#
+# model_provider = "azure-responses"  # For Responses API (recommended)
+# model_provider = "azure-chat"       # For Chat Completions API
+#
+# These automatically use AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+
+# ============================================================================
+# OPTION 2: Custom Azure Configuration
+# ============================================================================
+# Only needed if you want to override defaults or use multiple Azure resources
+
+[model_providers.my-azure-eastus]
+name = "Azure East US"
+base_url = "https://eastus-resource.openai.azure.com/openai/v1"
+env_key = "AZURE_EASTUS_KEY"
+wire_api = "responses"
+auth_type = "api_key"
+query_params = { api-version = "preview" }
+request_max_retries = 3
+stream_idle_timeout_ms = 60000
+
+[model_providers.my-azure-westeu]
+name = "Azure West Europe"
+base_url = "https://westeu-resource.openai.azure.com/openai/v1"
+env_key = "AZURE_WESTEU_KEY"
+wire_api = "responses"
+auth_type = "api_key"
+query_params = { api-version = "preview" }
+
+# ============================================================================
+# PROFILES - Quick Model Switching
+# ============================================================================
+# Use profiles to quickly switch between models: codex --profile azure-o3
+
+[profiles.azure-gpt4o]
+model = "gpt-4o-2024-11"           # Your GPT-4o deployment name
+model_provider = "azure-responses"
+model_context_window = 128000
+model_max_output_tokens = 16384
+
+[profiles.azure-gpt5]
+model = "gpt-5-latest"              # Your GPT-5 deployment name
+model_provider = "azure-responses"
+model_reasoning_effort = "high"
+model_reasoning_summary = "detailed"
+model_context_window = 200000
+model_max_output_tokens = 65536
+
+[profiles.azure-o3]
+model = "o3-preview"                # Your o3 deployment name
+model_provider = "azure-responses"
+model_reasoning_effort = "high"
+model_reasoning_summary = "auto"
+
+[profiles.azure-o4-mini]
+model = "o4-mini-2025"              # Your o4-mini deployment name
+model_provider = "azure-responses"
+model_reasoning_effort = "medium"
+model_reasoning_summary = "concise"
+
+# Legacy Chat API profile (for older models)
+[profiles.azure-gpt35]
+model = "gpt-35-turbo-16k"         # Your GPT-3.5 deployment name
+model_provider = "azure-chat"
+model_context_window = 16385
+model_max_output_tokens = 4096
+
+# ============================================================================
+# ADVANCED: Multi-Region Setup with Failover
+# ============================================================================
+
+# Primary region
+[model_providers.azure-primary]
+name = "Azure Primary (East US)"
+base_url = "https://primary.openai.azure.com/openai/v1"
+env_key = "AZURE_PRIMARY_KEY"
+wire_api = "responses"
+auth_type = "api_key"
+query_params = { api-version = "preview" }
+
+# Fallback region
+[model_providers.azure-fallback]
+name = "Azure Fallback (West EU)"
+base_url = "https://fallback.openai.azure.com/openai/v1"
+env_key = "AZURE_FALLBACK_KEY"
+wire_api = "responses"
+auth_type = "api_key"
+query_params = { api-version = "preview" }
+
+# Profile using primary with manual fallback option
+[profiles.azure-ha]
+model = "gpt-4o-prod"
+model_provider = "azure-primary"
+# To use fallback: codex --profile azure-ha-fallback
+
+[profiles.azure-ha-fallback]
+model = "gpt-4o-prod"
+model_provider = "azure-fallback"
+
+# ============================================================================
+# AZURE AD AUTHENTICATION (Enterprise)
+# ============================================================================
+
+[model_providers.azure-ad]
+name = "Azure with AD Auth"
+base_url = "https://enterprise.openai.azure.com/openai/v1"
+# No env_key - use Azure AD token instead
+wire_api = "responses"
+auth_type = "bearer"  # Uses Bearer token from Azure AD
+query_params = { api-version = "preview" }
+# Set up Azure AD auth separately via Azure CLI or environment
+
+# ============================================================================
+# SANDBOX SETTINGS
+# ============================================================================
+
+[sandbox_workspace_write]
+network_access = true               # Allow network access
+writable_roots = []                 # Additional writable directories
+exclude_tmpdir_env_var = false
+exclude_slash_tmp = false
+
+# ============================================================================
+# SHELL ENVIRONMENT POLICY
+# ============================================================================
+
+[shell_environment_policy]
+inherit = "all"                     # Inherit all env vars
+ignore_default_excludes = false
+# Exclude sensitive Azure/AWS credentials from child processes
+exclude = ["AZURE_*_KEY", "AWS_SECRET*", "AZURE_CLIENT_SECRET"]
+
+# ============================================================================
+# TIPS FOR AZURE USERS
+# ============================================================================
+# 
+# 1. Model Naming:
+#    - Use deployment names that match OpenAI patterns for automatic
+#      capability detection (e.g., "gpt-4o-prod", "gpt-5-latest", "o3-dev")
+#    - Custom names work but won't auto-detect capabilities
+#
+# 2. API Versions:
+#    - Responses API: Use "preview"
+#    - Chat API: Use "2024-10-01-preview" or latest stable version
+#
+# 3. Response Storage:
+#    - Enabled by default for Azure (better performance)
+#    - Disable with: disable_response_storage = true (if using ZDR)
+#
+# 4. Background Mode:
+#    - Enable with: export CODEX_ENABLE_BACKGROUND=1
+#    - Useful for long-running responses
+#
+# 5. Debugging:
+#    - Enable debug logs: RUST_LOG=debug codex
+#    - Check Azure portal for deployment status and quotas
+#
+# ============================================================================

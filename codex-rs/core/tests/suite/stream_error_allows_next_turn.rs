@@ -74,6 +74,7 @@ async fn continue_after_stream_error() {
         env_key: Some("PATH".into()),
         env_key_instructions: None,
         wire_api: WireApi::Responses,
+        auth_type: Default::default(),
         query_params: None,
         http_headers: None,
         env_http_headers: None,

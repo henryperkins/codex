@@ -39,6 +39,11 @@ pub struct Prompt {
 
     /// Optional override for the built-in BASE_INSTRUCTIONS.
     pub base_instructions_override: Option<String>,
+
+    /// Optional `previous_response_id` used for response chaining on providers
+    /// that support it (e.g., Azure Responses API). When present, the client
+    /// will forward it in the request payload.
+    pub previous_response_id: Option<String>,
 }
 
 impl Prompt {
@@ -66,7 +71,65 @@ impl Prompt {
     }
 
     pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
-        self.input.clone()
+        // Sanitize the input before serialization:
+        // - Drop `Reasoning` items entirely. These are server-emitted with
+        //   immutable ids (e.g., `rs_…`). Re-sending them can trigger
+        //   duplicate-id validation errors on providers that store response
+        //   items (e.g., Azure Responses API).
+        // - Clear server-assigned ids from items that may carry them
+        //   (messages, function/custom/shell calls). These ids are minted by
+        //   the server and are unique within its stored transcript. When
+        //   chaining with `previous_response_id`, re-sending items that still
+        //   have their original ids will trip validation with errors like
+        //   "Duplicate item found with id fc_…". Clearing the ids keeps the
+        //   semantic content while avoiding duplicate-id conflicts.
+        self.input
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Reasoning { .. } => None,
+                ResponseItem::Message { role, content, .. } => Some(ResponseItem::Message {
+                    id: None,
+                    role: role.clone(),
+                    content: content.clone(),
+                }),
+                ResponseItem::FunctionCall {
+                    id: _,
+                    name,
+                    arguments,
+                    call_id,
+                } => Some(ResponseItem::FunctionCall {
+                    id: None,
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    call_id: call_id.clone(),
+                }),
+                ResponseItem::LocalShellCall {
+                    id: _,
+                    call_id,
+                    status,
+                    action,
+                } => Some(ResponseItem::LocalShellCall {
+                    id: None,
+                    call_id: call_id.clone(),
+                    status: status.clone(),
+                    action: action.clone(),
+                }),
+                ResponseItem::CustomToolCall {
+                    id: _,
+                    status,
+                    call_id,
+                    name,
+                    input,
+                } => Some(ResponseItem::CustomToolCall {
+                    id: None,
+                    status: status.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }),
+                other => Some(other.clone()),
+            })
+            .collect()
     }
 
     /// Creates a formatted user instructions message from a string
@@ -88,6 +151,10 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+    },
+    Incomplete {
+        response_id: String,
+        _reason: Option<String>,
     },
     OutputTextDelta(String),
     ReasoningSummaryDelta(String),
@@ -143,11 +210,25 @@ pub(crate) struct ResponsesApiRequest<'a> {
     pub(crate) tools: &'a [serde_json::Value],
     pub(crate) tool_choice: &'static str,
     pub(crate) parallel_tool_calls: bool,
+    // Match OpenAI's client behavior: only include `reasoning` when supported
+    // by the model family. When unsupported, omit the field entirely rather
+    // than sending `null` so providers (including Azure) don't see a stray key.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<Reasoning>,
     /// true when using the Responses API.
     pub(crate) store: bool,
     pub(crate) stream: bool,
     pub(crate) include: Vec<String>,
+    /// Link this request to the previous streamed response when server‑side
+    /// storage is enabled. This enables response chaining on providers that
+    /// support it (e.g., Azure OpenAI Responses API).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_response_id: Option<String>,
+    /// When true, the server may process the request asynchronously. In this
+    /// mode the initial POST usually returns a minimal envelope and callers
+    /// must poll `GET /v1/responses/{id}` until `status == "completed"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) background: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -218,6 +299,8 @@ mod tests {
             store: true,
             stream: true,
             include: vec![],
+            previous_response_id: None,
+            background: None,
             prompt_cache_key: None,
             text: Some(TextControls {
                 verbosity: Some(OpenAiVerbosity::Low),
@@ -248,11 +331,136 @@ mod tests {
             store: true,
             stream: true,
             include: vec![],
+            previous_response_id: None,
+            background: None,
             prompt_cache_key: None,
             text: None,
         };
 
         let v = serde_json::to_value(&req).expect("json");
         assert!(v.get("text").is_none());
+    }
+
+    #[test]
+    fn formatted_input_clears_server_assigned_ids_and_drops_reasoning() {
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::LocalShellAction;
+        use codex_protocol::models::LocalShellExecAction;
+        use codex_protocol::models::LocalShellStatus;
+        use codex_protocol::models::ResponseItem;
+
+        let prompt = Prompt {
+            input: vec![
+                // Server-emitted reasoning should be dropped entirely.
+                ResponseItem::Reasoning {
+                    id: "rs_123".to_string(),
+                    summary: vec![],
+                    content: None,
+                    encrypted_content: None,
+                },
+                // Message id should be cleared.
+                ResponseItem::Message {
+                    id: Some("msg_1".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "hello".to_string(),
+                    }],
+                },
+                // Function call id should be cleared but call_id preserved.
+                ResponseItem::FunctionCall {
+                    id: Some("fc_1".to_string()),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                    call_id: "call_1".to_string(),
+                },
+                // Local shell call id should be cleared; call_id/status/action preserved.
+                ResponseItem::LocalShellCall {
+                    id: Some("ls_1".to_string()),
+                    call_id: Some("call_2".to_string()),
+                    status: LocalShellStatus::InProgress,
+                    action: LocalShellAction::Exec(LocalShellExecAction {
+                        command: vec!["echo".to_string(), "hi".to_string()],
+                        timeout_ms: None,
+                        working_directory: None,
+                        env: None,
+                        user: None,
+                    }),
+                },
+                // Custom tool call id should be cleared.
+                ResponseItem::CustomToolCall {
+                    id: Some("ctc_1".to_string()),
+                    status: Some("in_progress".to_string()),
+                    call_id: "call_3".to_string(),
+                    name: "custom.tool".to_string(),
+                    input: "{}".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let formatted = prompt.get_formatted_input();
+
+        // Reasoning item dropped; remaining 4 entries.
+        assert_eq!(formatted.len(), 4);
+
+        // Message id cleared
+        match &formatted[0] {
+            ResponseItem::Message { id, role, content } => {
+                assert!(id.is_none());
+                assert_eq!(role, "assistant");
+                assert!(matches!(content[0], ContentItem::OutputText { .. }));
+            }
+            _ => panic!("unexpected variant for formatted[0]"),
+        }
+
+        // Function call id cleared, call_id intact
+        match &formatted[1] {
+            ResponseItem::FunctionCall {
+                id,
+                name,
+                arguments,
+                call_id,
+            } => {
+                assert!(id.is_none());
+                assert_eq!(name, "shell");
+                assert_eq!(arguments, "{}");
+                assert_eq!(call_id, "call_1");
+            }
+            _ => panic!("unexpected variant for formatted[1]"),
+        }
+
+        // Local shell call id cleared, other fields preserved
+        match &formatted[2] {
+            ResponseItem::LocalShellCall {
+                id,
+                call_id,
+                status,
+                action,
+            } => {
+                assert!(id.is_none());
+                assert_eq!(call_id.as_deref(), Some("call_2"));
+                assert!(matches!(status, LocalShellStatus::InProgress));
+                assert!(matches!(action, LocalShellAction::Exec(_)));
+            }
+            _ => panic!("unexpected variant for formatted[2]"),
+        }
+
+        // Custom tool call id cleared, other fields preserved
+        match &formatted[3] {
+            ResponseItem::CustomToolCall {
+                id,
+                status,
+                call_id,
+                name,
+                input,
+            } => {
+                assert!(id.is_none());
+                assert_eq!(status.as_deref(), Some("in_progress"));
+                assert_eq!(call_id, "call_3");
+                assert_eq!(name, "custom.tool");
+                assert_eq!(input, "{}");
+            }
+            _ => panic!("unexpected variant for formatted[3]"),
+        }
     }
 }

@@ -1079,6 +1079,7 @@ disable_response_storage = true
             base_url: Some("https://api.openai.com/v1".to_string()),
             env_key: Some("OPENAI_API_KEY".to_string()),
             wire_api: crate::WireApi::Chat,
+            auth_type: crate::model_provider_info::AuthType::Bearer,
             env_key_instructions: None,
             query_params: None,
             http_headers: None,

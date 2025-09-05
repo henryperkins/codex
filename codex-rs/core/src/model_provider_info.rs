@@ -39,6 +39,21 @@ pub enum WireApi {
     Chat,
 }
 
+/// How this provider authenticates outbound HTTP requests.
+///
+/// By default, Codex assumes OpenAI‑style Bearer tokens in the
+/// `Authorization` header. Azure OpenAI, however, expects the API key in an
+/// `api-key` header. Providers can override the default via TOML or built‑ins.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    /// Send `Authorization: Bearer <token>`.
+    #[default]
+    Bearer,
+    /// Send `api-key: <token>`.
+    ApiKey,
+}
+
 /// Serializable representation of a provider definition.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ModelProviderInfo {
@@ -56,6 +71,10 @@ pub struct ModelProviderInfo {
     /// Which wire protocol this provider expects.
     #[serde(default)]
     pub wire_api: WireApi,
+
+    /// How to authenticate requests for this provider. Defaults to Bearer.
+    #[serde(default)]
+    pub auth_type: AuthType,
 
     /// Optional query parameters to append to the base URL.
     pub query_params: Option<HashMap<String, String>>,
@@ -89,7 +108,7 @@ impl ModelProviderInfo {
     /// Construct a `POST` RequestBuilder for the given URL using the provided
     /// reqwest Client applying:
     ///   • provider-specific headers (static + env based)
-    ///   • Bearer auth header when an API key is available.
+    ///   • Auth header when an API key is available (Bearer or api-key for Azure).
     ///   • Auth token for OAuth.
     ///
     /// If the provider declares an `env_key` but the variable is missing/empty, returns an [`Err`] identical to the
@@ -115,8 +134,18 @@ impl ModelProviderInfo {
 
         let mut builder = client.post(url);
 
+        // Choose the appropriate auth header behavior based on provider settings.
         if let Some(auth) = effective_auth.as_ref() {
-            builder = builder.bearer_auth(auth.get_token().await?);
+            match (self.auth_type, auth.mode) {
+                (AuthType::ApiKey, AuthMode::ApiKey) => {
+                    // Azure API key header
+                    builder = builder.header("api-key", auth.get_token().await?);
+                }
+                // For all other modes (including ChatGPT), use Bearer.
+                _ => {
+                    builder = builder.bearer_auth(auth.get_token().await?);
+                }
+            }
         }
 
         Ok(self.apply_http_headers(builder))
@@ -159,10 +188,51 @@ impl ModelProviderInfo {
         }
     }
 
+    /// Build the URL for `GET /responses/{id}` honoring base URL and query params
+    /// (e.g., Azure's `api-version`).
+    pub(crate) fn get_response_url(&self, auth: &Option<CodexAuth>, id: &str) -> String {
+        let default_base_url = if matches!(
+            auth,
+            Some(CodexAuth {
+                mode: AuthMode::ChatGPT,
+                ..
+            })
+        ) {
+            "https://chatgpt.com/backend-api/codex"
+        } else {
+            "https://api.openai.com/v1"
+        };
+        let query_string = self.get_query_string();
+        let base_url = self
+            .base_url
+            .clone()
+            .unwrap_or(default_base_url.to_string());
+        format!("{base_url}/responses/{id}{query_string}")
+    }
+
+    /// Best-effort detection of Azure providers so we can parse Azure-specific
+    /// errors and behaviors.
+    pub(crate) fn is_probably_azure(&self) -> bool {
+        let base_is_azure = self
+            .base_url
+            .as_ref()
+            .map(|u| u.contains(".azure.com"))
+            .unwrap_or(false);
+        let has_api_version = self
+            .query_params
+            .as_ref()
+            .map(|m| m.contains_key("api-version"))
+            .unwrap_or(false);
+        base_is_azure || has_api_version || matches!(self.auth_type, AuthType::ApiKey)
+    }
+
     /// Apply provider-specific HTTP headers (both static and environment-based)
     /// onto an existing `reqwest::RequestBuilder` and return the updated
     /// builder.
-    fn apply_http_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub(crate) fn apply_http_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
         if let Some(extra) = &self.http_headers {
             for (k, v) in extra {
                 builder = builder.header(k, v);
@@ -257,6 +327,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key: None,
                 env_key_instructions: None,
                 wire_api: WireApi::Responses,
+                auth_type: AuthType::Bearer,
                 query_params: None,
                 http_headers: Some(
                     [("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]
@@ -279,6 +350,74 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
                 requires_openai_auth: true,
+            },
+        ),
+        // Azure OpenAI – Responses API
+        (
+            "azure-responses",
+            P {
+                name: "Azure OpenAI (Responses)".into(),
+                // If AZURE_OPENAI_ENDPOINT is set, derive a sensible default base URL.
+                // Users can still override in config.toml.
+                base_url: std::env::var("AZURE_OPENAI_ENDPOINT")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|ep| format!("{ep}/openai")),
+                // Use API key auth via header; read from standard env var.
+                env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
+                env_key_instructions: None,
+                wire_api: WireApi::Responses,
+                auth_type: AuthType::ApiKey,
+                // v1 Responses API uses "preview" not dated versions like "2025-04-01-preview"
+                query_params: Some(
+                    [(
+                        "api-version".to_string(),
+                        std::env::var("AZURE_OPENAI_API_VERSION")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                            .unwrap_or_else(|| "preview".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+            },
+        ),
+        // Azure OpenAI – Chat Completions fallback
+        (
+            "azure-chat",
+            P {
+                name: "Azure OpenAI (Chat)".into(),
+                base_url: std::env::var("AZURE_OPENAI_ENDPOINT")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|ep| format!("{ep}/openai")),
+                env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
+                env_key_instructions: None,
+                wire_api: WireApi::Chat,
+                auth_type: AuthType::ApiKey,
+                query_params: Some(
+                    [(
+                        "api-version".to_string(),
+                        std::env::var("AZURE_OPENAI_API_VERSION")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                            .unwrap_or_else(|| "2025-04-01-preview".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
             },
         ),
         (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
@@ -316,6 +455,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         env_key: None,
         env_key_instructions: None,
         wire_api: WireApi::Chat,
+        auth_type: AuthType::Bearer,
         query_params: None,
         http_headers: None,
         env_http_headers: None,
@@ -343,6 +483,7 @@ base_url = "http://localhost:11434/v1"
             env_key: None,
             env_key_instructions: None,
             wire_api: WireApi::Chat,
+            auth_type: AuthType::Bearer,
             query_params: None,
             http_headers: None,
             env_http_headers: None,
@@ -370,6 +511,7 @@ query_params = { api-version = "2025-04-01-preview" }
             env_key: Some("AZURE_OPENAI_API_KEY".into()),
             env_key_instructions: None,
             wire_api: WireApi::Chat,
+            auth_type: AuthType::Bearer,
             query_params: Some(maplit::hashmap! {
                 "api-version".to_string() => "2025-04-01-preview".to_string(),
             }),
@@ -400,6 +542,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             env_key: Some("API_KEY".into()),
             env_key_instructions: None,
             wire_api: WireApi::Chat,
+            auth_type: AuthType::Bearer,
             query_params: None,
             http_headers: Some(maplit::hashmap! {
                 "X-Example-Header".to_string() => "example-value".to_string(),

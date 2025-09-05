@@ -80,6 +80,7 @@ async fn retries_on_early_close() {
         env_key: Some("PATH".into()),
         env_key_instructions: None,
         wire_api: codex_core::WireApi::Responses,
+        auth_type: Default::default(),
         query_params: None,
         http_headers: None,
         env_http_headers: None,
