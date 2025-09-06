@@ -16,7 +16,6 @@ use core_test_support::load_sse_fixture_with_id;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::Request;
 use wiremock::Respond;
 use wiremock::ResponseTemplate;
@@ -40,7 +39,7 @@ async fn retries_on_early_close() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     struct SeqResponder;
     impl Respond for SeqResponder {

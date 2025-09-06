@@ -6,6 +6,7 @@ use codex_core::CodexConversation;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigToml;
+use wiremock::MockServer;
 
 /// Returns a default `Config` whose on-disk state is confined to the provided
 /// temporary directory. Using a per-test directory keeps tests hermetic and
@@ -90,6 +91,15 @@ pub fn load_sse_fixture_with_id(path: impl AsRef<std::path::Path>, id: &str) -> 
             }
         })
         .collect()
+}
+
+/// Start a Wiremock server with an increased body print limit to avoid
+/// truncation in test logs when requests are large.
+pub async fn start_mock_server() -> MockServer {
+    wiremock::MockServer::builder()
+        .body_print_limit(wiremock::BodyPrintLimit::Limited(1_000_000))
+        .start()
+        .await
 }
 
 pub async fn wait_for_event<F>(

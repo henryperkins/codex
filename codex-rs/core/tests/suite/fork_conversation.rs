@@ -11,7 +11,6 @@ use core_test_support::load_default_config_for_test;
 use core_test_support::wait_for_event;
 use tempfile::TempDir;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -24,7 +23,7 @@ fn sse_completed(id: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_conversation_twice_drops_to_first_message() {
     // Start a mock server that completes three turns.
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
     let sse = sse_completed("resp");
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")

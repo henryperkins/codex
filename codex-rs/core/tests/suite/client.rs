@@ -119,7 +119,7 @@ async fn azure_api_key_header_and_endpoint_are_used() {
     }
 
     // Mock server
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // Basic SSE body
     let first = ResponseTemplate::new(200)
@@ -184,7 +184,7 @@ async fn azure_chat_uses_chat_endpoint_and_api_key() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // Minimal Chat Completions SSE stream: one token delta then [DONE].
     let body = "event: message\n\
@@ -195,17 +195,19 @@ data: [DONE]\n\n";
         .set_body_raw(body, "text/event-stream");
 
     Mock::given(method("POST"))
-        .and(path("/openai/chat/completions"))
-        .and(query_param("api-version", "2025-04-01-preview"))
+        .and(path("/openai/v1/chat/completions"))
+        .and(query_param("api-version", "preview"))
         .respond_with(tpl)
         .expect(1)
         .mount(&server)
         .await;
 
     let mut provider = built_in_model_providers()["azure-chat"].clone();
-    provider.base_url = Some(format!("{}/openai", server.uri()));
+    provider.base_url = Some(format!("{}/openai/v1", server.uri()));
     let existing_env_var_with_random_value = if cfg!(windows) { "USERNAME" } else { "USER" };
     provider.env_key = Some(existing_env_var_with_random_value.to_string());
+    provider.request_max_retries = Some(0);
+    provider.stream_max_retries = Some(0);
 
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home);
@@ -244,7 +246,7 @@ async fn azure_omits_reasoning_when_unknown_model_family() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // Minimal SSE body that completes immediately.
     let first = ResponseTemplate::new(200)
@@ -326,7 +328,7 @@ async fn responses_previous_response_id_is_chained() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // Respond with two completed SSE streams with different ids.
     let first = ResponseTemplate::new(200)
@@ -408,7 +410,7 @@ async fn azure_error_parsing_deployment_not_found() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
     let error_body = serde_json::json!({
         "error": {
             "code": "DeploymentNotFound",
@@ -466,7 +468,7 @@ async fn background_polling_completes() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // Initial POST returns response object with id and queued/in_progress status.
     // Azure returns the response object directly with object: "response"
@@ -616,7 +618,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
     drop(f);
 
     // Mock server that will receive the resumed request
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(sse_completed("resp1"), "text/event-stream");
@@ -705,7 +707,7 @@ async fn includes_session_id_and_model_headers_in_request() {
     }
 
     // Mock server
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // First request – must NOT include `previous_response_id`.
     let first = ResponseTemplate::new(200)
@@ -771,7 +773,7 @@ async fn includes_session_id_and_model_headers_in_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_base_instructions_override_in_request() {
     // Mock server
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // First request – must NOT include `previous_response_id`.
     let first = ResponseTemplate::new(200)
@@ -828,7 +830,7 @@ async fn includes_base_instructions_override_in_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn originator_config_override_is_used() {
     // Mock server
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
@@ -885,7 +887,7 @@ async fn chatgpt_auth_sends_correct_request() {
     }
 
     // Mock server
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // First request – must NOT include `previous_response_id`.
     let first = ResponseTemplate::new(200)

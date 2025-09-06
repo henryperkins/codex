@@ -1,21 +1,26 @@
 //! Stream wrapper that provides resumption capabilities.
 
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Context;
+use std::task::Poll;
 
 use futures::stream::Stream;
 use pin_project::pin_project;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use crate::advanced_features::AdvancedFeatures;
-use crate::client_common::{ResponseEvent, ResponseStream};
-use crate::error::{Result, CodexErr};
+use crate::client_common::ResponseEvent;
+use crate::client_common::ResponseStream;
+use crate::error::CodexErr;
+use crate::error::Result;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::stream_resumption::context::ResumptionContext;
-use crate::stream_resumption::providers::{create_provider_resumption, ResumptionProvider};
-use codex_protocol::models::ResponseItem;
+use crate::stream_resumption::providers::ResumptionProvider;
+use crate::stream_resumption::providers::create_provider_resumption;
 
 /// A stream wrapper that provides automatic resumption capabilities.
 ///
@@ -39,15 +44,15 @@ impl ResumableStream {
         features: &AdvancedFeatures,
     ) -> Self {
         let (tx_event, rx_event) = mpsc::channel(32);
-        
+
         // Create provider-specific resumption handler
         let resumption_provider = create_provider_resumption(provider, None);
-        
+
         // Clone data for the resumption task
         let provider_clone = provider.clone();
         let features_clone = features.clone();
         let tx_event_clone = tx_event.clone();
-        
+
         // Spawn the resumption monitoring task
         let resumption_handle = tokio::spawn(async move {
             Self::monitor_and_resume(
@@ -56,33 +61,30 @@ impl ResumableStream {
                 provider_clone,
                 features_clone,
                 tx_event_clone,
-            ).await;
+            )
+            .await;
         });
-        
+
         Self {
             rx_event,
             resumption_handle: Some(resumption_handle),
         }
     }
-    
+
     /// Convert back to a ResponseStream for compatibility.
     pub fn into_response_stream(mut self) -> ResponseStream {
-        // Clean up the background task
-        if let Some(handle) = self.resumption_handle.take() {
-            handle.abort();
-        }
-        
-        // Use mem::replace to avoid moving out of Drop type  
+        // Detach the background task so it can continue forwarding events.
+        let _ = self.resumption_handle.take();
+
+        // Use mem::replace to avoid moving out of Drop type
         let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(32);
         let old_rx = std::mem::replace(&mut self.rx_event, dummy_rx);
         // Drop the dummy channel since we're returning the old one
         drop(dummy_tx);
-        
-        ResponseStream {
-            rx_event: old_rx,
-        }
+
+        ResponseStream { rx_event: old_rx }
     }
-    
+
     /// Main monitoring loop that handles resumption logic.
     async fn monitor_and_resume(
         mut stream: ResponseStream,
@@ -92,17 +94,27 @@ impl ResumableStream {
         tx_event: mpsc::Sender<Result<ResponseEvent>>,
     ) {
         let mut resumption_ctx: Option<ResumptionContext> = None;
-        let max_attempts = resumption_provider.max_resume_attempts();
-        
+        // Check TEST_DISABLE_RETRIES environment variable
+        let max_attempts = if std::env::var("TEST_DISABLE_RETRIES").is_ok() {
+            0
+        } else {
+            resumption_provider.max_resume_attempts()
+        };
+
         // Check if provider supports resumption
-        if !resumption_provider.supports_resumption() {
-            debug!("Provider does not support stream resumption, using passthrough mode");
+        if !resumption_provider.supports_resumption() || max_attempts == 0 {
+            debug!(
+                "Provider does not support stream resumption or retries disabled, using passthrough mode"
+            );
             Self::passthrough_stream(stream, tx_event).await;
             return;
         }
-        
-        debug!("Starting stream monitoring with resumption support (max_attempts={})", max_attempts);
-        
+
+        debug!(
+            "Starting stream monitoring with resumption support (max_attempts={})",
+            max_attempts
+        );
+
         loop {
             match stream.rx_event.recv().await {
                 Some(Ok(event)) => {
@@ -111,10 +123,14 @@ impl ResumableStream {
                         resumption_provider.extract_resumption_info(&event, ctx);
                     } else if let ResponseEvent::Completed { response_id, .. } = &event {
                         // Initialize resumption context when we get a response ID
-                        resumption_ctx = Some(ResumptionContext::new(response_id.clone(), max_attempts));
-                        debug!("Initialized resumption context with response_id: {}", response_id);
+                        resumption_ctx =
+                            Some(ResumptionContext::new(response_id.clone(), max_attempts));
+                        debug!(
+                            "Initialized resumption context with response_id: {}",
+                            response_id
+                        );
                     }
-                    
+
                     // Forward the event
                     if tx_event.send(Ok(event)).await.is_err() {
                         debug!("Receiver dropped, stopping stream monitoring");
@@ -131,8 +147,15 @@ impl ResumableStream {
                                 ctx.max_attempts,
                                 error
                             );
-                            
-                            match Self::attempt_resume(&resumption_provider, ctx, &provider, &features).await {
+
+                            match Self::attempt_resume(
+                                &resumption_provider,
+                                ctx,
+                                &provider,
+                                &features,
+                            )
+                            .await
+                            {
                                 Ok(new_stream) => {
                                     ctx.increment_attempt();
                                     stream = new_stream;
@@ -149,7 +172,7 @@ impl ResumableStream {
                     } else {
                         debug!("No resumption context available for error: {}", error);
                     }
-                    
+
                     // Forward the error (resumption failed or not applicable)
                     if tx_event.send(Err(error)).await.is_err() {
                         debug!("Receiver dropped during error forwarding");
@@ -163,10 +186,10 @@ impl ResumableStream {
                 }
             }
         }
-        
+
         debug!("Stream monitoring completed");
     }
-    
+
     /// Attempt to resume the stream from the last known good position.
     async fn attempt_resume(
         resumption_provider: &ResumptionProvider,
@@ -178,71 +201,83 @@ impl ResumableStream {
         let delay = resumption_provider.resume_delay(context.attempt_count);
         debug!("Waiting {:?} before resume attempt", delay);
         sleep(delay).await;
-        
+
         // Create the resume request
         let resume_request = resumption_provider
             .create_resume_request(context, &serde_json::json!({}))
             .await?;
-        
+
         debug!("Created resume request: {:?}", resume_request.url());
-        
+
         // Execute the resume request and create a new stream
         debug!("Executing resume request to: {}", resume_request.url());
-        
+
         let client = reqwest::Client::new();
-        let response = client.execute(resume_request).await
-            .map_err(|e| CodexErr::Stream(format!("Failed to execute resume request: {}", e), None))?;
-            
+        let response = client.execute(resume_request).await.map_err(|e| {
+            CodexErr::Stream(format!("Failed to execute resume request: {e}"), None)
+        })?;
+
         if !response.status().is_success() {
             return Err(CodexErr::Stream(
                 format!("Resume request failed with status: {}", response.status()),
-                None
+                None,
             ));
         }
-        
+
         // Convert the SSE response back to ResponseStream
         let (tx, rx) = mpsc::channel(32);
-        
+
         // Spawn a task to parse SSE events from the response stream
         let bytes_stream = response.bytes_stream();
         tokio::spawn(async move {
             let result = Self::parse_sse_stream(bytes_stream, tx.clone()).await;
             if let Err(e) = result {
                 debug!("SSE parsing error: {}", e);
-                let _ = tx.send(Err(CodexErr::Stream(format!("SSE parsing failed: {}", e), None))).await;
+                let _ = tx
+                    .send(Err(CodexErr::Stream(
+                        format!("SSE parsing failed: {e}"),
+                        None,
+                    )))
+                    .await;
             }
         });
-        
-        Ok(ResponseStream {
-            rx_event: rx,
-        })
+
+        Ok(ResponseStream { rx_event: rx })
     }
-    
+
     /// Parse Server-Sent Events from a byte stream and convert to ResponseEvents.
     async fn parse_sse_stream(
         mut bytes_stream: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + Send,
         tx: mpsc::Sender<Result<ResponseEvent>>,
     ) -> Result<()> {
         use futures::StreamExt;
-        
+
         let mut buffer = String::new();
-        
+
         while let Some(chunk) = bytes_stream.next().await {
-            let chunk = chunk.map_err(|e| CodexErr::Stream(format!("Stream read error: {}", e), None))?;
+            let chunk =
+                chunk.map_err(|e| CodexErr::Stream(format!("Stream read error: {e}"), None))?;
             let text = String::from_utf8_lossy(&chunk);
-            
-            // Process each line in the chunk
-            for line in text.split_inclusive('\n') {
-                if line.starts_with("data:") {
+
+            // Append new chunk to buffer
+            buffer.push_str(&text);
+
+            // Process complete lines in the buffer
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer.drain(..=newline_pos).collect::<String>();
+
+                if line.trim().starts_with("data:") {
                     // Extract JSON from the data: line
-                    let json_str = line["data:".len()..].trim();
-                    
+                    let json_str = line.trim()["data:".len()..].trim();
+
                     // Try to parse as SSE event
                     match serde_json::from_str::<serde_json::Value>(json_str) {
                         Ok(raw_event) => {
                             // Convert to ResponseEvent using similar logic from client.rs
-                            if let Some(event_type) = raw_event.get("type").and_then(|v| v.as_str()) {
-                                let response_event = Self::map_sse_to_response_event(event_type, &raw_event)?;
+                            if let Some(event_type) = raw_event.get("type").and_then(|v| v.as_str())
+                            {
+                                let response_event =
+                                    Self::map_sse_to_response_event(event_type, &raw_event)?;
                                 if tx.send(Ok(response_event)).await.is_err() {
                                     debug!("Receiver dropped during SSE parsing");
                                     return Ok(());
@@ -260,10 +295,10 @@ impl ResumableStream {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Map SSE event JSON to ResponseEvent enum.
     fn map_sse_to_response_event(
         event_type: &str,
@@ -274,41 +309,52 @@ impl ResumableStream {
             "response.queued" => ResponseEvent::Queued,
             "response.in_progress" => ResponseEvent::InProgress,
             "response.completed" => {
-                let id = raw_event.get("response")
+                let id = raw_event
+                    .get("response")
                     .and_then(|r| r.get("id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                ResponseEvent::Completed { response_id: id, token_usage: None }
+                ResponseEvent::Completed {
+                    response_id: id,
+                    token_usage: None,
+                }
             }
-            "response.failed" => {
-                ResponseEvent::Failed(raw_event.clone())
-            }
-            "error" => {
-                ResponseEvent::Error(raw_event.clone())
-            }
+            "response.failed" => ResponseEvent::Failed(raw_event.clone()),
+            "error" => ResponseEvent::Error(raw_event.clone()),
             "response.incomplete" => {
-                let id = raw_event.get("response")
+                let id = raw_event
+                    .get("response")
                     .and_then(|r| r.get("id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                ResponseEvent::Incomplete { response_id: id, _reason: None }
+                ResponseEvent::Incomplete {
+                    response_id: id,
+                    _reason: None,
+                }
             }
             "response.output_text.delta" => {
                 if let Some(delta) = raw_event.get("delta").and_then(|v| v.as_str()) {
                     ResponseEvent::OutputTextDelta(delta.to_string())
                 } else {
-                    return Err(CodexErr::Stream("Missing delta in output_text.delta".to_string(), None));
+                    return Err(CodexErr::Stream(
+                        "Missing delta in output_text.delta".to_string(),
+                        None,
+                    ));
                 }
             }
             "response.output_item.done" => {
                 if let Some(item) = raw_event.get("item") {
-                    let response_item = serde_json::from_value(item.clone())
-                        .map_err(|e| CodexErr::Stream(format!("Failed to parse ResponseItem: {}", e), None))?;
+                    let response_item = serde_json::from_value(item.clone()).map_err(|e| {
+                        CodexErr::Stream(format!("Failed to parse ResponseItem: {e}"), None)
+                    })?;
                     ResponseEvent::OutputItemDone(response_item)
                 } else {
-                    return Err(CodexErr::Stream("Missing item in output_item.done".to_string(), None));
+                    return Err(CodexErr::Stream(
+                        "Missing item in output_item.done".to_string(),
+                        None,
+                    ));
                 }
             }
             _ => {
@@ -319,10 +365,10 @@ impl ResumableStream {
                 }
             }
         };
-        
+
         Ok(event)
     }
-    
+
     /// Passthrough mode that forwards events without resumption logic.
     async fn passthrough_stream(
         mut stream: ResponseStream,
@@ -339,7 +385,7 @@ impl ResumableStream {
 
 impl Stream for ResumableStream {
     type Item = Result<ResponseEvent>;
-    
+
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         this.rx_event.poll_recv(cx)
@@ -356,7 +402,8 @@ pub type ResumableResponseStream = ResumableStream;
 mod tests {
     use super::*;
     use crate::advanced_features::AdvancedFeatures;
-    use crate::model_provider_info::{ModelProviderInfo, WireApi};
+    use crate::model_provider_info::ModelProviderInfo;
+    use crate::model_provider_info::WireApi;
     use tokio::sync::mpsc;
 
     fn create_test_provider() -> ModelProviderInfo {
@@ -376,51 +423,51 @@ mod tests {
             requires_openai_auth: false,
         }
     }
-    
-    fn create_test_stream() -> ResponseStream {
+
+    fn create_test_stream() -> (mpsc::Sender<Result<ResponseEvent>>, ResponseStream) {
         let (tx, rx) = mpsc::channel(10);
-        ResponseStream { rx_event: rx }
+        (tx, ResponseStream { rx_event: rx })
     }
 
     #[tokio::test]
     async fn test_resumable_stream_creation() {
         let provider = create_test_provider();
         let features = AdvancedFeatures::default();
-        let stream = create_test_stream();
-        
+        let (_tx, stream) = create_test_stream();
+
         let resumable = ResumableStream::new(stream, &provider, &features);
-        
+
         // Should be able to convert back to ResponseStream
         let _response_stream = resumable.into_response_stream();
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_passthrough_mode() {
         let provider = create_test_provider(); // No resumption support
         let features = AdvancedFeatures {
             enable_stream_resumption: true,
             ..Default::default()
         };
-        
+
         // Create a test stream with a single event
         let (tx, rx) = mpsc::channel(10);
         let test_stream = ResponseStream { rx_event: rx };
-        
+
         // Send a test event
         let test_event = ResponseEvent::Created;
         tx.send(Ok(test_event)).await.unwrap();
         drop(tx); // Close the stream
-        
+
         let mut resumable = ResumableStream::new(test_stream, &provider, &features);
-        
+
         // Should receive the event in passthrough mode
         let received = resumable.rx_event.recv().await;
         assert!(received.is_some());
         match received.unwrap() {
             Ok(ResponseEvent::Created) => (), // Expected
-            other => panic!("Unexpected event: {:?}", other),
+            other => panic!("Unexpected event: {other:?}"),
         }
-        
+
         // Stream should end normally
         let end = resumable.rx_event.recv().await;
         assert!(end.is_none());

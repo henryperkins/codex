@@ -13,7 +13,6 @@ use futures::StreamExt;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -23,7 +22,7 @@ fn network_disabled() -> bool {
 }
 
 async fn run_stream(sse_body: &str) -> Vec<ResponseEvent> {
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let template = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")

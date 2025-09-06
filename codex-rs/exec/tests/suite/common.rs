@@ -10,7 +10,6 @@ use std::process::Command;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -40,7 +39,10 @@ impl Respond for SeqResponder {
 /// server, and returns the response_streams in order for each api call. Runs
 /// the codex-exec command with the wiremock server as the model server.
 pub(crate) async fn run_e2e_exec_test(cwd: &Path, response_streams: Vec<String>) {
-    let server = MockServer::start().await;
+    let server = wiremock::MockServer::builder()
+        .body_print_limit(wiremock::BodyPrintLimit::Limited(1_000_000))
+        .start()
+        .await;
 
     let num_calls = response_streams.len();
     let seq_responder = SeqResponder {

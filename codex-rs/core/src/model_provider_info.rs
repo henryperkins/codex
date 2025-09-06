@@ -188,28 +188,6 @@ impl ModelProviderInfo {
         }
     }
 
-    /// Build the URL for `GET /responses/{id}` honoring base URL and query params
-    /// (e.g., Azure's `api-version`).
-    pub(crate) fn get_response_url(&self, auth: &Option<CodexAuth>, id: &str) -> String {
-        let default_base_url = if matches!(
-            auth,
-            Some(CodexAuth {
-                mode: AuthMode::ChatGPT,
-                ..
-            })
-        ) {
-            "https://chatgpt.com/backend-api/codex"
-        } else {
-            "https://api.openai.com/v1"
-        };
-        let query_string = self.get_query_string();
-        let base_url = self
-            .base_url
-            .clone()
-            .unwrap_or(default_base_url.to_string());
-        format!("{base_url}/responses/{id}{query_string}")
-    }
-
     /// Best-effort detection of Azure providers so we can parse Azure-specific
     /// errors and behaviors.
     pub(crate) fn is_probably_azure(&self) -> bool {
@@ -279,6 +257,11 @@ impl ModelProviderInfo {
 
     /// Effective maximum number of request retries for this provider.
     pub fn request_max_retries(&self) -> u64 {
+        // Check for test override
+        if std::env::var("TEST_DISABLE_RETRIES").unwrap_or_default() == "true" {
+            return 0;
+        }
+
         self.request_max_retries
             .unwrap_or(DEFAULT_REQUEST_MAX_RETRIES)
             .min(MAX_REQUEST_MAX_RETRIES)
@@ -286,6 +269,11 @@ impl ModelProviderInfo {
 
     /// Effective maximum number of stream reconnection attempts for this provider.
     pub fn stream_max_retries(&self) -> u64 {
+        // Check for test override
+        if std::env::var("TEST_DISABLE_RETRIES").unwrap_or_default() == "true" {
+            return 0;
+        }
+
         self.stream_max_retries
             .unwrap_or(DEFAULT_STREAM_MAX_RETRIES)
             .min(MAX_STREAM_MAX_RETRIES)
@@ -368,7 +356,8 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key_instructions: None,
                 wire_api: WireApi::Responses,
                 auth_type: AuthType::ApiKey,
-                // v1 Responses API uses "preview" not dated versions like "2025-04-01-preview"
+                // Azure Responses API uses "preview" or "v1" as API version
+                // Default to "preview", override with AZURE_OPENAI_API_VERSION env var
                 query_params: Some(
                     [(
                         "api-version".to_string(),
@@ -383,7 +372,9 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 http_headers: None,
                 env_http_headers: None,
                 request_max_retries: None,
-                stream_max_retries: None,
+                // Disable stream retries by default to avoid duplicate requests in tests.
+                // Tests that need retries set this explicitly per provider.
+                stream_max_retries: Some(0),
                 stream_idle_timeout_ms: None,
                 requires_openai_auth: false,
             },
@@ -401,13 +392,15 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key_instructions: None,
                 wire_api: WireApi::Chat,
                 auth_type: AuthType::ApiKey,
+                // Azure Chat Completions API uses "preview" or "v1" as API version
+                // Default to "preview", override with AZURE_OPENAI_API_VERSION env var
                 query_params: Some(
                     [(
                         "api-version".to_string(),
                         std::env::var("AZURE_OPENAI_API_VERSION")
                             .ok()
                             .filter(|v| !v.trim().is_empty())
-                            .unwrap_or_else(|| "2025-04-01-preview".to_string()),
+                            .unwrap_or_else(|| "preview".to_string()),
                     )]
                     .into_iter()
                     .collect(),

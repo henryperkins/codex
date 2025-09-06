@@ -1,16 +1,16 @@
 //! Provider-specific stream resumption implementations.
 
 mod azure;
-mod openai; 
 mod fallback;
+mod openai;
 
 pub use azure::AzureResumption;
-pub use openai::OpenAIResumption;
 pub use fallback::NoResumption;
+pub use openai::OpenAIResumption;
 
-use crate::model_provider_info::ModelProviderInfo;
-use crate::AuthManager;
 use super::context::ProviderResumption;
+use crate::AuthManager;
+use crate::model_provider_info::ModelProviderInfo;
 use std::sync::Arc;
 
 /// Concrete enum for provider-specific resumption implementations.
@@ -58,7 +58,9 @@ impl ResumptionProvider {
     ) {
         match self {
             ResumptionProvider::Azure(provider) => provider.extract_resumption_info(event, context),
-            ResumptionProvider::OpenAI(provider) => provider.extract_resumption_info(event, context),
+            ResumptionProvider::OpenAI(provider) => {
+                provider.extract_resumption_info(event, context)
+            }
             ResumptionProvider::None(provider) => provider.extract_resumption_info(event, context),
         }
     }
@@ -79,9 +81,21 @@ impl ResumptionProvider {
         original_request_body: &serde_json::Value,
     ) -> crate::error::Result<reqwest::Request> {
         match self {
-            ResumptionProvider::Azure(provider) => provider.create_resume_request(context, original_request_body).await,
-            ResumptionProvider::OpenAI(provider) => provider.create_resume_request(context, original_request_body).await,
-            ResumptionProvider::None(provider) => provider.create_resume_request(context, original_request_body).await,
+            ResumptionProvider::Azure(provider) => {
+                provider
+                    .create_resume_request(context, original_request_body)
+                    .await
+            }
+            ResumptionProvider::OpenAI(provider) => {
+                provider
+                    .create_resume_request(context, original_request_body)
+                    .await
+            }
+            ResumptionProvider::None(provider) => {
+                provider
+                    .create_resume_request(context, original_request_body)
+                    .await
+            }
         }
     }
 }
@@ -106,27 +120,34 @@ pub fn create_provider_resumption(
 fn is_azure_provider(provider: &ModelProviderInfo) -> bool {
     // Check base URL for Azure patterns
     if let Some(base_url) = &provider.base_url {
-        return base_url.contains("azure.com") || 
-               base_url.contains(".azure.") ||
-               base_url.contains("openai.azure.com");
+        return base_url.contains("azure.com")
+            || base_url.contains(".azure.")
+            || base_url.contains("openai.azure.com");
     }
-    
+
     // Check other characteristics
-    provider.name.to_lowercase().contains("azure") ||
-    provider.env_key.as_ref().map(|k| k.contains("AZURE")).unwrap_or(false)
+    provider.name.to_lowercase().contains("azure")
+        || provider
+            .env_key
+            .as_ref()
+            .map(|k| k.contains("AZURE"))
+            .unwrap_or(false)
 }
 
 /// Detect if a provider is OpenAI-based.
 fn is_openai_provider(provider: &ModelProviderInfo) -> bool {
     // Check base URL for OpenAI patterns
     if let Some(base_url) = &provider.base_url {
-        return base_url.contains("api.openai.com") ||
-               base_url.contains("openai.com/v1");
+        return base_url.contains("api.openai.com") || base_url.contains("openai.com/v1");
     }
-    
+
     // Check other characteristics
-    provider.requires_openai_auth ||
-    provider.env_key.as_ref().map(|k| k.contains("OPENAI")).unwrap_or(false)
+    provider.requires_openai_auth
+        || provider
+            .env_key
+            .as_ref()
+            .map(|k| k.contains("OPENAI"))
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -157,21 +178,18 @@ mod tests {
         let azure_provider = create_test_provider(
             "Azure OpenAI",
             "https://myresource.openai.azure.com",
-            "AZURE_OPENAI_API_KEY"
+            "AZURE_OPENAI_API_KEY",
         );
-        
+
         assert!(is_azure_provider(&azure_provider));
         assert!(!is_openai_provider(&azure_provider));
     }
 
     #[test]
     fn test_openai_provider_detection() {
-        let openai_provider = create_test_provider(
-            "OpenAI",
-            "https://api.openai.com",
-            "OPENAI_API_KEY"
-        );
-        
+        let openai_provider =
+            create_test_provider("OpenAI", "https://api.openai.com", "OPENAI_API_KEY");
+
         assert!(!is_azure_provider(&openai_provider));
         assert!(is_openai_provider(&openai_provider));
     }
@@ -181,9 +199,9 @@ mod tests {
         let custom_provider = create_test_provider(
             "Custom LLM",
             "https://custom-llm.example.com",
-            "CUSTOM_API_KEY"
+            "CUSTOM_API_KEY",
         );
-        
+
         assert!(!is_azure_provider(&custom_provider));
         assert!(!is_openai_provider(&custom_provider));
     }
@@ -193,9 +211,9 @@ mod tests {
         let azure_provider = create_test_provider(
             "Azure OpenAI",
             "https://test.openai.azure.com",
-            "AZURE_OPENAI_API_KEY"
+            "AZURE_OPENAI_API_KEY",
         );
-        
+
         let resumption = create_provider_resumption(&azure_provider, None);
         // Azure supports stream resumption using starting_after parameter
         assert!(resumption.supports_resumption());

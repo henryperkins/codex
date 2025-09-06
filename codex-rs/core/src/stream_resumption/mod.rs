@@ -5,12 +5,16 @@
 //! to be completely modular and non-invasive to upstream code changes.
 
 mod context;
-mod wrapper;
 mod providers;
+mod wrapper;
 
-pub use context::{ResumptionContext, ProviderResumption};
-pub use wrapper::{ResumableStream, ResumableResponseStream};
-pub use providers::{create_provider_resumption, ResumptionProvider, NoResumption};
+pub use context::ProviderResumption;
+pub use context::ResumptionContext;
+pub use providers::NoResumption;
+pub use providers::ResumptionProvider;
+pub use providers::create_provider_resumption;
+pub use wrapper::ResumableResponseStream;
+pub use wrapper::ResumableStream;
 
 use crate::advanced_features::AdvancedFeatures;
 use crate::client_common::ResponseStream;
@@ -39,17 +43,20 @@ pub fn maybe_enable_resumption(
 /// Check if a provider supports stream resumption.
 pub fn provider_supports_resumption(provider: &ModelProviderInfo) -> bool {
     // For now, primarily Azure-based providers
-    provider.is_probably_azure() || 
-    provider.base_url.as_ref()
-        .map(|url| url.contains("azure") || url.contains("openai.azure.com"))
-        .unwrap_or(false)
+    provider.is_probably_azure()
+        || provider
+            .base_url
+            .as_ref()
+            .map(|url| url.contains("azure") || url.contains("openai.azure.com"))
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::advanced_features::AdvancedFeatures;
-    use crate::model_provider_info::{ModelProviderInfo, WireApi};
+    use crate::model_provider_info::ModelProviderInfo;
+    use crate::model_provider_info::WireApi;
 
     #[test]
     fn test_provider_resumption_detection() {
@@ -94,11 +101,11 @@ mod tests {
     fn test_resumption_enabled_by_default() {
         let features = AdvancedFeatures::default();
         assert!(features.enable_stream_resumption); // Network resilience is enabled by default
-        
+
         // Provider-optimized configs should also have it enabled
         let azure_features = AdvancedFeatures::azure_optimized();
         assert!(azure_features.enable_stream_resumption);
-        
+
         let openai_features = AdvancedFeatures::openai_optimized();
         assert!(openai_features.enable_stream_resumption);
     }

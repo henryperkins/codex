@@ -1866,7 +1866,7 @@ async fn try_run_turn(
                     sess.tx_event.send(event).await.ok();
                 }
             }
-            
+
             // Azure-specific events - mostly no-op in this context
             ResponseEvent::Queued | ResponseEvent::InProgress => {}
             ResponseEvent::Failed(_) | ResponseEvent::Error(_) => {}

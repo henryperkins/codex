@@ -6,7 +6,6 @@ use tempfile::TempDir;
 use uuid::Uuid;
 use walkdir::WalkDir;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -26,7 +25,7 @@ async fn chat_mode_stream_cli() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
     let sse = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{}}]}\n\n",
@@ -93,7 +92,7 @@ async fn exec_cli_applies_experimental_instructions_file() {
 
     // Start mock server which will capture the request and return a minimal
     // SSE stream for a single turn.
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
     let sse = concat!(
         "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n"

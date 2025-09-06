@@ -13,7 +13,6 @@ use core_test_support::load_sse_fixture_with_id;
 use core_test_support::wait_for_event_with_timeout;
 use tempfile::TempDir;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::body_string_contains;
 use wiremock::matchers::method;
@@ -32,7 +31,7 @@ async fn continue_after_stream_error() {
         return;
     }
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let fail = ResponseTemplate::new(500)
         .insert_header("content-type", "application/json")

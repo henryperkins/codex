@@ -17,7 +17,6 @@ use serde_json::Value;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -27,7 +26,7 @@ fn network_disabled() -> bool {
 }
 
 async fn run_request(input: Vec<ResponseItem>) -> Value {
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let template = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")

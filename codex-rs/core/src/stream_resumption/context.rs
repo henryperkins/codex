@@ -1,24 +1,42 @@
 //! Resumption context and provider trait definitions.
 
+use crate::error::Result;
 use async_trait::async_trait;
 use std::time::Duration;
-use crate::error::Result;
 
 /// Context information needed to resume a stream from a specific point.
 #[derive(Debug, Clone)]
 pub struct ResumptionContext {
     /// The response ID from the original request, used as the resumption anchor.
     pub response_id: String,
-    
-    /// The last sequence number we successfully received.
+
+    /// The last sequence number we successfully received (Azure SSE cursor).
     pub last_sequence: Option<u64>,
-    
+
+    /// Last output item ID for deduplication after resume.
+    pub last_output_item_id: Option<String>,
+
+    /// Partial SSE buffer containing incomplete event data.
+    pub partial_sse_buffer: String,
+
+    /// Partial content being accumulated (e.g., incomplete message text).
+    pub partial_content: String,
+
+    /// Encrypted reasoning content for stateless mode (if needed).
+    pub reasoning_encrypted_content: Option<String>,
+
+    /// Whether the original request was in background mode.
+    pub is_background: bool,
+
+    /// Whether responses should be stored for chaining.
+    pub store_responses: bool,
+
     /// Number of resume attempts made so far.
     pub attempt_count: u32,
-    
+
     /// Maximum number of resume attempts allowed.
     pub max_attempts: u32,
-    
+
     /// Provider-specific metadata for resumption.
     pub provider_metadata: serde_json::Value,
 }
@@ -28,49 +46,64 @@ impl ResumptionContext {
         Self {
             response_id,
             last_sequence: None,
+            last_output_item_id: None,
+            partial_sse_buffer: String::new(),
+            partial_content: String::new(),
+            reasoning_encrypted_content: None,
+            is_background: false,
+            store_responses: false,
             attempt_count: 0,
             max_attempts,
             provider_metadata: serde_json::Value::Null,
         }
     }
-    
+
     pub fn can_retry(&self) -> bool {
         self.attempt_count < self.max_attempts
     }
-    
+
     pub fn increment_attempt(&mut self) {
         self.attempt_count += 1;
     }
-    
+
     pub fn update_sequence(&mut self, sequence: u64) {
         self.last_sequence = Some(sequence);
     }
 }
 
 /// Trait for provider-specific stream resumption capabilities.
-/// 
+///
 /// Different providers (Azure, OpenAI, etc.) have different APIs for resuming
 /// interrupted streams. This trait abstracts those differences.
 #[async_trait]
 pub trait ProviderResumption: Send + Sync {
     /// Check if this provider supports stream resumption.
     fn supports_resumption(&self) -> bool;
-    
+
     /// Get the maximum number of resume attempts for this provider.
     fn max_resume_attempts(&self) -> u32 {
         3 // Conservative default
     }
-    
-    /// Get the delay before attempting a resume (for exponential backoff).
+
+    /// Get the delay before attempting a resume (for exponential backoff with jitter).
     fn resume_delay(&self, attempt: u32) -> Duration {
+        use rand::Rng;
+
         // Exponential backoff: 500ms, 1s, 2s, 4s, ...
         let base_delay_ms = 500u64;
-        let delay_ms = base_delay_ms * (2u64.pow(attempt.min(6))); // Cap at ~32 seconds
-        Duration::from_millis(delay_ms)
+        let exponential_delay = base_delay_ms * (2u64.pow(attempt.min(6))); // Cap at ~32 seconds
+        let max_delay_ms = 30_000u64; // 30 second cap
+        let delay_ms = exponential_delay.min(max_delay_ms);
+
+        // Add full jitter (random between 0 and delay)
+        let mut rng = rand::thread_rng();
+        let jittered_delay = rng.gen_range(0..=delay_ms);
+
+        Duration::from_millis(jittered_delay)
     }
-    
+
     /// Create a new stream request to resume from the given context.
-    /// 
+    ///
     /// This should construct a new HTTP request that tells the provider
     /// to continue streaming from where we left off.
     async fn create_resume_request(
@@ -78,9 +111,9 @@ pub trait ProviderResumption: Send + Sync {
         context: &ResumptionContext,
         original_request_body: &serde_json::Value,
     ) -> Result<reqwest::Request>;
-    
+
     /// Extract resumption information from a streaming response event.
-    /// 
+    ///
     /// This is called for each event to update our resumption context
     /// with any provider-specific tracking information (like sequence numbers).
     fn extract_resumption_info(
@@ -88,9 +121,9 @@ pub trait ProviderResumption: Send + Sync {
         event: &crate::client_common::ResponseEvent,
         context: &mut ResumptionContext,
     );
-    
+
     /// Determine if an error is recoverable via stream resumption.
-    /// 
+    ///
     /// Not all errors should trigger resumption attempts. This method
     /// helps distinguish between network/timeout errors (recoverable)
     /// and API errors (not recoverable).
@@ -99,16 +132,17 @@ pub trait ProviderResumption: Send + Sync {
 
 /// Configuration for stream resumption behavior.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StreamResumptionConfig {
     /// Maximum number of resume attempts before giving up.
     pub max_attempts: u32,
-    
+
     /// Base delay for exponential backoff between attempts.
     pub base_delay_ms: u64,
-    
+
     /// Maximum delay cap for exponential backoff.
     pub max_delay_ms: u64,
-    
+
     /// Whether to enable detailed logging of resumption attempts.
     pub debug_logging: bool,
 }
@@ -126,6 +160,7 @@ impl Default for StreamResumptionConfig {
 
 impl StreamResumptionConfig {
     /// Create a configuration optimized for reliable networks.
+    #[allow(dead_code)]
     pub fn reliable_network() -> Self {
         Self {
             max_attempts: 2,
@@ -134,8 +169,9 @@ impl StreamResumptionConfig {
             debug_logging: false,
         }
     }
-    
+
     /// Create a configuration optimized for unreliable networks.
+    #[allow(dead_code)]
     pub fn unreliable_network() -> Self {
         Self {
             max_attempts: 5,
@@ -144,8 +180,9 @@ impl StreamResumptionConfig {
             debug_logging: true,
         }
     }
-    
+
     /// Calculate the delay for a given attempt number.
+    #[allow(dead_code)]
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let delay_ms = self.base_delay_ms * (2u64.pow(attempt.min(10)));
         let capped_delay_ms = delay_ms.min(self.max_delay_ms);

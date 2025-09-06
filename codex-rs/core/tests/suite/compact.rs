@@ -96,7 +96,7 @@ async fn summarize_context_three_requests_and_instructions() {
     }
 
     // Set up a mock server that we can inspect after the run.
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     // SSE 1: assistant replies normally so it is recorded in history.
     let sse1 = sse(vec![

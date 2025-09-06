@@ -18,7 +18,6 @@ use core_test_support::load_sse_fixture_with_id;
 use core_test_support::wait_for_event;
 use tempfile::TempDir;
 use wiremock::Mock;
-use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -44,7 +43,7 @@ fn assert_tool_names(body: &serde_json::Value, expected_names: &[&str]) {
 async fn codex_mini_latest_tools() {
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let sse = sse_completed("resp");
     let template = ResponseTemplate::new(200)
@@ -128,7 +127,7 @@ async fn codex_mini_latest_tools() {
 async fn prompt_tools_are_consistent_across_requests() {
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let sse = sse_completed("resp");
     let template = ResponseTemplate::new(200)
@@ -211,7 +210,7 @@ async fn prompt_tools_are_consistent_across_requests() {
 async fn prefixes_context_and_instructions_once_and_consistently_across_requests() {
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let sse = sse_completed("resp");
     let template = ResponseTemplate::new(200)
@@ -329,7 +328,7 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() {
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let sse = sse_completed("resp");
     let template = ResponseTemplate::new(200)
@@ -450,7 +449,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() {
 async fn per_turn_overrides_keep_cached_prefix_and_key_constant() {
     use pretty_assertions::assert_eq;
 
-    let server = MockServer::start().await;
+    let server = core_test_support::start_mock_server().await;
 
     let sse = sse_completed("resp");
     let template = ResponseTemplate::new(200)

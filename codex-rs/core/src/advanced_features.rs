@@ -4,12 +4,13 @@
 //! and advanced storage features. By default, all advanced features are disabled to match
 //! upstream performance characteristics.
 
-use std::time::Duration;
-use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use serde::Deserialize;
+use serde::Serialize;
+use std::time::Duration;
 
 /// Configuration for optional advanced features.
-/// 
+///
 /// Default behavior matches upstream: all advanced features disabled for maximum performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvancedFeatures {
@@ -34,7 +35,7 @@ pub struct AdvancedFeatures {
 
     /// Configuration for background processing when enabled.
     pub background_config: BackgroundProcessingConfig,
-    
+
     /// Configuration for stream resumption behavior.
     pub stream_resumption_config: StreamResumptionConfig,
 }
@@ -94,13 +95,13 @@ impl AdvancedFeatures {
 pub struct BackgroundProcessingConfig {
     /// Initial delay before first polling attempt.
     pub initial_polling_delay: Duration,
-    
+
     /// Maximum number of polling attempts before giving up.
     pub max_polling_retries: u32,
-    
+
     /// Multiplier for exponential backoff between polling attempts.
     pub backoff_multiplier: f64,
-    
+
     /// Threshold for determining if a request should go to background.
     pub complexity_threshold: ComplexityThreshold,
 }
@@ -120,7 +121,7 @@ impl Default for BackgroundProcessingConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ComplexityThreshold {
     Low,    // Background for most requests
-    Medium, // Background for moderately complex requests  
+    Medium, // Background for moderately complex requests
     High,   // Background only for very complex requests (default)
 }
 
@@ -152,16 +153,16 @@ impl ComplexityLevel {
 pub trait ProviderCapabilities {
     /// Does this provider support response chaining via previous_response_id?
     fn supports_response_chaining(&self) -> bool;
-    
+
     /// Does this provider support background/async processing with polling?
     fn supports_background_processing(&self) -> bool;
-    
+
     /// Does this provider support stream resumption on network failures?
     fn supports_stream_resumption(&self) -> bool;
-    
+
     /// Does this provider require response storage for chaining to work?
     fn requires_response_storage_for_chaining(&self) -> bool;
-    
+
     /// Maximum number of stream resumption retries for this provider.
     fn max_resume_retries(&self) -> u32 {
         3
@@ -169,16 +170,17 @@ pub trait ProviderCapabilities {
 }
 
 /// Storage interface for response persistence and retrieval.
+#[async_trait::async_trait]
 pub trait ResponseStorage: Send + Sync {
     /// Should this request's response be stored?
     async fn should_store(&self, request: &RequestContext) -> bool;
-    
+
     /// Store a response and return its storage ID.
     async fn store_response(&self, response: &ResponseData) -> Result<String>;
-    
+
     /// Retrieve a previously stored response by ID.
     async fn get_previous_response(&self, id: &str) -> Result<Option<ResponseData>>;
-    
+
     /// Clean up old responses beyond retention period.
     async fn cleanup_expired_responses(&self) -> Result<u64>;
 }
@@ -195,7 +197,7 @@ pub struct RequestContext {
 impl RequestComplexity for RequestContext {
     fn estimated_complexity(&self) -> ComplexityLevel {
         let mut score = 0;
-        
+
         // Token count influence
         if let Some(tokens) = self.estimated_tokens {
             score += match tokens {
@@ -205,20 +207,20 @@ impl RequestComplexity for RequestContext {
                 _ => 3,
             };
         }
-        
-        // Tool usage influence  
+
+        // Tool usage influence
         score += match self.tool_count {
             0 => 0,
             1..=3 => 1,
             4..=10 => 2,
             _ => 3,
         };
-        
+
         // Chain complexity
         if self.has_previous_response_id {
             score += 1;
         }
-        
+
         match score {
             0..=1 => ComplexityLevel::Low,
             2..=3 => ComplexityLevel::Medium,
@@ -247,19 +249,20 @@ pub struct TokenUsage {
 #[derive(Debug, Default)]
 pub struct NoStorage;
 
+#[async_trait::async_trait]
 impl ResponseStorage for NoStorage {
     async fn should_store(&self, _request: &RequestContext) -> bool {
         false
     }
-    
+
     async fn store_response(&self, _response: &ResponseData) -> Result<String> {
         Err(crate::error::CodexErr::InternalServerError)
     }
-    
+
     async fn get_previous_response(&self, _id: &str) -> Result<Option<ResponseData>> {
         Ok(None)
     }
-    
+
     async fn cleanup_expired_responses(&self) -> Result<u64> {
         Ok(0)
     }
@@ -270,13 +273,13 @@ impl ResponseStorage for NoStorage {
 pub struct StreamResumptionConfig {
     /// Maximum number of resume attempts before giving up.
     pub max_attempts: u32,
-    
+
     /// Base delay for exponential backoff between attempts (milliseconds).
     pub base_delay_ms: u64,
-    
+
     /// Maximum delay cap for exponential backoff (milliseconds).
     pub max_delay_ms: u64,
-    
+
     /// Whether to enable detailed logging of resumption attempts.
     pub debug_logging: bool,
 }
@@ -302,7 +305,7 @@ impl StreamResumptionConfig {
             debug_logging: false,
         }
     }
-    
+
     /// Create a configuration optimized for unreliable networks.
     pub fn unreliable_network() -> Self {
         Self {
@@ -351,7 +354,10 @@ mod tests {
             tool_count: 15,
             has_previous_response_id: true,
         };
-        assert_eq!(complex_request.estimated_complexity(), ComplexityLevel::VeryHigh);
+        assert_eq!(
+            complex_request.estimated_complexity(),
+            ComplexityLevel::VeryHigh
+        );
     }
 
     #[test]

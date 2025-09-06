@@ -33,19 +33,14 @@ impl TaskTracker {
     /// # }
     /// ```
     pub fn track(&self, handle: JoinHandle<()>) {
-        let mut guard = self.inner.lock().expect("poisoned lock");
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.push(handle);
-    }
-
-    /// Returns true if this is the last strong reference to the inner state.
-    pub fn is_last_ref(&self) -> bool {
-        Arc::strong_count(&self.inner) == 1
     }
 
     /// Abort all currently-tracked tasks.  Aborted tasks are removed from the
     /// internal list so that repeated calls are no-ops.
     pub fn abort_all(&self) {
-        let mut guard = self.inner.lock().expect("poisoned lock");
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for h in guard.drain(..) {
             h.abort();
         }
@@ -57,7 +52,7 @@ impl Drop for TaskTracker {
         // Only abort tasks when this is the last strong reference to the inner state.
         // This prevents premature cancellation when short-lived clones are dropped.
         if Arc::strong_count(&self.inner) == 1 {
-            let mut guard = self.inner.lock().expect("poisoned lock");
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             for h in guard.drain(..) {
                 h.abort();
             }
