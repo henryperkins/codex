@@ -23,6 +23,7 @@ use crate::error::CodexErr;
 use crate::error::Result;
 use crate::model_family::ModelFamily;
 use crate::openai_tools::create_tools_json_for_chat_completions_api;
+use crate::task_tracker::TaskTracker;
 use crate::util::backoff;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
@@ -34,6 +35,7 @@ pub(crate) async fn stream_chat_completions(
     model_family: &ModelFamily,
     client: &reqwest::Client,
     provider: &ModelProviderInfo,
+    task_tracker: &TaskTracker,
 ) -> Result<ResponseStream> {
     // Build messages array
     let mut messages = Vec::<serde_json::Value>::new();
@@ -41,7 +43,7 @@ pub(crate) async fn stream_chat_completions(
     let full_instructions = prompt.get_full_instructions(model_family);
     messages.push(json!({"role": "system", "content": full_instructions}));
 
-    let input = prompt.get_formatted_input();
+    let input = &prompt.input;
 
     // Pre-scan: map Reasoning blocks to the adjacent assistant anchor after the last user.
     // - If the last emitted message is a user message, drop all reasoning.
@@ -53,7 +55,7 @@ pub(crate) async fn stream_chat_completions(
 
     // Determine the last role that would be emitted to Chat Completions.
     let mut last_emitted_role: Option<&str> = None;
-    for item in &input {
+    for item in input {
         match item {
             ResponseItem::Message { role, .. } => last_emitted_role = Some(role.as_str()),
             ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. } => {
@@ -207,20 +209,28 @@ pub(crate) async fn stream_chat_completions(
                     "content": output.content,
                 }));
             }
+            ResponseItem::LocalShellCall { call_id, .. } => {
+                let mut msg = json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "local_shell_call"
+                    }]
+                });
+                if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
+                    && let Some(obj) = msg.as_object_mut()
+                {
+                    obj.insert("reasoning".to_string(), json!(reasoning));
+                }
+                messages.push(msg);
+            }
             ResponseItem::Reasoning { .. }
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::Other
-            | ResponseItem::LocalShellCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::CustomToolCallOutput { .. } => {
                 // Omit these items from the conversation history.
-                //
-                // NOTE: Chat Completions only supports "function" tool calls.
-                // Local/Custom tool calls and their outputs are handled via the
-                // Responses API path (response.output_item.done / background
-                // polling) and must not be serialized into the Chat `messages`
-                // array. Keeping them out here ensures strict conformance to the
-                // Chat schema.
                 continue;
             }
         }
@@ -257,11 +267,12 @@ pub(crate) async fn stream_chat_completions(
             Ok(resp) if resp.status().is_success() => {
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
                 let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
-                tokio::spawn(process_chat_sse(
+                let handle = tokio::spawn(process_chat_sse(
                     stream,
                     tx_event,
                     provider.stream_idle_timeout(),
                 ));
+                task_tracker.track(handle);
                 return Ok(ResponseStream { rx_event });
             }
             Ok(res) => {

@@ -407,7 +407,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                         std::env::var("AZURE_OPENAI_API_VERSION")
                             .ok()
                             .filter(|v| !v.trim().is_empty())
-                            .unwrap_or_else(|| "preview".to_string()),
+                            .unwrap_or_else(|| "2025-04-01-preview".to_string()),
                     )]
                     .into_iter()
                     .collect(),

@@ -106,6 +106,7 @@ use crate::safety::SafetyCheck;
 use crate::safety::assess_command_safety;
 use crate::safety::assess_safety_for_untrusted_command;
 use crate::shell;
+use crate::task_tracker::TaskTracker;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::user_instructions::UserInstructions;
 use crate::user_notification::UserNotification;
@@ -208,12 +209,13 @@ impl Codex {
         let session_id = session.session_id;
 
         // This task will run until Op::Shutdown is received.
-        tokio::spawn(submission_loop(
+        let handle = tokio::spawn(submission_loop(
             session.clone(),
             turn_context,
             config,
             rx_sub,
         ));
+        session.task_tracker.track(handle);
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
@@ -287,6 +289,7 @@ pub(crate) struct Session {
     codex_linux_sandbox_exe: Option<PathBuf>,
     user_shell: shell::Shell,
     show_raw_agent_reasoning: bool,
+    task_tracker: TaskTracker,
 }
 
 /// The context needed for a single turn of the conversation.
@@ -476,6 +479,7 @@ impl Session {
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
             user_shell: default_shell,
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+            task_tracker: TaskTracker::default(),
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -948,6 +952,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.interrupt_task();
+        self.task_tracker.abort_all();
     }
 }
 
@@ -1237,7 +1242,7 @@ async fn submission_loop(
                 let tx_event = sess.tx_event.clone();
                 let sub_id = sub.id.clone();
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     // Run lookup in blocking thread because it does file IO + locking.
                     let entry_opt = tokio::task::spawn_blocking(move || {
                         crate::message_history::lookup(log_id, offset, &config)
@@ -1266,6 +1271,7 @@ async fn submission_loop(
                         warn!("failed to send GetHistoryEntryResponse event: {e}");
                     }
                 });
+                sess.task_tracker.track(handle);
             }
             Op::ListMcpTools => {
                 let tx_event = sess.tx_event.clone();

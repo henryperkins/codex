@@ -58,6 +58,7 @@ pub(crate) mod safety;
 pub mod seatbelt;
 pub mod shell;
 pub mod spawn;
+mod task_tracker;
 pub mod terminal;
 mod tool_apply_patch;
 pub mod turn_diff_tracker;

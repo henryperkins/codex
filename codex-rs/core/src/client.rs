@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::AuthManager;
+use crate::task_tracker::TaskTracker;
 use bytes::Bytes;
 use codex_protocol::mcp_protocol::AuthMode;
 use eventsource_stream::Eventsource;
@@ -83,6 +84,9 @@ pub struct ModelClient {
     last_response_was_stored: Arc<tokio::sync::Mutex<bool>>,
     /// Fingerprint of the provider/model context used for the last response id.
     last_provider_fingerprint: Arc<tokio::sync::Mutex<Option<String>>>,
+
+    /// Tracks background tasks spawned by this `ModelClient`.
+    tracker: TaskTracker,
 }
 
 impl ModelClient {
@@ -107,6 +111,8 @@ impl ModelClient {
             last_response_id: Arc::new(tokio::sync::Mutex::new(None)),
             last_response_was_stored: Arc::new(tokio::sync::Mutex::new(false)),
             last_provider_fingerprint: Arc::new(tokio::sync::Mutex::new(None)),
+
+            tracker: TaskTracker::default(),
         }
     }
 
@@ -129,6 +135,7 @@ impl ModelClient {
                     &self.config.model_family,
                     &self.client,
                     &self.provider,
+                    &self.tracker,
                 )
                 .await?;
 
@@ -145,7 +152,7 @@ impl ModelClient {
                 // `ResponseStream` by forwarding events through a channel.
                 let (tx, rx) = mpsc::channel::<Result<ResponseEvent>>(16);
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     use futures::StreamExt;
                     while let Some(ev) = aggregated.next().await {
                         // Exit early if receiver hung up.
@@ -154,11 +161,12 @@ impl ModelClient {
                         }
                     }
                 });
+                self.tracker.track(handle);
 
                 // Intercept Completed events to capture the response id (if any).
                 let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(16);
                 let last_id = self.last_response_id.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let mut rx = rx;
                     while let Some(ev) = rx.recv().await {
                         if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
@@ -172,6 +180,7 @@ impl ModelClient {
                         }
                     }
                 });
+                self.tracker.track(handle);
                 Ok(ResponseStream { rx_event: rx2 })
             }
         }
@@ -197,6 +206,11 @@ impl ModelClient {
         // disabled via auth mode (e.g., ChatGPT), we may need to force it on
         // when background streaming is enabled.
         let mut store = prompt.store && auth_mode != Some(AuthMode::ChatGPT);
+        
+        // OpenAI's Responses API requires store=true when using previous_response_id
+        if !self.provider.is_probably_azure() && prompt.previous_response_id.is_some() {
+            store = true;
+        }
 
         let full_instructions = prompt.get_full_instructions(&self.config.model_family);
         let tools_json = create_tools_json_for_responses_api(&prompt.tools)?;
@@ -269,9 +283,15 @@ impl ModelClient {
             store = true;
         }
 
-        // One-shot fallback toggle for Azure chaining errors.
-        let mut force_no_previous_id = false;
-        let mut tried_chain_fallback = false;
+        // Track the `previous_response_id` we will send on each attempt. If the
+        // initial chained request fails with the Azure-specific
+        // `previous_response_not_found` error we automatically retry **once**
+        // without a `previous_response_id`. This removes the previous
+        // implementation’s interplay between `force_no_previous_id` and
+        // `tried_chain_fallback`, simplifying the control-flow and eliminating
+        // data races on those mutable flags.
+
+        let mut prev_id_for_attempt = candidate_prev_id.clone();
 
         let mut attempt = 0;
         let max_retries = self.provider.request_max_retries();
@@ -283,11 +303,8 @@ impl ModelClient {
             let auth = auth_manager.as_ref().and_then(|m| m.auth());
 
             // Build request payload for this attempt (allows toggling prev id).
-            let effective_prev_id = if force_no_previous_id {
-                None
-            } else {
-                candidate_prev_id.clone()
-            };
+            // Use the (possibly cleared) `prev_id_for_attempt` for this try.
+            let effective_prev_id = prev_id_for_attempt.clone();
             let reasoning = create_reasoning_param_for_request(
                 &self.config.model_family,
                 self.effort,
@@ -386,12 +403,14 @@ impl ModelClient {
                         } else {
                             None
                         };
-                        tokio::spawn(process_sse(
+                        let handle = tokio::spawn(process_sse(
                             Box::pin(stream),
                             tx_event,
                             self.provider.stream_idle_timeout(),
                             resume_ctx,
                         ));
+                        // Track the spawned task so we can abort it on drop.
+                        self.tracker.track(handle);
 
                         // Intercept Completed to track response id for chaining.
                         let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(1600);
@@ -466,7 +485,7 @@ impl ModelClient {
                     let last_fp = self.last_provider_fingerprint.clone();
                     let provider_fp_for_this_turn = current_provider_fingerprint.clone();
                     let stored_flag_for_this_turn = store;
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let mut rx = rx_event;
                         while let Some(ev) = rx.recv().await {
                             if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
@@ -482,9 +501,11 @@ impl ModelClient {
                             }
                         }
                     });
+                    self.tracker.track(handle);
 
                     // Spawn poller asynchronously.
-                    tokio::spawn(manager.poll_until_complete(id, tx_event.clone()));
+                    let handle = tokio::spawn(manager.poll_until_complete(id, tx_event.clone()));
+                    self.tracker.track(handle);
 
                     return Ok(ResponseStream { rx_event: rx2 });
                 }
@@ -519,14 +540,17 @@ impl ModelClient {
                         let body = res.text().await.unwrap_or_default();
                         if self.provider.is_probably_azure() {
                             // If Azure rejected chaining, retry once without previous_response_id.
-                            if candidate_prev_id.is_some()
-                                && !tried_chain_fallback
+                            // Retry once without `previous_response_id` if the
+                            // server says that the referenced response was not
+                            // found. This can happen on Azure when the ID has
+                            // expired or belongs to a different resource.
+                            if prev_id_for_attempt.is_some()
                                 && azure_previous_response_not_found(&body)
                             {
-                                tried_chain_fallback = true;
-                                force_no_previous_id = true;
-                                // small delay to avoid hammering
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                prev_id_for_attempt = None;
+                                // Brief back-off to avoid hammering the
+                                // service in rapid succession.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
                             let msg = parse_azure_error_message(&body).unwrap_or(body);
@@ -653,6 +677,14 @@ impl ModelClient {
             };
             Err(CodexErr::UnexpectedStatus(status, msg))
         }
+    }
+}
+
+impl Drop for ModelClient {
+    fn drop(&mut self) {
+        // Do not eagerly abort here; TaskTracker will abort on the last drop.
+        // This avoids cancelling in-flight streams when short-lived clones drop.
+        // Intentional no-op.
     }
 }
 
