@@ -99,6 +99,7 @@ use crate::protocol::SessionConfiguredEvent;
 use crate::protocol::StreamErrorEvent;
 use crate::protocol::Submission;
 use crate::protocol::TaskCompleteEvent;
+use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WebSearchBeginEvent;
 use crate::rollout::RolloutRecorder;
@@ -264,6 +265,7 @@ struct State {
     pending_input: Vec<ResponseInputItem>,
     history: ConversationHistory,
     last_response_id: Option<String>,
+    token_info: Option<TokenUsageInfo>,
 }
 
 /// Context for an initialized model agent
@@ -1806,21 +1808,28 @@ async fn try_run_turn(
                 response_id,
                 token_usage,
             } => {
-                {
-                    let mut state = sess.state.lock_unchecked();
+                let info = {
+                    let mut st = sess.state.lock_unchecked();
+                    // Store response_id for stream resumption
                     if !response_id.is_empty() {
-                        state.last_response_id = Some(response_id);
+                        st.last_response_id = Some(response_id);
                     }
-                }
-                if let Some(token_usage) = token_usage {
-                    sess.tx_event
-                        .send(Event {
-                            id: sub_id.to_string(),
-                            msg: EventMsg::TokenCount(token_usage),
-                        })
-                        .await
-                        .ok();
-                }
+                    // Update token usage info
+                    let info = TokenUsageInfo::new_or_append(
+                        &st.token_info,
+                        &token_usage,
+                        turn_context.client.get_model_context_window(),
+                    );
+                    st.token_info = info.clone();
+                    info
+                };
+                sess.tx_event
+                    .send(Event {
+                        id: sub_id.to_string(),
+                        msg: EventMsg::TokenCount(crate::protocol::TokenCountEvent { info }),
+                    })
+                    .await
+                    .ok();
 
                 let unified_diff = turn_diff_tracker.get_unified_diff();
                 if let Ok(Some(unified_diff)) = unified_diff {
@@ -2902,13 +2911,21 @@ async fn drain_to_completed(
                 response_id: _,
                 token_usage,
             }) => {
-                // some providers don't return token usage, so we default
-                // TODO: consider approximate token usage
-                let token_usage = token_usage.unwrap_or_default();
+                let info = {
+                    let mut st = sess.state.lock_unchecked();
+                    let info = TokenUsageInfo::new_or_append(
+                        &st.token_info,
+                        &token_usage,
+                        turn_context.client.get_model_context_window(),
+                    );
+                    st.token_info = info.clone();
+                    info
+                };
+
                 sess.tx_event
                     .send(Event {
                         id: sub_id.to_string(),
-                        msg: EventMsg::TokenCount(token_usage),
+                        msg: EventMsg::TokenCount(crate::protocol::TokenCountEvent { info }),
                     })
                     .await
                     .ok();
