@@ -17,6 +17,7 @@ pub mod token_data;
 pub use codex_conversation::CodexConversation;
 pub mod config;
 pub mod advanced_features;
+pub mod stream_resumption;
 pub mod config_profile;
 pub mod config_types;
 mod conversation_history;

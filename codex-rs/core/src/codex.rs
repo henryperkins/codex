@@ -1603,17 +1603,8 @@ async fn run_turn(
 
     let prev_id_for_turn = {
         let state = sess.state.lock_unchecked();
-        if turn_context.disable_response_storage {
-            None
-        } else {
-            state.last_response_id.clone()
-        }
+        state.last_response_id.clone()
     };
-    tracing::trace!(
-        "Building Prompt; previous_response_id={:?}, store={}",
-        prev_id_for_turn,
-        !turn_context.disable_response_storage
-    );
     let prompt = Prompt {
         input,
         tools,
@@ -1875,6 +1866,18 @@ async fn try_run_turn(
                     sess.tx_event.send(event).await.ok();
                 }
             }
+            
+            // Azure-specific events - mostly no-op in this context
+            ResponseEvent::Queued | ResponseEvent::InProgress => {}
+            ResponseEvent::Failed(_) | ResponseEvent::Error(_) => {}
+            ResponseEvent::OutputItemAdded { .. } => {}
+            ResponseEvent::OutputTextDeltaIndexed { .. } => {}
+            ResponseEvent::OutputTextDone { .. } => {}
+            ResponseEvent::RefusalDelta { .. } => {}
+            ResponseEvent::RefusalDone { .. } => {}
+            ResponseEvent::ReasoningDelta { .. } => {}
+            ResponseEvent::ReasoningDone { .. } => {}
+            ResponseEvent::Unknown { .. } => {}
         }
     }
 }
@@ -1907,11 +1910,7 @@ async fn run_compact_task(
         base_instructions_override: Some(compact_instructions.clone()),
         previous_response_id: {
             let state = sess.state.lock_unchecked();
-            if turn_context.disable_response_storage {
-                None
-            } else {
-                state.last_response_id.clone()
-            }
+            state.last_response_id.clone()
         },
     };
 

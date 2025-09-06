@@ -34,6 +34,9 @@ pub struct AdvancedFeatures {
 
     /// Configuration for background processing when enabled.
     pub background_config: BackgroundProcessingConfig,
+    
+    /// Configuration for stream resumption behavior.
+    pub stream_resumption_config: StreamResumptionConfig,
 }
 
 impl Default for AdvancedFeatures {
@@ -45,6 +48,7 @@ impl Default for AdvancedFeatures {
             enable_response_storage: false,
             enable_stream_resumption: true, // Network resilience is generally desired
             background_config: BackgroundProcessingConfig::default(),
+            stream_resumption_config: StreamResumptionConfig::default(),
         }
     }
 }
@@ -65,22 +69,22 @@ impl AdvancedFeatures {
             enable_response_chaining: true,
             enable_background_processing: true,
             enable_stream_resumption: true,
-            // Azure doesn't require storage for chaining
+            enable_response_storage: true, // Required for background processing (store=true)
             ..Default::default()
         }
     }
 
     /// Validate feature compatibility and auto-enable dependencies.
     pub fn validate_and_fix(&mut self) {
-        // Response chaining on OpenAI requires storage
+        // Response chaining on OpenAI requires storage, but Azure supports it without storage
         if self.enable_response_chaining && !self.enable_response_storage {
-            // Note: This would need provider detection in real implementation
-            tracing::warn!("Response chaining may require storage for some providers");
+            tracing::warn!("Response chaining may require storage for OpenAI providers");
         }
 
-        // Background processing requires some form of response tracking
+        // Background processing REQUIRES storage on Azure (store=true)
         if self.enable_background_processing && !self.enable_response_storage {
-            tracing::warn!("Background processing works best with response storage enabled");
+            tracing::warn!("Background processing requires storage (store=true) - auto-enabling");
+            self.enable_response_storage = true;
         }
     }
 }
@@ -249,7 +253,7 @@ impl ResponseStorage for NoStorage {
     }
     
     async fn store_response(&self, _response: &ResponseData) -> Result<String> {
-        Err(crate::error::CodexErr::StorageDisabled)
+        Err(crate::error::CodexErr::InternalServerError)
     }
     
     async fn get_previous_response(&self, _id: &str) -> Result<Option<ResponseData>> {
@@ -258,6 +262,55 @@ impl ResponseStorage for NoStorage {
     
     async fn cleanup_expired_responses(&self) -> Result<u64> {
         Ok(0)
+    }
+}
+
+/// Configuration for stream resumption behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamResumptionConfig {
+    /// Maximum number of resume attempts before giving up.
+    pub max_attempts: u32,
+    
+    /// Base delay for exponential backoff between attempts (milliseconds).
+    pub base_delay_ms: u64,
+    
+    /// Maximum delay cap for exponential backoff (milliseconds).
+    pub max_delay_ms: u64,
+    
+    /// Whether to enable detailed logging of resumption attempts.
+    pub debug_logging: bool,
+}
+
+impl Default for StreamResumptionConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 500,
+            max_delay_ms: 30_000, // 30 seconds max
+            debug_logging: false,
+        }
+    }
+}
+
+impl StreamResumptionConfig {
+    /// Create a configuration optimized for reliable networks.
+    pub fn reliable_network() -> Self {
+        Self {
+            max_attempts: 2,
+            base_delay_ms: 250,
+            max_delay_ms: 5_000, // 5 seconds max
+            debug_logging: false,
+        }
+    }
+    
+    /// Create a configuration optimized for unreliable networks.
+    pub fn unreliable_network() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay_ms: 1_000,
+            max_delay_ms: 60_000, // 1 minute max
+            debug_logging: true,
+        }
     }
 }
 

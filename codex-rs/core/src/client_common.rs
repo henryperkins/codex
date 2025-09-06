@@ -144,6 +144,56 @@ pub enum ResponseEvent {
     WebSearchCallBegin {
         call_id: String,
     },
+    
+    // Azure Responses API specific events
+    Queued,
+    InProgress,
+    Failed(serde_json::Value),
+    Error(serde_json::Value),
+    
+    // Output events with indices and IDs for Azure
+    OutputItemAdded {
+        output_index: u32,
+        item: serde_json::Value,
+    },
+    OutputTextDeltaIndexed {
+        output_index: u32,
+        content_index: u32,
+        item_id: String,
+        delta: String,
+    },
+    OutputTextDone {
+        output_index: u32,
+        content_index: u32,
+        item_id: String,
+        text: String,
+    },
+    RefusalDelta {
+        output_index: u32,
+        content_index: u32,
+        item_id: String,
+        delta: String,
+    },
+    RefusalDone {
+        output_index: u32,
+        content_index: u32,
+        item_id: String,
+        refusal: String,
+    },
+    
+    // Reasoning events
+    ReasoningDelta {
+        delta: String,
+    },
+    ReasoningDone {
+        reasoning: String,
+    },
+    
+    // Generic event for unknown/future events
+    Unknown {
+        event_type: String,
+        payload: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -199,16 +249,6 @@ pub(crate) struct ResponsesApiRequest<'a> {
     pub(crate) store: bool,
     pub(crate) stream: bool,
     pub(crate) include: Vec<String>,
-    /// Link this request to the previous streamed response when server‑side
-    /// storage is enabled. This enables response chaining on providers that
-    /// support it (e.g., Azure OpenAI Responses API).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) previous_response_id: Option<String>,
-    /// When true, the server may process the request asynchronously. In this
-    /// mode the initial POST usually returns a minimal envelope and callers
-    /// must poll `GET /v1/responses/{id}` until `status == "completed"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) background: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,8 +319,6 @@ mod tests {
             store: false,
             stream: true,
             include: vec![],
-            previous_response_id: None,
-            background: None,
             prompt_cache_key: None,
             text: Some(TextControls {
                 verbosity: Some(OpenAiVerbosity::Low),
@@ -311,8 +349,6 @@ mod tests {
             store: false,
             stream: true,
             include: vec![],
-            previous_response_id: None,
-            background: None,
             prompt_cache_key: None,
             text: None,
         };

@@ -792,6 +792,22 @@ where
                 Poll::Ready(Some(Ok(ResponseEvent::WebSearchCallBegin { call_id }))) => {
                     return Poll::Ready(Some(Ok(ResponseEvent::WebSearchCallBegin { call_id })));
                 }
+                
+                // Azure-specific events - mostly continue processing
+                Poll::Ready(Some(Ok(ResponseEvent::Queued))) |
+                Poll::Ready(Some(Ok(ResponseEvent::InProgress))) |
+                Poll::Ready(Some(Ok(ResponseEvent::Failed(_)))) |
+                Poll::Ready(Some(Ok(ResponseEvent::Error(_)))) |
+                Poll::Ready(Some(Ok(ResponseEvent::OutputItemAdded { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::OutputTextDeltaIndexed { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::OutputTextDone { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::RefusalDelta { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::RefusalDone { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::ReasoningDelta { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::ReasoningDone { .. }))) |
+                Poll::Ready(Some(Ok(ResponseEvent::Unknown { .. }))) => {
+                    continue;
+                }
             }
         }
     }

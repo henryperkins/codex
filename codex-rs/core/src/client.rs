@@ -2,10 +2,8 @@ use std::io::BufRead;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
-use std::time::Instant;
 
 use crate::AuthManager;
-use crate::task_tracker::TaskTracker;
 use bytes::Bytes;
 use codex_protocol::mcp_protocol::AuthMode;
 use eventsource_stream::Eventsource;
@@ -33,7 +31,6 @@ use crate::client_common::create_reasoning_param_for_request;
 use crate::client_common::create_text_param_for_request;
 use crate::config::Config;
 use crate::default_client::create_client;
-use crate::default_client::get_codex_user_agent;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::error::UsageLimitReachedError;
@@ -44,11 +41,12 @@ use crate::model_provider_info::WireApi;
 use crate::openai_model_info::get_model_info;
 use crate::openai_tools::create_tools_json_for_responses_api;
 use crate::protocol::TokenUsage;
+use crate::task_tracker::TaskTracker;
 use crate::util::backoff;
+use crate::advanced_features::AdvancedFeatures;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ResponseItem;
-use std::pin::Pin;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
@@ -77,16 +75,8 @@ pub struct ModelClient {
     session_id: Uuid,
     effort: ReasoningEffortConfig,
     summary: ReasoningSummaryConfig,
-    /// Tracks the last completed `response_id` for chaining when server-side
-    /// storage is enabled (e.g., Azure Responses API).
-    last_response_id: Arc<tokio::sync::Mutex<Option<String>>>,
-    /// Whether the last completed response was stored server-side.
-    last_response_was_stored: Arc<tokio::sync::Mutex<bool>>,
-    /// Fingerprint of the provider/model context used for the last response id.
-    last_provider_fingerprint: Arc<tokio::sync::Mutex<Option<String>>>,
-
-    /// Tracks background tasks spawned by this `ModelClient`.
     tracker: TaskTracker,
+    advanced_features: AdvancedFeatures,
 }
 
 impl ModelClient {
@@ -108,12 +98,18 @@ impl ModelClient {
             session_id,
             effort,
             summary,
-            last_response_id: Arc::new(tokio::sync::Mutex::new(None)),
-            last_response_was_stored: Arc::new(tokio::sync::Mutex::new(false)),
-            last_provider_fingerprint: Arc::new(tokio::sync::Mutex::new(None)),
-
             tracker: TaskTracker::default(),
+            advanced_features: AdvancedFeatures::default(),
         }
+    }
+
+    pub fn with_advanced_features(mut self, features: AdvancedFeatures) -> Self {
+        self.advanced_features = features;
+        self
+    }
+
+    pub fn get_advanced_features(&self) -> &AdvancedFeatures {
+        &self.advanced_features
     }
 
     pub fn get_model_context_window(&self) -> Option<u64> {
@@ -152,7 +148,7 @@ impl ModelClient {
                 // `ResponseStream` by forwarding events through a channel.
                 let (tx, rx) = mpsc::channel::<Result<ResponseEvent>>(16);
 
-                let handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     use futures::StreamExt;
                     while let Some(ev) = aggregated.next().await {
                         // Exit early if receiver hung up.
@@ -161,27 +157,8 @@ impl ModelClient {
                         }
                     }
                 });
-                self.tracker.track(handle);
 
-                // Intercept Completed events to capture the response id (if any).
-                let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(16);
-                let last_id = self.last_response_id.clone();
-                let handle = tokio::spawn(async move {
-                    let mut rx = rx;
-                    while let Some(ev) = rx.recv().await {
-                        if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
-                            let mut guard = last_id.lock().await;
-                            if !response_id.is_empty() {
-                                *guard = Some(response_id.clone());
-                            }
-                        }
-                        if tx2.send(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-                self.tracker.track(handle);
-                Ok(ResponseStream { rx_event: rx2 })
+                Ok(ResponseStream { rx_event: rx })
             }
         }
     }
@@ -211,50 +188,6 @@ impl ModelClient {
         };
 
         let input_with_instructions = prompt.get_formatted_input();
-        // compute static inputs for payload construction outside the retry loop
-        let base_instructions_ref = full_instructions.clone();
-        let input_ref = input_with_instructions.clone();
-        let tools_ref = tools_json.clone();
-
-        // Only include `text.verbosity` for GPT-5 family models
-        // verbosity/text control computed per attempt (cheap) based on family
-        // and config; reasoning is also recomputed each attempt.
-
-        // Compute a provider fingerprint (base_url + query params + model) so
-        // we only chain across consistent contexts.
-        let current_provider_fingerprint = {
-            let mut s = String::new();
-            if let Some(b) = &self.provider.base_url {
-                s.push_str(b);
-            }
-            if let Some(q) = &self.provider.query_params {
-                let mut kv: Vec<_> = q.iter().collect();
-                kv.sort_by(|a, b| a.0.cmp(b.0));
-                for (k, v) in kv {
-                    s.push('|');
-                    s.push_str(k);
-                    s.push('=');
-                    s.push_str(v);
-                }
-            }
-            s.push('|');
-            s.push_str(&self.config.model);
-            s
-        };
-
-        // Decide whether chaining is allowed for this request.
-        // Per spec, rely on previous_response_id only when responses are stored.
-        let allow_chain = store;
-
-        // Candidate previous id (from prompt override or last tracked id).
-        let candidate_prev_id = if allow_chain {
-            prompt
-                .previous_response_id
-                .clone()
-                .or(self.last_response_id.lock().await.clone())
-        } else {
-            None
-        };
 
         // Only include `text.verbosity` for GPT-5 family models
         let text = if self.config.model_family.family == "gpt-5" {
@@ -284,16 +217,6 @@ impl ModelClient {
             text,
         };
 
-        // Track the `previous_response_id` we will send on each attempt. If the
-        // initial chained request fails with the Azure-specific
-        // `previous_response_not_found` error we automatically retry **once**
-        // without a `previous_response_id`. This removes the previous
-        // implementation’s interplay between `force_no_previous_id` and
-        // `tried_chain_fallback`, simplifying the control-flow and eliminating
-        // data races on those mutable flags.
-
-        let mut prev_id_for_attempt = candidate_prev_id.clone();
-
         let mut attempt = 0;
         let max_retries = self.provider.request_max_retries();
 
@@ -302,44 +225,6 @@ impl ModelClient {
 
             // Always fetch the latest auth in case a prior attempt refreshed the token.
             let auth = auth_manager.as_ref().and_then(|m| m.auth());
-
-            // Build request payload for this attempt (allows toggling prev id).
-            // Use the (possibly cleared) `prev_id_for_attempt` for this try.
-            let effective_prev_id = prev_id_for_attempt.clone();
-            let reasoning = create_reasoning_param_for_request(
-                &self.config.model_family,
-                self.effort,
-                self.summary,
-            );
-            let text = if self.config.model_family.family == "gpt-5" {
-                create_text_param_for_request(self.config.model_verbosity)
-            } else {
-                if self.config.model_verbosity.is_some() {
-                    warn!(
-                        "model_verbosity is set but ignored for non-gpt-5 model family: {}",
-                        self.config.model_family.family
-                    );
-                }
-                None
-            };
-            let payload = ResponsesApiRequest {
-                model: &self.config.model,
-                instructions: &base_instructions_ref,
-                input: &input_ref,
-                tools: &tools_ref,
-                tool_choice: "auto",
-                parallel_tool_calls: false,
-                reasoning,
-                store,
-                stream: true,
-                include: include.clone(),
-                previous_response_id: effective_prev_id,
-                background,
-                prompt_cache_key: Some(self.session_id.to_string()),
-                text,
-            };
-
-            // payload dump removed
 
             trace!(
                 "POST to {}: {}",
@@ -352,10 +237,8 @@ impl ModelClient {
                 .create_request_builder(&self.client, &auth)
                 .await?;
 
-            if !self.provider.is_probably_azure() {
-                req_builder = req_builder.header("OpenAI-Beta", "responses=experimental");
-            }
             req_builder = req_builder
+                .header("OpenAI-Beta", "responses=experimental")
                 .header("session_id", self.session_id.to_string())
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .json(&payload);
@@ -383,132 +266,15 @@ impl ModelClient {
                 Ok(resp) if resp.status().is_success() => {
                     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
 
-                    let is_sse = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|ct| ct.starts_with("text/event-stream"))
-                        .unwrap_or(false);
+                    // spawn task to process SSE
+                    let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
+                    tokio::spawn(process_sse(
+                        stream,
+                        tx_event,
+                        self.provider.stream_idle_timeout(),
+                    ));
 
-                    if is_sse {
-                        // spawn task to process SSE (with optional Azure resume context)
-                        let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
-                        // For Azure, enable resume for all streaming responses.
-                        let resume_ctx = if self.provider.is_probably_azure() {
-                            Some(ResumeCtx {
-                                client: self.client.clone(),
-                                provider: self.provider.clone(),
-                                auth_manager: self.auth_manager.clone(),
-                                background: background.unwrap_or(false),
-                            })
-                        } else {
-                            None
-                        };
-                        let handle = tokio::spawn(process_sse(
-                            Box::pin(stream),
-                            tx_event,
-                            self.provider.stream_idle_timeout(),
-                            resume_ctx,
-                        ));
-                        // Track the spawned task so we can abort it on drop.
-                        self.tracker.track(handle);
-
-                        // Intercept Completed to track response id for chaining.
-                        let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(1600);
-                        let last_id = self.last_response_id.clone();
-                        let last_was_stored = self.last_response_was_stored.clone();
-                        let last_fp = self.last_provider_fingerprint.clone();
-                        let provider_fp_for_this_turn = current_provider_fingerprint.clone();
-                        let stored_flag_for_this_turn = store;
-                        tokio::spawn(async move {
-                            let mut rx = rx_event;
-                            while let Some(ev) = rx.recv().await {
-                                if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
-                                    let mut guard = last_id.lock().await;
-                                    if !response_id.is_empty() {
-                                        *guard = Some(response_id.clone());
-                                    }
-                                    // Record chain safety info for next turn.
-                                    *last_was_stored.lock().await = stored_flag_for_this_turn;
-                                    *last_fp.lock().await = Some(provider_fp_for_this_turn.clone());
-                                }
-                                if tx2.send(ev).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-
-                        return Ok(ResponseStream { rx_event: rx2 });
-                    }
-
-                    // Not SSE: background envelope -> poll GET /responses/{id}
-                    let v: serde_json::Value = match resp.json().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx_event
-                                .send(Err(CodexErr::Stream(
-                                    format!("invalid JSON response: {e}"),
-                                    None,
-                                )))
-                                .await;
-                            return Ok(ResponseStream { rx_event });
-                        }
-                    };
-                    let id = v
-                        .get("response")
-                        .and_then(|r| r.get("id"))
-                        .or_else(|| v.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if id.is_empty() {
-                        let _ = tx_event
-                            .send(Err(CodexErr::Stream(
-                                "missing id in background response".to_string(),
-                                None,
-                            )))
-                            .await;
-                        return Ok(ResponseStream { rx_event });
-                    }
-                    let manager = BackgroundTaskManager::new(
-                        self.client.clone(),
-                        self.provider.clone(),
-                        self.auth_manager.clone(),
-                    );
-
-                    // Emit Created before polling begins to mirror SSE behavior.
-                    let _ = tx_event.send(Ok(ResponseEvent::Created)).await;
-
-                    // Start forwarder BEFORE starting the poller, so events get relayed immediately.
-                    let (tx2, rx2) = mpsc::channel::<Result<ResponseEvent>>(1600);
-                    let last_id = self.last_response_id.clone();
-                    let last_was_stored = self.last_response_was_stored.clone();
-                    let last_fp = self.last_provider_fingerprint.clone();
-                    let provider_fp_for_this_turn = current_provider_fingerprint.clone();
-                    let stored_flag_for_this_turn = store;
-                    let handle = tokio::spawn(async move {
-                        let mut rx = rx_event;
-                        while let Some(ev) = rx.recv().await {
-                            if let Ok(ResponseEvent::Completed { response_id, .. }) = &ev {
-                                let mut guard = last_id.lock().await;
-                                if !response_id.is_empty() {
-                                    *guard = Some(response_id.clone());
-                                }
-                                *last_was_stored.lock().await = stored_flag_for_this_turn;
-                                *last_fp.lock().await = Some(provider_fp_for_this_turn.clone());
-                            }
-                            if tx2.send(ev).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    self.tracker.track(handle);
-
-                    // Spawn poller asynchronously.
-                    let handle = tokio::spawn(manager.poll_until_complete(id, tx_event.clone()));
-                    self.tracker.track(handle);
-
-                    return Ok(ResponseStream { rx_event: rx2 });
+                    return Ok(ResponseStream { rx_event });
                 }
                 Ok(res) => {
                     let status = res.status();
@@ -538,25 +304,8 @@ impl ModelClient {
                         || status == StatusCode::UNAUTHORIZED
                         || status.is_server_error())
                     {
+                        // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
                         let body = res.text().await.unwrap_or_default();
-                        if self.provider.is_probably_azure() {
-                            // If Azure rejected chaining, retry once without previous_response_id.
-                            // Retry once without `previous_response_id` if the
-                            // server says that the referenced response was not
-                            // found. This can happen on Azure when the ID has
-                            // expired or belongs to a different resource.
-                            if prev_id_for_attempt.is_some()
-                                && azure_previous_response_not_found(&body)
-                            {
-                                prev_id_for_attempt = None;
-                                // Brief back-off to avoid hammering the
-                                // service in rapid succession.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
-                            }
-                            let msg = parse_azure_error_message(&body).unwrap_or(body);
-                            return Err(CodexErr::UnexpectedStatus(status, msg));
-                        }
                         return Err(CodexErr::UnexpectedStatus(status, body));
                     }
 
@@ -632,61 +381,6 @@ impl ModelClient {
     pub fn get_auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
     }
-
-    /// Attempts to cancel a background response.
-    /// - Azure: `POST /v1/responses/{id}/cancel`
-    /// - Others: `DELETE /v1/responses/{id}`
-    pub async fn cancel_background(&self, response_id: &str) -> Result<()> {
-        let auth = self.auth_manager.as_ref().and_then(|m| m.auth());
-        let base_url = self.provider.get_response_url(&auth, response_id);
-        let (use_post, url) = if self.provider.is_probably_azure() {
-            if let Some((path, qs)) = base_url.split_once('?') {
-                (true, format!("{path}/cancel?{qs}"))
-            } else {
-                (true, format!("{base_url}/cancel"))
-            }
-        } else {
-            (false, base_url)
-        };
-
-        let mut req = if use_post {
-            self.client.post(url)
-        } else {
-            self.client.delete(url)
-        };
-        if let Some(auth) = auth.as_ref() {
-            match self.provider.auth_type {
-                crate::model_provider_info::AuthType::ApiKey => {
-                    req = req.header("api-key", auth.get_token().await?);
-                }
-                _ => {
-                    req = req.bearer_auth(auth.get_token().await?);
-                }
-            }
-        }
-        req = self.provider.apply_http_headers(req);
-        let resp = req.send().await.map_err(CodexErr::Reqwest)?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let msg = if self.provider.is_probably_azure() {
-                parse_azure_error_message(&body).unwrap_or(body)
-            } else {
-                body
-            };
-            Err(CodexErr::UnexpectedStatus(status, msg))
-        }
-    }
-}
-
-impl Drop for ModelClient {
-    fn drop(&mut self) {
-        // Do not eagerly abort here; TaskTracker will abort on the last drop.
-        // This avoids cancelling in-flight streams when short-lived clones drop.
-        // Intentional no-op.
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -710,7 +404,7 @@ struct ResponseCompleted {
     usage: Option<ResponseCompletedUsage>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ResponseCompletedUsage {
     input_tokens: u64,
     input_tokens_details: Option<ResponseCompletedInputTokensDetails>,
@@ -731,375 +425,63 @@ impl From<ResponseCompletedUsage> for TokenUsage {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ResponseCompletedInputTokensDetails {
     cached_tokens: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ResponseCompletedOutputTokensDetails {
     reasoning_tokens: u64,
 }
 
-/// Minimal background task poller for providers (e.g., Azure) that process
-/// Responses asynchronously when `background: true` is requested.
-struct BackgroundTaskManager {
-    client: reqwest::Client,
-    provider: ModelProviderInfo,
-    auth_manager: Option<Arc<AuthManager>>,
-}
-
-impl BackgroundTaskManager {
-    fn new(
-        client: reqwest::Client,
-        provider: ModelProviderInfo,
-        auth_manager: Option<Arc<AuthManager>>,
-    ) -> Self {
-        Self {
-            client,
-            provider,
-            auth_manager,
-        }
-    }
-
-    async fn poll_until_complete(
-        self,
-        response_id: String,
-        tx_event: mpsc::Sender<Result<ResponseEvent>>,
-    ) {
-        let mut attempt = 0u64;
-        let start = Instant::now();
-
-        loop {
-            attempt += 1;
-            let auth = self.auth_manager.as_ref().and_then(|m| m.auth());
-            let url = self.provider.get_response_url(&auth, &response_id);
-
-            let mut req = self.client.get(&url);
-            if let Some(auth) = auth.as_ref() {
-                // Use the same header semantics as POST.
-                match self.provider.auth_type {
-                    crate::model_provider_info::AuthType::ApiKey => match auth.get_token().await {
-                        Ok(t) => {
-                            req = req.header("api-key", t);
-                        }
-                        Err(e) => {
-                            let _ = tx_event.send(Err(e.into())).await;
-                            return;
-                        }
-                    },
-                    _ => match auth.get_token().await {
-                        Ok(t) => {
-                            req = req.bearer_auth(t);
-                        }
-                        Err(e) => {
-                            let _ = tx_event.send(Err(e.into())).await;
-                            return;
-                        }
-                    },
-                }
-            }
-            req = self.provider.apply_http_headers(req);
-            // Mirror important POST headers for consistency.
-            req = req
-                .header("originator", get_codex_user_agent(None))
-                .header("User-Agent", get_codex_user_agent(None));
-
-            let res = req.send().await;
-            match res {
-                Ok(resp) if resp.status().is_success() => {
-                    let v: serde_json::Value = match resp.json().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx_event
-                                .send(Err(CodexErr::Stream(
-                                    format!("invalid JSON from poll: {e}"),
-                                    None,
-                                )))
-                                .await;
-                            return;
-                        }
-                    };
-                    let r = v.get("response").cloned().unwrap_or(v);
-                    let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                    match status {
-                        "queued" | "in_progress" => {}
-                        "completed" => {
-                            // Emit output items, then Completed
-                            if let Some(items) = r.get("output").and_then(|o| o.as_array()) {
-                                for it in items {
-                                    if let Ok(item) =
-                                        serde_json::from_value::<ResponseItem>(it.clone())
-                                        && tx_event
-                                            .send(Ok(ResponseEvent::OutputItemDone(item)))
-                                            .await
-                                            .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            let usage = r
-                                .get("usage")
-                                .cloned()
-                                .and_then(|u| {
-                                    serde_json::from_value::<ResponseCompletedUsage>(u).ok()
-                                })
-                                .map(TokenUsage::from);
-                            let _ = tx_event
-                                .send(Ok(ResponseEvent::Completed {
-                                    response_id: response_id.clone(),
-                                    token_usage: usage,
-                                }))
-                                .await;
-                            return;
-                        }
-                        "failed" | "canceled" | "cancelled" => {
-                            // Surface the error message when available.
-                            let msg = r
-                                .get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("background task failed");
-                            let _ = tx_event
-                                .send(Err(CodexErr::Stream(msg.to_string(), None)))
-                                .await;
-                            return;
-                        }
-                        other => {
-                            let _ = tx_event
-                                .send(Err(CodexErr::Stream(
-                                    format!("unknown background status: {other}"),
-                                    None,
-                                )))
-                                .await;
-                            return;
-                        }
-                    }
-
-                    // Backoff between polls with a small cap to keep tests snappy.
-                    let delay = backoff(attempt).min(Duration::from_millis(300));
-                    tokio::time::sleep(delay).await;
-                }
-                Ok(resp) => {
-                    // Non-success – attempt to extract a friendly message.
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    let msg = if self.provider.is_probably_azure() {
-                        parse_azure_error_message(&body).unwrap_or(body)
-                    } else {
-                        body
-                    };
-                    let _ = tx_event
-                        .send(Err(CodexErr::UnexpectedStatus(status, msg)))
-                        .await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx_event.send(Err(CodexErr::Reqwest(e))).await;
-                    return;
-                }
-            }
-
-            if start.elapsed() > Duration::from_secs(300) {
-                let _ = tx_event
-                    .send(Err(CodexErr::Stream(
-                        "background task timed out (5m)".into(),
-                        None,
-                    )))
-                    .await;
-                return;
-            }
-        }
-    }
-}
-
-fn parse_azure_error_message(body: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let err = v.get("error")?;
-    let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    let msg = err
-        .get("message")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            err.get("innererror")
-                .and_then(|ie| ie.get("message").and_then(|m| m.as_str()))
-        })
-        .unwrap_or("");
-    if code.is_empty() && msg.is_empty() {
-        None
-    } else if code.is_empty() {
-        Some(msg.to_string())
-    } else if msg.is_empty() {
-        Some(code.to_string())
-    } else {
-        Some(format!("{code}: {msg}"))
-    }
-}
-
-fn azure_previous_response_not_found(body: &str) -> bool {
-    let v: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let err = match v.get("error") {
-        Some(e) => e,
-        None => return false,
-    };
-    // Check common locations for a code signal.
-    let code = err.get("code").and_then(|v| v.as_str());
-    let inner_code = err
-        .get("innererror")
-        .and_then(|ie| ie.get("code"))
-        .and_then(|v| v.as_str());
-    let msg = err
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    matches!(code, Some(c) if c.eq_ignore_ascii_case("previous_response_not_found"))
-        || matches!(inner_code, Some(c) if c.eq_ignore_ascii_case("previous_response_not_found"))
-        || msg.contains("previous_response_not_found")
-        || (msg.contains("previous") && msg.contains("response") && msg.contains("not found"))
-}
-#[derive(Clone)]
-struct ResumeCtx {
-    client: reqwest::Client,
-    provider: ModelProviderInfo,
-    auth_manager: Option<Arc<AuthManager>>,
-    background: bool,
-}
-
-type BytesResultStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
-
-async fn process_sse(
-    stream: BytesResultStream,
+async fn process_sse<S>(
+    stream: S,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
-    resume_ctx: Option<ResumeCtx>,
-) {
+) where
+    S: Stream<Item = Result<Bytes>> + Unpin,
+{
     let mut stream = stream.eventsource();
 
     // If the stream stays completely silent for an extended period treat it as disconnected.
-    // Track the final `response.completed` envelope. Emit `Completed` as soon
-    // as we see it to avoid hanging when servers keep connections open after
-    // the terminal event (which some mock servers do).
+    // The response id returned from the "complete" message.
     let mut response_completed: Option<ResponseCompleted> = None;
-    let mut completed_emitted = false;
     let mut response_error: Option<CodexErr> = None;
-    let mut last_sequence_number: Option<u64> = None;
-    let mut response_id_for_resume: Option<String> = None;
-
-    // Resume config for Azure background streaming.
-    let mut resume_attempts: u64 = 0;
-    let max_resume_retries = resume_ctx
-        .as_ref()
-        .map(|c| c.provider.stream_max_retries())
-        .unwrap_or(0);
 
     loop {
         let sse = match timeout(idle_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
-                // Attempt resume on parser/network error if eligible.
-                if resume_ctx.is_some()
-                    && !completed_emitted
-                    && response_completed.is_none()
-                    && response_id_for_resume.is_some()
-                    && last_sequence_number.is_some()
-                    && resume_attempts < max_resume_retries
-                    && let Some(ctx) = resume_ctx.as_ref()
-                    && let Some(new_stream) = attempt_resume(
-                        &ctx.client,
-                        &ctx.provider,
-                        &ctx.auth_manager,
-                        response_id_for_resume.as_ref().unwrap(),
-                        last_sequence_number.unwrap(),
-                    )
-                    .await
-                {
-                    resume_attempts += 1;
-                    stream = new_stream.eventsource();
-                    continue;
-                }
                 let event = CodexErr::Stream(e.to_string(), None);
                 let _ = tx_event.send(Err(event)).await;
                 return;
             }
             Ok(None) => {
-                // If the server closed the connection after the terminal event
-                // we may have already emitted Completed. Avoid duplicating it.
-                if !completed_emitted && response_completed.is_none() {
-                    // Try to resume first if eligible; otherwise fall through to emit error or
-                    // final Completed.
-                    if resume_ctx.is_some()
-                        && response_id_for_resume.is_some()
-                        && last_sequence_number.is_some()
-                        && resume_attempts < max_resume_retries
-                        && let Some(ctx) = resume_ctx.as_ref()
-                        && let Some(new_stream) = attempt_resume(
-                            &ctx.client,
-                            &ctx.provider,
-                            &ctx.auth_manager,
-                            response_id_for_resume.as_ref().unwrap(),
-                            last_sequence_number.unwrap(),
-                        )
-                        .await
-                    {
-                        resume_attempts += 1;
-                        stream = new_stream.eventsource();
-                        continue;
+                match response_completed {
+                    Some(ResponseCompleted {
+                        id: response_id,
+                        usage,
+                    }) => {
+                        let event = ResponseEvent::Completed {
+                            response_id,
+                            token_usage: usage.map(Into::into),
+                        };
+                        let _ = tx_event.send(Ok(event)).await;
                     }
-                }
-
-                if !completed_emitted {
-                    match response_completed {
-                        Some(ResponseCompleted {
-                            id: response_id,
-                            usage,
-                        }) => {
-                            let event = ResponseEvent::Completed {
-                                response_id,
-                                token_usage: usage.map(Into::into),
-                            };
-                            let _ = tx_event.send(Ok(event)).await;
-                        }
-                        None => {
-                            let _ = tx_event
-                                .send(Err(response_error.unwrap_or(CodexErr::Stream(
-                                    "stream closed before response.completed".into(),
-                                    None,
-                                ))))
-                                .await;
-                        }
+                    None => {
+                        let _ = tx_event
+                            .send(Err(response_error.unwrap_or(CodexErr::Stream(
+                                "stream closed before response.completed".into(),
+                                None,
+                            ))))
+                            .await;
                     }
                 }
                 return;
             }
             Err(_) => {
-                // Idle timeout – attempt resume if eligible before failing.
-                if resume_ctx.is_some()
-                    && !completed_emitted
-                    && response_completed.is_none()
-                    && response_id_for_resume.is_some()
-                    && last_sequence_number.is_some()
-                    && resume_attempts < max_resume_retries
-                    && let Some(ctx) = resume_ctx.as_ref()
-                    && let Some(new_stream) = attempt_resume(
-                        &ctx.client,
-                        &ctx.provider,
-                        &ctx.auth_manager,
-                        response_id_for_resume.as_ref().unwrap(),
-                        last_sequence_number.unwrap(),
-                    )
-                    .await
-                {
-                    resume_attempts += 1;
-                    stream = new_stream.eventsource();
-                    continue;
-                }
                 let _ = tx_event
                     .send(Err(CodexErr::Stream(
                         "idle timeout waiting for SSE".into(),
@@ -1121,30 +503,7 @@ async fn process_sse(
             }
         };
 
-        // Track sequence number and response id for potential resume.
-        if let Some(seq) = event.sequence_number {
-            last_sequence_number = Some(seq);
-        }
-
         match event.kind.as_str() {
-                // Azure: reasoning content delta (alias of response.reasoning_text.delta)
-                "response.reasoning.delta" => {
-                    if let Some(delta) = event.delta {
-                        let event = ResponseEvent::ReasoningContentDelta(delta);
-                        if tx_event.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                // Azure: preamble (treat as a reasoning summary style area)
-                "response.preamble.delta" => {
-                    if let Some(delta) = event.delta {
-                        let event = ResponseEvent::ReasoningSummaryDelta(delta);
-                        if tx_event.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
             // Individual output item finalised. Forward immediately so the
             // rest of the agent can stream assistant text/functions *live*
             // instead of waiting for the final `response.completed` envelope.
@@ -1200,23 +559,21 @@ async fn process_sse(
                 }
             }
             "response.created" => {
-                if let Some(resp) = event.response.as_ref() {
-                    if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
-                        response_id_for_resume = Some(id.to_string());
-                    }
-                    let _ = tx_event.send(Ok(ResponseEvent::Created)).await;
+                if event.response.is_some() {
+                    let _ = tx_event.send(Ok(ResponseEvent::Created {})).await;
                 }
             }
             "response.failed" => {
                 if let Some(resp_val) = event.response {
-                    // Default if no error object present.
                     response_error = Some(CodexErr::Stream(
                         "response.failed event received".to_string(),
                         None,
                     ));
 
-                    if let Some(error_val) = resp_val.get("error") {
-                        match serde_json::from_value::<Error>(error_val.clone()) {
+                    let error = resp_val.get("error");
+
+                    if let Some(error) = error {
+                        match serde_json::from_value::<Error>(error.clone()) {
                             Ok(error) => {
                                 let delay = try_parse_retry_after(&error);
                                 let message = error.message.unwrap_or_default();
@@ -1229,47 +586,11 @@ async fn process_sse(
                     }
                 }
             }
-            // Graceful terminal outcome with reason (no subsequent completed)
-            "response.incomplete" => {
-                if let Some(resp_val) = event.response.as_ref() {
-                    let id = resp_val
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let reason = resp_val
-                        .get("incomplete_details")
-                        .and_then(|d| d.get("reason"))
-                        .and_then(|r| r.as_str())
-                        .map(|s| s.to_string());
-                    let ev = ResponseEvent::Incomplete { response_id: id, _reason: reason };
-                    if tx_event.send(Ok(ev)).await.is_err() {
-                        return;
-                    }
-                    // Mark terminal state to suppress idle-close error.
-                    completed_emitted = true;
-                }
-            }
-
             // Final response completed – includes array of output items & id
             "response.completed" => {
                 if let Some(resp_val) = event.response {
                     match serde_json::from_value::<ResponseCompleted>(resp_val) {
                         Ok(r) => {
-                            // Capture id for any subsequent resume attempts (though this is terminal).
-                            response_id_for_resume = Some(r.id.clone());
-                            // Emit Completed immediately to avoid hanging if
-                            // the server doesn't close the SSE stream right
-                            // away. Also retain it so the stream-closure path
-                            // can still emit it if we didn't already.
-                            if !completed_emitted {
-                                let event = ResponseEvent::Completed {
-                                    response_id: r.id.clone(),
-                                    token_usage: r.usage.clone().map(Into::into),
-                                };
-                                let _ = tx_event.send(Ok(event)).await;
-                                completed_emitted = true;
-                            }
                             response_completed = Some(r);
                         }
                         Err(e) => {
@@ -1283,7 +604,6 @@ async fn process_sse(
             | "response.function_call_arguments.delta"
             | "response.custom_tool_call_input.delta"
             | "response.custom_tool_call_input.done" // also emitted as response.output_item.done
-            | "response.in_progress"
             | "response.output_text.done" => {}
             "response.output_item.added" => {
                 if let Some(item) = event.item.as_ref() {
@@ -1311,80 +631,65 @@ async fn process_sse(
                 }
             }
             "response.reasoning_summary_text.done" => {}
-            // Azure image generation partials and MCP approval requests are
-            // not yet surfaced via a dedicated UI event. Ignore gracefully.
-            "response.image_generation_call.partial_image" | "response.mcp_approval_request" => {}
-            _ => {}
-        }
-    }
-}
-
-/// Attempt to resume an Azure Responses SSE stream starting after the given
-/// sequence cursor. Returns a boxed byte stream on success, or None if resume
-/// is not possible.
-async fn attempt_resume(
-    client: &reqwest::Client,
-    provider: &ModelProviderInfo,
-    auth_manager: &Option<Arc<AuthManager>>,
-    response_id: &str,
-    starting_after: u64,
-) -> Option<BytesResultStream> {
-    use reqwest::header::CONTENT_TYPE;
-
-    let auth = auth_manager.as_ref().and_then(|m| m.auth());
-    let base = provider.get_response_url(&auth, response_id);
-    let sep = if base.contains('?') { '&' } else { '?' };
-    let url = format!("{base}{sep}stream=true&starting_after={starting_after}");
-
-    let mut req = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "text/event-stream");
-
-    // Prefer provider API key when configured; otherwise fall back to
-    // AuthManager token. Mirror create_request_builder semantics.
-    if let Ok(Some(api_key)) = provider.api_key() {
-        match provider.auth_type {
-            crate::model_provider_info::AuthType::ApiKey => {
-                req = req.header("api-key", api_key);
+            
+            // Azure-specific lifecycle events
+            "response.queued" => {
+                let event = ResponseEvent::Queued;
+                if tx_event.send(Ok(event)).await.is_err() {
+                    return;
+                }
             }
+            "response.in_progress" => {
+                let event = ResponseEvent::InProgress;
+                if tx_event.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            "error" => {
+                let event = ResponseEvent::Error(event.response.unwrap_or_default());
+                if tx_event.send(Ok(event)).await.is_err() {
+                    return;
+                }
+                // Also set response_error for compatibility
+                response_error = Some(CodexErr::Stream(
+                    "error event received".to_string(),
+                    None,
+                ));
+            }
+            "response.incomplete" => {
+                if let Some(resp_val) = event.response {
+                    if let Some(id) = resp_val.get("id").and_then(|v| v.as_str()) {
+                        let event = ResponseEvent::Incomplete {
+                            response_id: id.to_string(),
+                            _reason: resp_val.get("incomplete_details")
+                                .and_then(|v| v.get("reason"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        if tx_event.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            
+            // Handle unknown events
             _ => {
-                req = req.bearer_auth(api_key);
+                let event = ResponseEvent::Unknown {
+                    event_type: event.kind.clone(),
+                    payload: serde_json::json!({
+                        "response": event.response,
+                        "item": event.item,
+                        "delta": event.delta,
+                        "sequence_number": event.sequence_number
+                    }),
+                };
+                if tx_event.send(Ok(event)).await.is_err() {
+                    return;
+                }
             }
         }
-    } else if let Some(ca) = auth.as_ref() {
-        match provider.auth_type {
-            crate::model_provider_info::AuthType::ApiKey => match ca.get_token().await {
-                Ok(t) => req = req.header("api-key", t),
-                Err(_) => return None,
-            },
-            _ => match ca.get_token().await {
-                Ok(t) => req = req.bearer_auth(t),
-                Err(_) => return None,
-            },
-        }
     }
-
-    req = provider.apply_http_headers(req);
-
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-    if !resp.status().is_success() {
-        return None;
-    }
-    let is_sse = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.starts_with("text/event-stream"))
-        .unwrap_or(false);
-    if !is_sse {
-        return None;
-    }
-
-    let s = resp.bytes_stream().map_err(CodexErr::Reqwest);
-    Some(Box::pin(s))
 }
 
 /// used in tests to stream from a text SSE file
@@ -1406,10 +711,9 @@ async fn stream_from_fixture(
     let rdr = std::io::Cursor::new(content);
     let stream = ReaderStream::new(rdr).map_err(CodexErr::Io);
     tokio::spawn(process_sse(
-        Box::pin(stream),
+        stream,
         tx_event,
         provider.stream_idle_timeout(),
-        None,
     ));
     Ok(ResponseStream { rx_event })
 }
@@ -1474,12 +778,7 @@ mod tests {
         let reader = builder.build();
         let stream = ReaderStream::new(reader).map_err(CodexErr::Io);
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent>>(16);
-        tokio::spawn(process_sse(
-            Box::pin(stream),
-            tx,
-            provider.stream_idle_timeout(),
-            None,
-        ));
+        tokio::spawn(process_sse(stream, tx, provider.stream_idle_timeout()));
 
         let mut events = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -1509,12 +808,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent>>(8);
         let stream = ReaderStream::new(std::io::Cursor::new(body)).map_err(CodexErr::Io);
-        tokio::spawn(process_sse(
-            Box::pin(stream),
-            tx,
-            provider.stream_idle_timeout(),
-            None,
-        ));
+        tokio::spawn(process_sse(stream, tx, provider.stream_idle_timeout()));
 
         let mut out = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -1812,5 +1106,54 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
+    }
+
+    #[test]
+    fn test_advanced_features_integration() {
+        use crate::advanced_features::AdvancedFeatures;
+        
+        // Test standalone AdvancedFeatures functionality
+        let default_features = AdvancedFeatures::default();
+        assert!(!default_features.enable_response_chaining);
+        assert!(!default_features.enable_background_processing);
+        assert!(!default_features.enable_response_storage);
+        assert!(default_features.enable_stream_resumption); // Only this is enabled by default
+
+        // Test OpenAI-optimized features
+        let openai_features = AdvancedFeatures::openai_optimized();
+        assert!(openai_features.enable_response_chaining);
+        assert!(openai_features.enable_response_storage);
+        assert!(openai_features.enable_stream_resumption);
+        assert!(!openai_features.enable_background_processing); // Not enabled by OpenAI preset
+
+        // Test Azure-optimized features  
+        let azure_features = AdvancedFeatures::azure_optimized();
+        assert!(azure_features.enable_response_chaining);
+        assert!(azure_features.enable_background_processing);
+        assert!(azure_features.enable_stream_resumption);
+        assert!(azure_features.enable_response_storage); // Required for background processing (store=true)
+
+        // Test custom features
+        let custom_features = AdvancedFeatures {
+            enable_response_chaining: true,
+            enable_background_processing: false,
+            enable_response_storage: false,
+            enable_stream_resumption: false,
+            ..Default::default()
+        };
+        assert!(custom_features.enable_response_chaining);
+        assert!(!custom_features.enable_background_processing);
+        assert!(!custom_features.enable_response_storage);
+        assert!(!custom_features.enable_stream_resumption);
+
+        // Test auto-enabling of storage for background processing
+        let mut incomplete_features = AdvancedFeatures {
+            enable_background_processing: true,
+            enable_response_storage: false, // This should auto-enable
+            ..Default::default()
+        };
+        assert!(!incomplete_features.enable_response_storage); // Before validation
+        incomplete_features.validate_and_fix();
+        assert!(incomplete_features.enable_response_storage); // Auto-enabled by validation
     }
 }
