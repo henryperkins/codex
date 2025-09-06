@@ -25,9 +25,6 @@ pub struct Prompt {
     /// Conversation context input items.
     pub input: Vec<ResponseItem>,
 
-    /// Whether to store response on server side (disable_response_storage = !store).
-    pub store: bool,
-
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
     pub(crate) tools: Vec<OpenAiTool>,
@@ -199,7 +196,6 @@ pub(crate) struct ResponsesApiRequest<'a> {
     // than sending `null` so providers (including Azure) don't see a stray key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<Reasoning>,
-    /// true when using the Responses API.
     pub(crate) store: bool,
     pub(crate) stream: bool,
     pub(crate) include: Vec<String>,
@@ -280,7 +276,7 @@ mod tests {
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning: None,
-            store: true,
+            store: false,
             stream: true,
             include: vec![],
             previous_response_id: None,
@@ -312,7 +308,7 @@ mod tests {
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning: None,
-            store: true,
+            store: false,
             stream: true,
             include: vec![],
             previous_response_id: None,

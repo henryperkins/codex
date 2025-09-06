@@ -196,38 +196,25 @@ impl ModelClient {
 
         let auth_manager = self.auth_manager.clone();
 
-        let auth_mode = auth_manager
-            .as_ref()
-            .and_then(|m| m.auth())
-            .as_ref()
-            .map(|a| a.mode);
-
-        // Background streaming requires `store=true` on Azure. If storage is
-        // disabled via auth mode (e.g., ChatGPT), we may need to force it on
-        // when background streaming is enabled.
-        let mut store = prompt.store && auth_mode != Some(AuthMode::ChatGPT);
-        
-        // OpenAI's Responses API requires store=true when using previous_response_id
-        if !self.provider.is_probably_azure() && prompt.previous_response_id.is_some() {
-            store = true;
-        }
-
         let full_instructions = prompt.get_full_instructions(&self.config.model_family);
         let tools_json = create_tools_json_for_responses_api(&prompt.tools)?;
+        let reasoning = create_reasoning_param_for_request(
+            &self.config.model_family,
+            self.effort,
+            self.summary,
+        );
+
+        let include: Vec<String> = if reasoning.is_some() {
+            vec!["reasoning.encrypted_content".to_string()]
+        } else {
+            vec![]
+        };
+
         let input_with_instructions = prompt.get_formatted_input();
         // compute static inputs for payload construction outside the retry loop
         let base_instructions_ref = full_instructions.clone();
         let input_ref = input_with_instructions.clone();
         let tools_ref = tools_json.clone();
-
-        // Request encrypted COT if we are not storing responses,
-        // otherwise reasoning items will be referenced by ID
-        let include: Vec<String> =
-            if !store && self.config.model_family.supports_reasoning_summaries {
-                vec!["reasoning.encrypted_content".to_string()]
-            } else {
-                vec![]
-            };
 
         // Only include `text.verbosity` for GPT-5 family models
         // verbosity/text control computed per attempt (cheap) based on family
@@ -269,19 +256,33 @@ impl ModelClient {
             None
         };
 
-        // debug logging removed
-
-        let background = match std::env::var("CODEX_ENABLE_BACKGROUND") {
-            Ok(v) if v == "1" => Some(true),
-            _ => None,
+        // Only include `text.verbosity` for GPT-5 family models
+        let text = if self.config.model_family.family == "gpt-5" {
+            create_text_param_for_request(self.config.model_verbosity)
+        } else {
+            if self.config.model_verbosity.is_some() {
+                warn!(
+                    "model_verbosity is set but ignored for non-gpt-5 model family: {}",
+                    self.config.model_family.family
+                );
+            }
+            None
         };
 
-        if background == Some(true) && !store {
-            tracing::warn!(
-                "background=true requires store=true; forcing store=true for this request"
-            );
-            store = true;
-        }
+        let payload = ResponsesApiRequest {
+            model: &self.config.model,
+            instructions: &full_instructions,
+            input: &input_with_instructions,
+            tools: &tools_json,
+            tool_choice: "auto",
+            parallel_tool_calls: false,
+            reasoning,
+            store: false,
+            stream: true,
+            include,
+            prompt_cache_key: Some(self.session_id.to_string()),
+            text,
+        };
 
         // Track the `previous_response_id` we will send on each attempt. If the
         // initial chained request fails with the Azure-specific
