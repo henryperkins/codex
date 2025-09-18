@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -130,7 +131,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ShellToolCallParams;
 use codex_protocol::protocol::InitialHistory;
 
-mod compact;
+pub mod compact;
 use self::compact::build_compacted_history;
 use self::compact::collect_user_messages;
 
@@ -710,7 +711,7 @@ impl Session {
         self.persist_rollout_items(&rollout_items).await;
     }
 
-    fn build_initial_context(&self, turn_context: &TurnContext) -> Vec<ResponseItem> {
+    pub(crate) fn build_initial_context(&self, turn_context: &TurnContext) -> Vec<ResponseItem> {
         let mut items = Vec::<ResponseItem>::with_capacity(2);
         if let Some(user_instructions) = turn_context.user_instructions.as_deref() {
             items.push(UserInstructions::new(user_instructions.to_string()).into());
@@ -898,6 +899,7 @@ impl Session {
             exec_args.params,
             exec_args.sandbox_type,
             exec_args.sandbox_policy,
+            exec_args.sandbox_cwd,
             exec_args.codex_linux_sandbox_exe,
             exec_args.stdout_stream,
         )
@@ -2691,6 +2693,7 @@ pub struct ExecInvokeArgs<'a> {
     pub params: ExecParams,
     pub sandbox_type: SandboxType,
     pub sandbox_policy: &'a SandboxPolicy,
+    pub sandbox_cwd: &'a Path,
     pub codex_linux_sandbox_exe: &'a Option<PathBuf>,
     pub stdout_stream: Option<StdoutStream>,
 }
@@ -2882,6 +2885,7 @@ async fn handle_container_exec_with_params(
                 params: params.clone(),
                 sandbox_type,
                 sandbox_policy: &turn_context.sandbox_policy,
+                sandbox_cwd: &turn_context.cwd,
                 codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
                 stdout_stream: if exec_command_context.apply_patch.is_some() {
                     None
@@ -3016,6 +3020,7 @@ async fn handle_sandbox_error(
                         params,
                         sandbox_type: SandboxType::None,
                         sandbox_policy: &turn_context.sandbox_policy,
+                        sandbox_cwd: &turn_context.cwd,
                         codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
                         stdout_stream: if exec_command_context.apply_patch.is_some() {
                             None
@@ -3303,7 +3308,7 @@ async fn exit_review_mode(
   <results>
   {findings_str}
   </results>
-</user_tool>
+</user_action>
 "#));
     } else {
         user_message.push_str(r#"<user_action>
@@ -3312,7 +3317,7 @@ async fn exit_review_mode(
   <results>
   None.
   </results>
-</user_tool>
+</user_action>
 "#);
     }
 
@@ -3324,6 +3329,9 @@ async fn exit_review_mode(
         }])
         .await;
 }
+
+#[cfg(test)]
+pub(crate) use tests::make_session_and_context;
 
 #[cfg(test)]
 mod tests {
@@ -3565,7 +3573,7 @@ mod tests {
         })
     }
 
-    fn make_session_and_context() -> (Session, TurnContext) {
+    pub(crate) fn make_session_and_context() -> (Session, TurnContext) {
         let (tx_event, _rx_event) = async_channel::unbounded();
         let codex_home = tempfile::tempdir().expect("create temp dir");
         let config = Config::load_from_base_config_with_overrides(
