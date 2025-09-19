@@ -1542,9 +1542,9 @@ async fn spawn_review_thread(
     sub_id: String,
     review_request: ReviewRequest,
 ) {
-    let model = config.review_model.clone();
-    let review_model_family = find_family_for_model(&model)
-        .unwrap_or_else(|| parent_turn_context.client.get_model_family());
+    // Use the current model instead of a hardcoded review model
+    let model = config.model.clone();
+    let review_model_family = config.model_family.clone();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_family: &review_model_family,
         include_plan_tool: false,
@@ -1561,12 +1561,13 @@ async fn spawn_review_thread(
     let auth_manager = parent_turn_context.client.get_auth_manager();
     let model_family = review_model_family.clone();
 
-    // Build per‑turn client with the requested model/family.
+    // Build per‑turn client with the current model/family and reasoning settings.
     let mut per_turn_config = (*config).clone();
     per_turn_config.model = model.clone();
     per_turn_config.model_family = model_family.clone();
-    per_turn_config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
-    per_turn_config.model_reasoning_summary = ReasoningSummaryConfig::Detailed;
+    // Use the current reasoning effort setting instead of hardcoding to Low
+    per_turn_config.model_reasoning_effort = config.model_reasoning_effort.clone();
+    per_turn_config.model_reasoning_summary = config.model_reasoning_summary.clone();
     if let Some(model_info) = get_model_info(&model_family) {
         per_turn_config.model_context_window = Some(model_info.context_window);
     }
