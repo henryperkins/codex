@@ -672,6 +672,7 @@ dependencies = [
  "codex-apply-patch",
  "codex-file-search",
  "codex-mcp-client",
+ "codex-openai-schema",
  "codex-protocol",
  "core_test_support",
  "dirs",
@@ -708,6 +709,7 @@ dependencies = [
  "tracing",
  "tree-sitter",
  "tree-sitter-bash",
+ "url",
  "uuid",
  "walkdir",
  "which",
@@ -865,6 +867,14 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "codex-openai-schema"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

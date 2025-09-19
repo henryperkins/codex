@@ -1566,8 +1566,8 @@ async fn spawn_review_thread(
     per_turn_config.model = model.clone();
     per_turn_config.model_family = model_family.clone();
     // Use the current reasoning effort setting instead of hardcoding to Low
-    per_turn_config.model_reasoning_effort = config.model_reasoning_effort.clone();
-    per_turn_config.model_reasoning_summary = config.model_reasoning_summary.clone();
+    per_turn_config.model_reasoning_effort = config.model_reasoning_effort;
+    per_turn_config.model_reasoning_summary = config.model_reasoning_summary;
     if let Some(model_info) = get_model_info(&model_family) {
         per_turn_config.model_context_window = Some(model_info.context_window);
     }

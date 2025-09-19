@@ -15,6 +15,7 @@ members = [
     "mcp-server",
     "mcp-types",
     "ollama",
+    "openai_schema",
     "protocol",
     "protocol-ts",
     "tui",

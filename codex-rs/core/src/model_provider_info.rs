@@ -180,7 +180,10 @@ impl ModelProviderInfo {
     /// Apply provider-specific HTTP headers (both static and environment-based)
     /// onto an existing `reqwest::RequestBuilder` and return the updated
     /// builder.
-    fn apply_http_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub(crate) fn apply_http_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
         if let Some(extra) = &self.http_headers {
             for (k, v) in extra {
                 builder = builder.header(k, v);
@@ -390,13 +393,13 @@ base_url = "http://localhost:11434/v1"
     fn test_deserialize_azure_model_provider_toml() {
         let azure_provider_toml = r#"
 name = "Azure"
-base_url = "https://xxxxx.openai.azure.com/openai"
+base_url = "https://xxxxx.openai.azure.com/openai/v1"
 env_key = "AZURE_OPENAI_API_KEY"
 query_params = { api-version = "2025-04-01-preview" }
         "#;
         let expected_provider = ModelProviderInfo {
             name: "Azure".into(),
-            base_url: Some("https://xxxxx.openai.azure.com/openai".into()),
+            base_url: Some("https://xxxxx.openai.azure.com/openai/v1".into()),
             env_key: Some("AZURE_OPENAI_API_KEY".into()),
             env_key_instructions: None,
             wire_api: WireApi::Chat,
