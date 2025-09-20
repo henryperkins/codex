@@ -6,7 +6,6 @@ use reqwest::StatusCode;
 use serde_json;
 use std::io;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::task::JoinError;
 
 pub type Result<T> = std::result::Result<T, CodexErr>;
@@ -127,8 +126,46 @@ pub enum CodexErr {
     #[error(transparent)]
     TokioJoin(#[from] JoinError),
 
+    /// Azure-specific error with structured code/message and optional request id.
+    #[error("{0}")]
+    Azure(#[from] AzureError),
+
     #[error("{0}")]
     EnvVar(EnvVarError),
+}
+
+/// A structured Azure OpenAI error returned by non-successful responses.
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub struct AzureError {
+    pub status: StatusCode,
+    pub code: String,
+    pub message: String,
+    pub request_id: Option<String>,
+}
+
+impl std::fmt::Display for AzureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(req_id) = &self.request_id {
+            write!(
+                f,
+                "Azure error {status} ({code}): {message} [request id: {req_id}]",
+                status = self.status,
+                code = self.code,
+                message = self.message,
+                req_id = req_id,
+            )
+        } else {
+            write!(
+                f,
+                "Azure error {status} ({code}): {message}",
+                status = self.status,
+                code = self.code,
+                message = self.message,
+            )
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -16,34 +16,95 @@ use codex_openai_schema::ResponseInputItemsList;
 
 use crate::auth::AuthManager;
 use crate::auth::CodexAuth;
-use crate::error::CodexErr;
-use crate::error::Result;
+use crate::error::{AzureError, CodexErr, Result};
 use crate::model_provider_info::ModelProviderInfo;
 use crate::util::backoff;
-use reqwest::header::RETRY_AFTER;
-use std::time::Duration;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 /// Builds a full Azure OpenAI URL for a specific resource path that needs a
 /// `{response_id}` segment inserted *before* the query string.
 fn build_azure_url(provider: &ModelProviderInfo, auth: &Option<CodexAuth>, suffix: &str) -> String {
-    // Example `base` value: https://<resource>.openai.azure.com/openai/v1/responses?api-version=2025-04-01-preview
-    let base = provider.get_full_url(auth);
+    // provider.get_full_url() already ends with "/responses?..."
+    let base_with_query = provider.get_full_url(auth);
 
-    let mut url = url::Url::parse(&base).expect("provider.get_full_url should return valid URL");
+    // Separate query string so we can insert suffix before it.
+    let (base, query) = match base_with_query.split_once('?') {
+        Some((b, q)) => (b.to_string(), format!("?{q}")),
+        None => (base_with_query.clone(), String::new()),
+    };
 
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .expect("URL should be able to modify path segments");
-
-        for seg in suffix.trim_start_matches('/').split('/') {
-            if !seg.is_empty() {
-                segments.push(seg);
-            }
-        }
+    let mut url = base;
+    if !url.ends_with('/') {
+        url.push('/');
     }
 
-    url.to_string()
+    url.push_str(suffix.trim_start_matches('/'));
+    url.push_str(&query);
+    url
+}
+
+/// Returns a delay based on Retry-After headers or falls back to exponential backoff.
+fn calc_retry_delay(headers: &HeaderMap, attempt: u64) -> std::time::Duration {
+    // Azure may send either `Retry-After` (secs) or `Retry-After-Ms` (ms)
+    if let Some(delay_ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(delay_ms);
+    }
+
+    if let Some(delay_secs) = headers
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(delay_secs);
+    }
+
+    backoff(attempt)
+}
+
+/// Helper to parse Azure error body {"error": {"code": ..., "message": ...}}
+fn parse_azure_error(body: String, status: reqwest::StatusCode, headers: &HeaderMap) -> AzureError {
+    #[derive(serde::Deserialize)]
+    struct InnerError {
+        code: Option<String>,
+        message: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        error: Option<InnerError>,
+    }
+
+    let (code, message) = match serde_json::from_str::<ErrorBody>(&body) {
+        Ok(err_body) => {
+            let code = err_body
+                .error
+                .as_ref()
+                .and_then(|e| e.code.clone())
+                .unwrap_or_else(|| "unknown".into());
+            let message = err_body
+                .error
+                .as_ref()
+                .and_then(|e| e.message.clone())
+                .unwrap_or_else(|| body.clone());
+            (code, message)
+        }
+        Err(_) => ("unknown".into(), body.clone()),
+    };
+
+    let request_id = headers
+        .get("azure-openai-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    AzureError {
+        status,
+        code,
+        message,
+        request_id,
+    }
 }
 
 /// Fetches the **final** response object for a given response ID.
@@ -68,6 +129,9 @@ pub async fn get_response(
         }
         builder = provider.apply_http_headers(builder);
 
+        let user_agent_val = format!("codex-cli/{}", env!("CARGO_PKG_VERSION"));
+        builder = builder.header("x-ms-useragent", user_agent_val);
+
         match builder.send().await {
             Ok(res) => {
                 if res.status().is_success() {
@@ -83,37 +147,20 @@ pub async fn get_response(
                 }
 
                 let status = res.status();
-
-                // Azure-specific error code
-                let az_code = res
-                    .headers()
-                    .get("x-ms-error-code")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
+                let headers_clone = res.headers().clone();
 
                 let should_retry =
                     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
 
                 if should_retry && attempt <= max_retries {
-                    let delay = res
-                        .headers()
-                        .get(RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(Duration::from_secs)
-                        .unwrap_or_else(|| backoff(attempt));
+                    let delay = calc_retry_delay(res.headers(), attempt);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
 
                 let body = res.text().await.unwrap_or_default();
-                let msg = if az_code.is_empty() {
-                    body
-                } else {
-                    format!("{body} (azure error code: {az_code})")
-                };
-                return Err(CodexErr::UnexpectedStatus(status, msg));
+                let azure_err = parse_azure_error(body, status, &headers_clone);
+                return Err(CodexErr::Azure(azure_err));
             }
             Err(e) => {
                 if attempt > max_retries {
@@ -149,6 +196,9 @@ pub async fn get_response_input_items(
         }
         builder = provider.apply_http_headers(builder);
 
+        let user_agent_val = format!("codex-cli/{}", env!("CARGO_PKG_VERSION"));
+        builder = builder.header("x-ms-useragent", user_agent_val);
+
         match builder.send().await {
             Ok(res) => {
                 if res.status().is_success() {
@@ -160,29 +210,82 @@ pub async fn get_response_input_items(
                 }
 
                 let status = res.status();
+                let headers_clone = res.headers().clone();
                 let should_retry =
                     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
 
                 if should_retry && attempt <= max_retries {
-                    let delay = res
-                        .headers()
-                        .get(RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(Duration::from_secs)
-                        .unwrap_or_else(|| backoff(attempt));
+                    let delay = calc_retry_delay(res.headers(), attempt);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
 
                 let body = res.text().await.unwrap_or_default();
-                return Err(CodexErr::UnexpectedStatus(status, body));
+                let azure_err = parse_azure_error(body, status, &headers_clone);
+                return Err(CodexErr::Azure(azure_err));
             }
             Err(e) => {
                 if attempt > max_retries {
                     return Err(CodexErr::Reqwest(e));
                 }
                 let delay = backoff(attempt);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// Deletes a stored response by ID.  Azure's API returns HTTP 204 on success.
+pub async fn delete_response(
+    provider: &ModelProviderInfo,
+    client: &reqwest::Client,
+    auth_manager: &Option<Arc<AuthManager>>,
+    response_id: &str,
+) -> Result<()> {
+    let auth = auth_manager.as_ref().and_then(|m| m.auth());
+    let url = build_azure_url(provider, &auth, response_id);
+
+    let max_retries = provider.request_max_retries();
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        let mut builder = client.delete(url.clone());
+        if let Some(auth) = auth.as_ref() {
+            builder = builder.bearer_auth(auth.get_token().await?);
+        }
+        builder = provider.apply_http_headers(builder);
+
+        let user_agent_val = format!("codex-cli/{}", env!("CARGO_PKG_VERSION"));
+        builder = builder.header("x-ms-useragent", user_agent_val);
+
+        match builder.send().await {
+            Ok(res) => {
+                if res.status().is_success() || res.status() == reqwest::StatusCode::NO_CONTENT {
+                    return Ok(());
+                }
+
+                let status = res.status();
+                let headers_clone = res.headers().clone();
+                let should_retry =
+                    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+
+                if should_retry && attempt <= max_retries {
+                    let delay = calc_retry_delay(&headers_clone, attempt);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                let body = res.text().await.unwrap_or_default();
+                let azure_err = parse_azure_error(body, status, &headers_clone);
+                return Err(CodexErr::Azure(azure_err));
+            }
+            Err(e) => {
+                if attempt > max_retries {
+                    return Err(CodexErr::Reqwest(e));
+                }
+                let delay = crate::util::backoff(attempt);
                 tokio::time::sleep(delay).await;
             }
         }

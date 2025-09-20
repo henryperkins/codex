@@ -144,6 +144,24 @@ impl ModelClient {
         .await
     }
 
+    /// Azure-only helper to delete a stored response.
+    pub async fn azure_delete_response(&self, response_id: &str) -> crate::error::Result<()> {
+        if !self.provider.is_azure_responses_endpoint() {
+            return Err(crate::error::CodexErr::UnexpectedStatus(
+                StatusCode::BAD_REQUEST,
+                "Provider is not Azure".into(),
+            ));
+        }
+
+        azure::delete_response(
+            &self.provider,
+            &self.client,
+            &self.auth_manager,
+            response_id,
+        )
+        .await
+    }
+
     pub fn get_model_context_window(&self) -> Option<u64> {
         self.config
             .model_context_window
