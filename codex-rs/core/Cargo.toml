@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+<<<<<<< HEAD
 anyhow = "1"
 askama = "0.12"
 async-channel = "2.3.1"
@@ -43,18 +44,51 @@ strum_macros = "0.27.2"
 tempfile = "3"
 thiserror = "2.0.16"
 time = { version = "0.3", features = [
+=======
+anyhow = { workspace = true }
+askama = { workspace = true }
+async-channel = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+codex-apply-patch = { workspace = true }
+codex-file-search = { workspace = true }
+codex-mcp-client = { workspace = true }
+codex-protocol = { workspace = true }
+dirs = { workspace = true }
+env-flags = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+mcp-types = { workspace = true }
+os_info = { workspace = true }
+portable-pty = { workspace = true }
+rand = { workspace = true }
+regex-lite = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+shlex = { workspace = true }
+similar = { workspace = true }
+strum_macros = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = [
+>>>>>>> 8bc73a2bfd2a5fcaaff586a23e6f5f9bf7a7f722
     "formatting",
     "parsing",
     "local-offset",
     "macros",
 ] }
-tokio = { version = "1", features = [
+tokio = { workspace = true, features = [
     "io-std",
     "macros",
     "process",
     "rt-multi-thread",
     "signal",
 ] }
+<<<<<<< HEAD
 tokio-util = "0.7.16"
 toml = "0.9.5"
 toml_edit = "0.23.4"
@@ -65,30 +99,41 @@ uuid = { version = "1", features = ["serde", "v4"] }
 which = "6"
 wildmatch = "2.5.0"
 url = "2"
+=======
+tokio-util = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tracing = { workspace = true, features = ["log"] }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+which = { workspace = true }
+wildmatch = { workspace = true }
+>>>>>>> 8bc73a2bfd2a5fcaaff586a23e6f5f9bf7a7f722
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4.1"
-seccompiler = "0.5.0"
+landlock = { workspace = true }
+seccompiler = { workspace = true }
 
 # Build OpenSSL from source for musl builds.
 [target.x86_64-unknown-linux-musl.dependencies]
-openssl-sys = { version = "*", features = ["vendored"] }
+openssl-sys = { workspace = true, features = ["vendored"] }
 
 # Build OpenSSL from source for musl builds.
 [target.aarch64-unknown-linux-musl.dependencies]
-openssl-sys = { version = "*", features = ["vendored"] }
+openssl-sys = { workspace = true, features = ["vendored"] }
 
 [dev-dependencies]
-assert_cmd = "2"
-core_test_support = { path = "tests/common" }
-maplit = "1.0.2"
-predicates = "3"
-pretty_assertions = "1.4.1"
-tempfile = "3"
-tokio-test = "0.4"
-walkdir = "2.5.0"
-wiremock = "0.6"
+assert_cmd = { workspace = true }
+core_test_support = { workspace = true }
+maplit = { workspace = true }
+predicates = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio-test = { workspace = true }
+walkdir = { workspace = true }
+wiremock = { workspace = true }
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]
