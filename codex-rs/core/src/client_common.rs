@@ -138,6 +138,10 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
 }
 
 /// Request object that is serialized as JSON and POST'ed when using the
+/// Responses API. This is now an alias to the struct generated from the
+/// official `v1preview.json` spec and kept in the `codex-openai-schema`
+/// crate. We keep the original name to avoid touching call-sites.
+/// Request object that is serialized as JSON and POST'ed when using the
 /// Responses API.
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesApiRequest<'a> {

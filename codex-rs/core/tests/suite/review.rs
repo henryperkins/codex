@@ -284,11 +284,15 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
     server.verify().await;
 }
 
-/// Ensure that when a custom `review_model` is set in the config, the review
-/// request uses that model (and not the main chat model).
+/// Ensure that the review uses the current model (not a separate review model).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+<<<<<<< HEAD
 async fn review_uses_custom_review_model_from_config() {
     skip_if_no_network!();
+=======
+async fn review_uses_current_model() {
+    non_sandbox_test!();
+>>>>>>> a607d066ebc164e39cbfe71a4f15e962c74fec88
 
     // Minimal stream: just a completed event
     let sse_raw = r#"[
@@ -296,18 +300,18 @@ async fn review_uses_custom_review_model_from_config() {
     ]"#;
     let server = start_responses_server_with_sse(sse_raw, 1).await;
     let codex_home = TempDir::new().unwrap();
-    // Choose a review model different from the main model; ensure it is used.
+    // The review should use the current model, not a separate review model
     let codex = new_conversation_for_server(&server, &codex_home, |cfg| {
         cfg.model = "gpt-4.1".to_string();
-        cfg.review_model = "gpt-5".to_string();
+        cfg.review_model = "gpt-5".to_string(); // This should be ignored now
     })
     .await;
 
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
-                prompt: "use custom model".to_string(),
-                user_facing_hint: "use custom model".to_string(),
+                prompt: "use current model".to_string(),
+                user_facing_hint: "use current model".to_string(),
             },
         })
         .await
@@ -326,10 +330,10 @@ async fn review_uses_custom_review_model_from_config() {
     .await;
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
-    // Assert the request body model equals the configured review model
+    // Assert the request body model equals the current model (not the review model)
     let request = &server.received_requests().await.unwrap()[0];
     let body = request.body_json::<serde_json::Value>().unwrap();
-    assert_eq!(body["model"].as_str().unwrap(), "gpt-5");
+    assert_eq!(body["model"].as_str().unwrap(), "gpt-4.1");
 
     server.verify().await;
 }

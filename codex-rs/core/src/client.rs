@@ -25,6 +25,7 @@ use tracing::debug;
 use tracing::trace;
 use tracing::warn;
 
+use crate::azure;
 use crate::chat_completions::AggregateStreamExt;
 use crate::chat_completions::stream_chat_completions;
 use crate::client_common::Prompt;
@@ -106,6 +107,69 @@ impl ModelClient {
             effort,
             summary,
         }
+    }
+
+    /// Azure-only helper to fetch the final `Response` object for a given ID.
+    /// Returns an error if the current provider is not an Azure Responses
+    /// endpoint.
+    pub async fn azure_get_response(
+        &self,
+        response_id: &str,
+    ) -> Result<codex_openai_schema::Response> {
+        if !self.provider.is_azure_responses_endpoint() {
+            return Err(CodexErr::UnexpectedStatus(
+                StatusCode::BAD_REQUEST,
+                "Provider is not Azure".into(),
+            ));
+        }
+
+        azure::get_response(
+            &self.provider,
+            &self.client,
+            &self.auth_manager,
+            response_id,
+        )
+        .await
+    }
+
+    /// Azure-only helper to fetch the list of input items a user sent for a
+    /// given response.
+    pub async fn azure_get_response_input_items(
+        &self,
+        response_id: &str,
+    ) -> Result<codex_openai_schema::ResponseInputItemsList> {
+        if !self.provider.is_azure_responses_endpoint() {
+            return Err(CodexErr::UnexpectedStatus(
+                StatusCode::BAD_REQUEST,
+                "Provider is not Azure".into(),
+            ));
+        }
+
+        azure::get_response_input_items(
+            &self.provider,
+            &self.client,
+            &self.auth_manager,
+            response_id,
+        )
+        .await
+    }
+
+    /// Azure-only helper to delete a stored response.
+    pub async fn azure_delete_response(&self, response_id: &str) -> crate::error::Result<()> {
+        if !self.provider.is_azure_responses_endpoint() {
+            return Err(crate::error::CodexErr::UnexpectedStatus(
+                StatusCode::BAD_REQUEST,
+                "Provider is not Azure".into(),
+            ));
+        }
+
+        azure::delete_response(
+            &self.provider,
+            &self.client,
+            &self.auth_manager,
+            response_id,
+        )
+        .await
     }
 
     pub fn get_model_context_window(&self) -> Option<u64> {
@@ -196,6 +260,7 @@ impl ModelClient {
 
         let input_with_instructions = prompt.get_formatted_input();
 
+<<<<<<< HEAD
         let verbosity = match &self.config.model_family.family {
             family if family == "gpt-5" => self.config.model_verbosity,
             _ => {
@@ -207,6 +272,32 @@ impl ModelClient {
                 }
 
                 None
+=======
+        // Warn users if they are still using the legacy Azure base URL without
+        // the required `/v1` segment introduced in the 2025-04-01 preview.
+        if self.provider.is_azure_responses_endpoint()
+            && !self
+                .provider
+                .base_url
+                .as_deref()
+                .map(|b| b.contains("/openai/v1"))
+                .unwrap_or(false)
+        {
+            warn!(
+                "Azure provider base_url is missing '/openai/v1'. Update your config or the request may hit a deprecated endpoint."
+            );
+        }
+
+        // Only include `text.verbosity` for GPT-5 family models
+        let text = if self.config.model_family.family == "gpt-5" {
+            create_text_param_for_request(self.config.model_verbosity)
+        } else {
+            if self.config.model_verbosity.is_some() {
+                warn!(
+                    "model_verbosity is set but ignored for non-gpt-5 model family: {}",
+                    self.config.model_family.family
+                );
+>>>>>>> a607d066ebc164e39cbfe71a4f15e962c74fec88
             }
         };
 

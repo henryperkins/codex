@@ -22,7 +22,11 @@ members = [
     "mcp-server",
     "mcp-types",
     "ollama",
+<<<<<<< HEAD
     "process-hardening",
+=======
+    "openai_schema",
+>>>>>>> a607d066ebc164e39cbfe71a4f15e962c74fec88
     "protocol",
     "protocol-ts",
     "rmcp-client",
