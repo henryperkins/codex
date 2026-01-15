@@ -26,6 +26,9 @@ pub struct RetryConfig {
     pub retry_429: bool,
     pub retry_5xx: bool,
     pub retry_transport: bool,
+    /// Maximum delay to honor from server retry-after headers.
+    /// If the server requests a longer delay, fall back to exponential backoff.
+    pub max_retry_delay: Option<Duration>,
 }
 
 impl RetryConfig {
@@ -38,6 +41,7 @@ impl RetryConfig {
                 retry_5xx: self.retry_5xx,
                 retry_transport: self.retry_transport,
             },
+            max_retry_delay: self.max_retry_delay,
         }
     }
 }

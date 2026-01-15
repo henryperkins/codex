@@ -356,12 +356,12 @@
     },
     "shell_environment_policy": {
       "default": {
-        "exclude": null,
-        "experimental_use_profile": null,
-        "ignore_default_excludes": null,
-        "include_only": null,
         "inherit": null,
-        "set": null
+        "ignore_default_excludes": null,
+        "exclude": null,
+        "set": null,
+        "include_only": null,
+        "experimental_use_profile": null
       },
       "allOf": [
         {
@@ -772,6 +772,12 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "max_retry_delay_ms": {
+          "description": "Maximum delay (in milliseconds) to wait when server sends retry-after headers. If the server requests a longer delay, fall back to exponential backoff. For Azure providers, defaults to 60000 (60 seconds) if not specified.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
         },
         "name": {
           "description": "Friendly display name.",

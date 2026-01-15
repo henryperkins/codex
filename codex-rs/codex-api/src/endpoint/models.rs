@@ -157,6 +157,7 @@ mod tests {
                 retry_429: false,
                 retry_5xx: true,
                 retry_transport: true,
+                max_retry_delay: None,
             },
             stream_idle_timeout: Duration::from_secs(1),
         }

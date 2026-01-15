@@ -1,0 +1,26 @@
+# Codex Configuration for Azure OpenAI
+# Copy this file to ~/.codex/config.toml after filling in your values
+
+# Set your default model provider
+model_provider = "azure"
+
+# Azure OpenAI Provider Configuration
+[model_providers.azure]
+name = "Azure OpenAI"
+
+# Replace YOUR-RESOURCE-NAME with your Azure OpenAI resource name
+# Example: if your endpoint is https://mycompany.openai.azure.com, use "mycompany"
+base_url = "https://fifteenmodels.openai.azure.com/openai/v1"
+
+# Environment variable containing your API key
+# Set it with: export AZURE_OPENAI_API_KEY="your-key-here"
+env_key = "AZURE_OPENAI_API_KEY"
+
+# Use the Responses API
+wire_api = "responses"
+
+# Retry up to 10 times on transient failures (429, 5xx, transport errors)
+request_max_retries = 10
+
+# Retry up to 10 times when streaming responses disconnect mid-response
+stream_max_retries = 10
