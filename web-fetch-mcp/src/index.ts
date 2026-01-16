@@ -11,6 +11,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  McpError,
+  ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { loadConfig, validateConfig, getConfig } from './config.js';
@@ -19,6 +23,229 @@ import { executeExtract, getExtractInputSchema } from './tools/extract.js';
 import { executeChunk, getChunkInputSchema } from './tools/chunk.js';
 import { executeCompact, getCompactInputSchema } from './tools/compact.js';
 import { closeBrowser } from './fetcher/browser-renderer.js';
+
+const PROMPTS = [
+  {
+    name: 'fetch_url',
+    title: 'Fetch URL',
+    description: 'Fetch a URL and return the LLMPacket',
+    arguments: [
+      { name: 'url', description: 'The URL to fetch', required: true },
+      { name: 'mode', description: 'Fetch mode: auto, http, or render', required: false },
+      { name: 'extraction', description: 'Optional JSON for options.extraction', required: false },
+    ],
+  },
+  {
+    name: 'fetch_and_chunk',
+    title: 'Fetch And Chunk',
+    description: 'Fetch a URL, then chunk the content',
+    arguments: [
+      { name: 'url', description: 'The URL to fetch', required: true },
+      { name: 'max_tokens', description: 'Max tokens per chunk', required: false },
+      { name: 'strategy', description: 'Chunk strategy: headings_first or balanced', required: false },
+    ],
+  },
+  {
+    name: 'fetch_and_compact',
+    title: 'Fetch And Compact',
+    description: 'Fetch a URL, then compact the content',
+    arguments: [
+      { name: 'url', description: 'The URL to fetch', required: true },
+      { name: 'max_tokens', description: 'Target max tokens for compaction', required: false },
+      { name: 'mode', description: 'Compaction mode: structural, salience, map_reduce, question_focused', required: false },
+      { name: 'question', description: 'Question for question-focused compaction', required: false },
+    ],
+  },
+  {
+    name: 'fetch_ai_search',
+    title: 'Fetch With AI Search',
+    description: 'Fetch a URL, upload to AI Search, and optionally run a query',
+    arguments: [
+      { name: 'url', description: 'The URL to fetch', required: true },
+      { name: 'query', description: 'Query string for AI Search', required: true },
+      { name: 'wait_ms', description: 'Wait before querying AI Search (ms)', required: false },
+      { name: 'mode', description: 'AI Search mode: search or ai_search', required: false },
+    ],
+  },
+];
+
+const PROMPT_MAP = new Map(PROMPTS.map(prompt => [prompt.name, prompt]));
+
+function getArgs(
+  args: Record<string, string> | undefined,
+  required: string[]
+): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  for (const key of required) {
+    const value = args?.[key];
+    if (!value || value.trim() === '') {
+      throw new McpError(ErrorCode.InvalidParams, `Missing required argument: ${key}`);
+    }
+    resolved[key] = value;
+  }
+
+  if (args) {
+    for (const [key, value] of Object.entries(args)) {
+      if (value !== undefined) {
+        resolved[key] = value;
+      }
+    }
+  }
+
+  return resolved;
+}
+
+function parseJsonArgument(value: string | undefined): unknown | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
+function parseNumberArgument(value: string | undefined): number | string | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (Number.isFinite(parsed)) {
+    return parsed;
+  }
+  return value;
+}
+
+function buildFetchUrlPrompt(args: Record<string, string>): string {
+  const url = args['url'] ?? '';
+  const mode = args['mode'];
+  const extraction = parseJsonArgument(args['extraction']);
+
+  const options: Record<string, unknown> = {};
+  if (mode) {
+    options['mode'] = mode;
+  }
+  if (extraction !== undefined) {
+    options['extraction'] = extraction;
+  }
+
+  const payload: Record<string, unknown> = { url };
+  if (Object.keys(options).length > 0) {
+    payload['options'] = options;
+  }
+
+  return [
+    'Call the `fetch` tool with the following input:',
+    '```json',
+    JSON.stringify(payload, null, 2),
+    '```',
+  ].join('\n');
+}
+
+function buildFetchAndChunkPrompt(args: Record<string, string>): string {
+  const url = args['url'] ?? '';
+  const maxTokens = parseNumberArgument(args['max_tokens']);
+  const strategy = args['strategy'];
+
+  const options: Record<string, unknown> = {};
+  if (maxTokens !== undefined) {
+    options['max_tokens'] = maxTokens;
+  }
+  if (strategy) {
+    options['strategy'] = strategy;
+  }
+
+  const chunkPayload: Record<string, unknown> = {
+    packet: '<fetchResult.packet>',
+  };
+  if (Object.keys(options).length > 0) {
+    chunkPayload['options'] = options;
+  }
+
+  return [
+    '1) Call `fetch` with:',
+    '```json',
+    JSON.stringify({ url }, null, 2),
+    '```',
+    '',
+    '2) Call `chunk` with the packet from step 1:',
+    '```json',
+    JSON.stringify(chunkPayload, null, 2),
+    '```',
+  ].join('\n');
+}
+
+function buildFetchAndCompactPrompt(args: Record<string, string>): string {
+  const url = args['url'] ?? '';
+  const maxTokens = parseNumberArgument(args['max_tokens']);
+  const mode = args['mode'];
+  const question = args['question'];
+
+  const options: Record<string, unknown> = {};
+  if (maxTokens !== undefined) {
+    options['max_tokens'] = maxTokens;
+  }
+  if (mode) {
+    options['mode'] = mode;
+  }
+  if (question) {
+    options['question'] = question;
+  }
+
+  const compactPayload: Record<string, unknown> = {
+    input: '<fetchResult.packet>',
+  };
+  if (Object.keys(options).length > 0) {
+    compactPayload['options'] = options;
+  }
+
+  return [
+    '1) Call `fetch` with:',
+    '```json',
+    JSON.stringify({ url }, null, 2),
+    '```',
+    '',
+    '2) Call `compact` with the packet from step 1:',
+    '```json',
+    JSON.stringify(compactPayload, null, 2),
+    '```',
+  ].join('\n');
+}
+
+function buildFetchAiSearchPrompt(args: Record<string, string>): string {
+  const url = args['url'] ?? '';
+  const query = args['query'] ?? '';
+  const waitMs = parseNumberArgument(args['wait_ms']);
+  const mode = args['mode'];
+
+  const aiSearchOptions: Record<string, unknown> = {
+    enabled: true,
+    query: {
+      query,
+      ...(mode ? { mode } : {}),
+    },
+  };
+  if (waitMs !== undefined) {
+    aiSearchOptions['wait_ms'] = waitMs;
+  }
+
+  const payload = {
+    url,
+    options: {
+      ai_search: aiSearchOptions,
+    },
+  };
+
+  return [
+    'Call the `fetch` tool with AI Search enabled:',
+    '```json',
+    JSON.stringify(payload, null, 2),
+    '```',
+  ].join('\n');
+}
 
 // Tool definitions
 const TOOLS = [
@@ -32,6 +259,7 @@ Returns an LLMPacket with:
 - Document outline
 - Key blocks for citation
 - Prompt injection detection warnings
+- Optional Cloudflare R2 upload for AI Search indexing
 
 Security: Blocks private IPs, respects robots.txt, rate limits per host.`,
     inputSchema: getFetchInputSchema(),
@@ -94,6 +322,9 @@ async function main(): Promise<void> {
     {
       capabilities: {
         tools: {},
+        prompts: {
+          listChanged: false,
+        },
       },
     }
   );
@@ -101,6 +332,82 @@ async function main(): Promise<void> {
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return { tools: TOOLS };
+  });
+
+  server.setRequestHandler(ListPromptsRequestSchema, async () => {
+    return { prompts: PROMPTS };
+  });
+
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    if (!PROMPT_MAP.has(name)) {
+      throw new McpError(ErrorCode.InvalidParams, `Prompt ${name} not found`);
+    }
+
+    switch (name) {
+      case 'fetch_url': {
+        const resolved = getArgs(args, ['url']);
+        return {
+          description: 'Fetch a URL and return the LLMPacket',
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: buildFetchUrlPrompt(resolved),
+              },
+            },
+          ],
+        };
+      }
+      case 'fetch_and_chunk': {
+        const resolved = getArgs(args, ['url']);
+        return {
+          description: 'Fetch a URL, then chunk the content',
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: buildFetchAndChunkPrompt(resolved),
+              },
+            },
+          ],
+        };
+      }
+      case 'fetch_and_compact': {
+        const resolved = getArgs(args, ['url']);
+        return {
+          description: 'Fetch a URL, then compact the content',
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: buildFetchAndCompactPrompt(resolved),
+              },
+            },
+          ],
+        };
+      }
+      case 'fetch_ai_search': {
+        const resolved = getArgs(args, ['url', 'query']);
+        return {
+          description: 'Fetch a URL, upload to AI Search, and optionally run a query',
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: buildFetchAiSearchPrompt(resolved),
+              },
+            },
+          ],
+        };
+      }
+      default:
+        throw new McpError(ErrorCode.InvalidParams, `Prompt ${name} not found`);
+    }
   });
 
   // Handle tool calls

@@ -44,6 +44,36 @@ export interface FetchOptions {
   render?: RenderOptions;
   extraction?: ExtractionOptions;
   format?: FormatOptions;
+  ai_search?: AiSearchOptions;
+}
+
+export type AiSearchQueryMode = 'search' | 'ai_search';
+
+export interface AiSearchQueryOptions {
+  query: string;
+  mode?: AiSearchQueryMode;
+  rewrite_query?: boolean;
+  max_num_results?: number;
+  ranking_options?: {
+    score_threshold?: number;
+  };
+  reranking?: {
+    enabled?: boolean;
+    model?: string;
+  };
+  filters?: Record<string, unknown>;
+  model?: string;
+  system_prompt?: string;
+}
+
+export interface AiSearchOptions {
+  enabled?: boolean;
+  prefix?: string;
+  max_file_bytes?: number;
+  wait_ms?: number;
+  skip_if_exists?: boolean;
+  require_success?: boolean;
+  query?: AiSearchQueryOptions;
 }
 
 // ============================================
@@ -274,4 +304,17 @@ export interface Config {
   renderBlockThirdParty: boolean;
   renderTimeoutMs: number;
   userAgent: string;
+  aiSearchEnabled: boolean;
+  aiSearchAccountId?: string;
+  aiSearchName?: string;
+  aiSearchApiToken?: string;
+  aiSearchR2AccessKeyId?: string;
+  aiSearchR2SecretAccessKey?: string;
+  aiSearchR2Bucket?: string;
+  aiSearchR2Endpoint?: string;
+  aiSearchR2Prefix?: string;
+  aiSearchMaxFileBytes: number;
+  aiSearchQueryTimeoutMs: number;
+  aiSearchQueryWaitMs: number;
+  aiSearchMaxQueryWaitMs: number;
 }

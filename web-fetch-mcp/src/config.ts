@@ -43,6 +43,19 @@ export function loadConfig(): Config {
     renderBlockThirdParty: parseBoolean(process.env['RENDER_BLOCK_THIRD_PARTY'], true),
     renderTimeoutMs: parseNumber(process.env['RENDER_TIMEOUT_MS'], 60000),
     userAgent: process.env['USER_AGENT'] || 'web-fetch-mcp/1.0 (+https://github.com/example/web-fetch-mcp)',
+    aiSearchEnabled: parseBoolean(process.env['AI_SEARCH_ENABLED'], false),
+    aiSearchAccountId: process.env['CF_ACCOUNT_ID'],
+    aiSearchName: process.env['CF_AI_SEARCH_NAME'],
+    aiSearchApiToken: process.env['CF_AI_SEARCH_API_TOKEN'],
+    aiSearchR2AccessKeyId: process.env['CF_R2_ACCESS_KEY_ID'],
+    aiSearchR2SecretAccessKey: process.env['CF_R2_SECRET_ACCESS_KEY'],
+    aiSearchR2Bucket: process.env['CF_R2_BUCKET'],
+    aiSearchR2Endpoint: process.env['CF_R2_ENDPOINT'],
+    aiSearchR2Prefix: process.env['CF_R2_PREFIX'],
+    aiSearchMaxFileBytes: parseNumber(process.env['AI_SEARCH_MAX_FILE_BYTES'], 4 * 1024 * 1024),
+    aiSearchQueryTimeoutMs: parseNumber(process.env['AI_SEARCH_QUERY_TIMEOUT_MS'], 15000),
+    aiSearchQueryWaitMs: parseNumber(process.env['AI_SEARCH_QUERY_WAIT_MS'], 0),
+    aiSearchMaxQueryWaitMs: parseNumber(process.env['AI_SEARCH_MAX_QUERY_WAIT_MS'], 15000),
   };
 }
 
@@ -87,6 +100,15 @@ export function validateConfig(config: Config): string[] {
   }
   if (config.defaultMaxTokens < 100) {
     errors.push('DEFAULT_MAX_TOKENS must be at least 100');
+  }
+  if (config.aiSearchMaxFileBytes < 1024) {
+    errors.push('AI_SEARCH_MAX_FILE_BYTES must be at least 1024 bytes');
+  }
+  if (config.aiSearchQueryTimeoutMs < 1000) {
+    errors.push('AI_SEARCH_QUERY_TIMEOUT_MS must be at least 1000ms');
+  }
+  if (config.aiSearchMaxQueryWaitMs < 0) {
+    errors.push('AI_SEARCH_MAX_QUERY_WAIT_MS must be at least 0ms');
   }
 
   return errors;

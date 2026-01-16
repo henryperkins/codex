@@ -10,6 +10,7 @@ import type {
   LLMPacket,
   RawFetchResult,
 } from '../types.js';
+import type { AiSearchIngestResult } from '../ai-search/index.js';
 import { httpFetchWithRetry } from '../fetcher/http-fetcher.js';
 import { browserRender, isBrowserAvailable } from '../fetcher/browser-renderer.js';
 import { checkRobots } from '../fetcher/robots.js';
@@ -18,6 +19,7 @@ import { getRateLimiter, waitForRateLimit } from '../security/rate-limiter.js';
 import { checkSSRF } from '../security/ssrf-guard.js';
 import { getHostname } from '../utils/url.js';
 import { getConfig } from '../config.js';
+import { ingestPacketToAiSearch } from '../ai-search/index.js';
 
 export interface FetchToolInput {
   url: string;
@@ -33,6 +35,7 @@ export interface FetchToolOutput {
     headers: Record<string, string>;
   };
   screenshot_base64?: string;
+  ai_search?: AiSearchIngestResult;
   error?: {
     code: string;
     message: string;
@@ -355,10 +358,33 @@ export async function executeFetch(input: FetchToolInput): Promise<FetchToolOutp
       normalizeResult.packet.screenshot_base64 = screenshot.toString('base64');
     }
 
+    let aiSearchResult: AiSearchIngestResult | undefined;
+    const aiSearchEnabled = options.ai_search?.enabled ?? config.aiSearchEnabled;
+    if (aiSearchEnabled && normalizeResult.packet) {
+      aiSearchResult = await ingestPacketToAiSearch(
+        normalizeResult.packet,
+        options.ai_search ?? {},
+        config
+      );
+
+      const aiSearchError = aiSearchResult.error ?? aiSearchResult.query?.error;
+      if (aiSearchError && options.ai_search?.require_success) {
+        return {
+          success: false,
+          error: {
+            code: aiSearchError.code,
+            message: aiSearchError.message,
+            details: aiSearchError.details,
+          },
+        };
+      }
+    }
+
     return {
       success: true,
       packet: normalizeResult.packet,
       screenshot_base64: screenshot ? screenshot.toString('base64') : undefined,
+      ai_search: aiSearchResult,
     };
 
   } catch (err) {
@@ -472,6 +498,62 @@ export function getFetchInputSchema(): object {
               },
               include_raw_excerpt: {
                 type: 'boolean',
+              },
+            },
+          },
+          ai_search: {
+            type: 'object',
+            properties: {
+              enabled: {
+                type: 'boolean',
+                description: 'Upload extracted content to Cloudflare R2 for AI Search indexing',
+              },
+              prefix: {
+                type: 'string',
+                description: 'Optional prefix for R2 object keys',
+              },
+              max_file_bytes: {
+                type: 'number',
+                description: 'Maximum bytes per uploaded file (default: 4MB)',
+              },
+              wait_ms: {
+                type: 'number',
+                description: 'Optional delay before running AI Search query (ms)',
+              },
+              skip_if_exists: {
+                type: 'boolean',
+                description: 'Skip upload if the first part already exists',
+              },
+              require_success: {
+                type: 'boolean',
+                description: 'Fail the fetch tool if AI Search upload or query fails',
+              },
+              query: {
+                type: 'object',
+                description: 'Optional AI Search query after upload',
+                properties: {
+                  query: { type: 'string' },
+                  mode: { type: 'string', enum: ['search', 'ai_search'] },
+                  rewrite_query: { type: 'boolean' },
+                  max_num_results: { type: 'number' },
+                  ranking_options: {
+                    type: 'object',
+                    properties: {
+                      score_threshold: { type: 'number' },
+                    },
+                  },
+                  reranking: {
+                    type: 'object',
+                    properties: {
+                      enabled: { type: 'boolean' },
+                      model: { type: 'string' },
+                    },
+                  },
+                  filters: { type: 'object' },
+                  model: { type: 'string' },
+                  system_prompt: { type: 'string' },
+                },
+                required: ['query'],
               },
             },
           },

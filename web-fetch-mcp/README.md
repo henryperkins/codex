@@ -9,6 +9,7 @@ A Model Context Protocol (MCP) server that provides safe, high-signal web browsi
 - **Security first**: SSRF protection, prompt injection detection, rate limiting
 - **LLM-optimized output**: Structured packets with citations, outlines, and metadata
 - **Context management**: Semantic chunking and intelligent compaction
+- **AI Search ingestion**: Optional Cloudflare R2 uploads for AI Search indexing
 
 ## Architecture Overview
 
@@ -79,6 +80,21 @@ RESPECT_ROBOTS=true         # Honor robots.txt
 # Processing
 DEFAULT_MAX_TOKENS=4000
 CHUNK_MARGIN_RATIO=0.10
+
+# Cloudflare AI Search (optional)
+AI_SEARCH_ENABLED=false
+CF_ACCOUNT_ID=your_account_id
+CF_AI_SEARCH_NAME=your_ai_search_name
+CF_AI_SEARCH_API_TOKEN=your_api_token
+CF_R2_BUCKET=your_r2_bucket
+CF_R2_ACCESS_KEY_ID=your_r2_access_key_id
+CF_R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
+CF_R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+CF_R2_PREFIX=ai-search/
+AI_SEARCH_MAX_FILE_BYTES=4194304
+AI_SEARCH_QUERY_TIMEOUT_MS=15000
+AI_SEARCH_QUERY_WAIT_MS=0
+AI_SEARCH_MAX_QUERY_WAIT_MS=15000
 ```
 
 ## MCP Tools
@@ -106,6 +122,18 @@ Fetch and extract content from a URL.
 - `format`: Output format options
   - `output`: `"llm_packet" | "raw" | "normalized"`
   - `include_raw_excerpt`: Include raw HTML snippet
+- `ai_search`: Cloudflare AI Search ingestion options
+  - `enabled`: Upload extracted content to R2 for AI Search indexing
+  - `prefix`: Optional R2 key prefix
+  - `max_file_bytes`: Per-file byte cap before splitting
+  - `wait_ms`: Optional delay before running AI Search query
+  - `skip_if_exists`: Skip upload if the first part exists
+  - `require_success`: Fail the fetch tool if upload or query fails
+  - `query`: Optional AI Search query (REST API)
+    - `query`: Query string
+    - `mode`: `"search" | "ai_search"` (retrieval only or retrieval+generation)
+    - `rewrite_query`, `max_num_results`, `ranking_options`, `reranking`, `filters`, `model`, `system_prompt`
+  - Note: `ai_search` is skipped when `format.output` is `raw`
 
 ### 2. `extract(input, options)`
 
@@ -139,6 +167,17 @@ Intelligently compress content.
   - `"question_focused"`: Relevant to question
 - `question`: Focus question (for question_focused mode)
 - `preserve`: Content types to keep: `["numbers", "dates", "names", "definitions", "procedures"]`
+
+## MCP Prompts
+
+This server exposes static prompt templates for user-invoked workflows:
+
+- `fetch_url`: args `url` (required), `mode`, `extraction` (JSON string)
+- `fetch_and_chunk`: args `url` (required), `max_tokens`, `strategy`
+- `fetch_and_compact`: args `url` (required), `max_tokens`, `mode`, `question`
+- `fetch_ai_search`: args `url` (required), `query` (required), `wait_ms`, `mode`
+
+Prompts are discoverable via `prompts/list` and retrievable via `prompts/get`.
 
 ## Output Format: LLMPacket
 
@@ -300,6 +339,28 @@ console.log(compactResult.compacted.summary);
 console.log(compactResult.compacted.key_points);
 ```
 
+### Fetch + AI Search upload
+
+```javascript
+const result = await mcp.callTool('fetch', {
+  url: 'https://example.com/guide',
+  options: {
+    mode: 'http',
+    ai_search: {
+      enabled: true,
+      prefix: 'docs/',
+      query: {
+        query: 'pricing limits',
+        mode: 'search',
+        max_num_results: 5
+      }
+    }
+  }
+});
+
+console.log(result.ai_search);
+```
+
 ## Threat Model & Mitigations
 
 | Threat | Mitigation |
@@ -336,6 +397,8 @@ web-fetch-mcp/
 │   ├── index.ts              # MCP server entry
 │   ├── config.ts             # Configuration
 │   ├── types.ts              # TypeScript types
+│   ├── ai-search/
+│   │   └── index.ts           # Cloudflare AI Search ingestion
 │   ├── tools/
 │   │   ├── fetch.ts          # fetch tool
 │   │   ├── extract.ts        # extract tool
