@@ -14,6 +14,7 @@ import type {
   ExtractedContent,
   ContentTypeInfo,
   RawFetchResult,
+  NormalizedContent,
 } from '../types.js';
 import { sha256, generateSourceId, generateBlockId } from '../utils/hash.js';
 import { normalizeUrl } from '../utils/url.js';
@@ -37,6 +38,27 @@ export interface NormalizeResult {
   success: boolean;
   packet?: LLMPacket;
   error?: string;
+}
+
+export function toNormalizedContent(packet: LLMPacket): NormalizedContent {
+  return {
+    source_id: packet.source_id,
+    original_url: packet.original_url,
+    canonical_url: packet.canonical_url,
+    retrieved_at: packet.retrieved_at,
+    status: packet.status,
+    content_type: packet.content_type,
+    metadata: packet.metadata,
+    outline: packet.outline,
+    key_blocks: packet.key_blocks,
+    content: packet.content,
+    source_summary: packet.source_summary,
+    citations: packet.citations,
+    unsafe_instructions_detected: packet.unsafe_instructions_detected,
+    warnings: packet.warnings,
+    raw_excerpt: packet.raw_excerpt,
+    screenshot_base64: packet.screenshot_base64,
+  };
 }
 
 /**

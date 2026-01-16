@@ -11,8 +11,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  CompleteRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
   McpError,
   ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
@@ -23,6 +27,10 @@ import { executeExtract, getExtractInputSchema } from './tools/extract.js';
 import { executeChunk, getChunkInputSchema } from './tools/chunk.js';
 import { executeCompact, getCompactInputSchema } from './tools/compact.js';
 import { closeBrowser } from './fetcher/browser-renderer.js';
+import { listResources, listResourceTemplates, readResource } from './resources/handlers.js';
+import { getResourceStore, setResourceListChangedNotifier } from './resources/store.js';
+import { buildCompletionResult } from './completions.js';
+import { paginateResults } from './pagination.js';
 
 const PROMPTS = [
   {
@@ -67,6 +75,12 @@ const PROMPTS = [
       { name: 'mode', description: 'AI Search mode: search or ai_search', required: false },
     ],
   },
+  {
+    name: 'resources_tips',
+    title: 'Resources Tips',
+    description: 'How to reuse fetched content via MCP resources',
+    arguments: [],
+  },
 ];
 
 const PROMPT_MAP = new Map(PROMPTS.map(prompt => [prompt.name, prompt]));
@@ -100,7 +114,7 @@ function parseJsonArgument(value: string | undefined): unknown | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-      (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
     try {
       return JSON.parse(trimmed);
     } catch {
@@ -117,6 +131,30 @@ function parseNumberArgument(value: string | undefined): number | string | undef
     return parsed;
   }
   return value;
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new McpError(ErrorCode.InvalidParams, `${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new McpError(ErrorCode.InvalidParams, `Missing required parameter: ${label}`);
+  }
+  return value;
+}
+
+function optionalRecord(value: unknown, label: string): Record<string, unknown> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new McpError(ErrorCode.InvalidParams, `${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
 }
 
 function buildFetchUrlPrompt(args: Record<string, string>): string {
@@ -247,6 +285,20 @@ function buildFetchAiSearchPrompt(args: Record<string, string>): string {
   ].join('\n');
 }
 
+function buildResourcesTipsPrompt(): string {
+  return [
+    'Tips for reusing fetched content via MCP resources:',
+    '- After successful fetch/extract (format.output != "raw"), a short-lived resource is stored keyed by source_id.',
+    '- Discover stored packets with resources/list; URI patterns via resources/templates/list.',
+    '- Read resource contents with resources/read:',
+    '  - webfetch://packet/{source_id} (LLMPacket JSON)',
+    '  - webfetch://content/{source_id} (markdown)',
+    '  - webfetch://normalized/{source_id} (NormalizedContent JSON)',
+    '  - webfetch://screenshot/{source_id} (PNG, only if captured)',
+    '- notifications/resources/list_changed is emitted when new resources are stored.',
+  ].join('\n');
+}
+
 // Tool definitions
 const TOOLS = [
   {
@@ -261,7 +313,9 @@ Returns an LLMPacket with:
 - Prompt injection detection warnings
 - Optional Cloudflare R2 upload for AI Search indexing
 
-Security: Blocks private IPs, respects robots.txt, rate limits per host.`,
+Security: Blocks private IPs, respects robots.txt, rate limits per host.
+
+Successful normalization stores a short-lived resource; use resources/list + resources/read to retrieve by source_id.`,
     inputSchema: getFetchInputSchema(),
   },
   {
@@ -269,7 +323,9 @@ Security: Blocks private IPs, respects robots.txt, rate limits per host.`,
     description: `Extract and normalize content from raw bytes or a URL.
 
 Use this when you already have content and want to process it into an LLMPacket.
-Supports all content types: HTML, Markdown, PDF, JSON, XML.`,
+Supports all content types: HTML, Markdown, PDF, JSON, XML.
+
+Successful normalization stores a short-lived resource; use resources/list + resources/read to retrieve by source_id.`,
     inputSchema: getExtractInputSchema(),
   },
   {
@@ -299,6 +355,18 @@ Always preserves numbers, dates, names, definitions, and procedures.`,
   },
 ];
 
+const SERVER_INSTRUCTIONS = [
+  'Usage tips:',
+  '- Successful fetch/extract (format.output != "raw") stores a short-lived resource keyed by source_id (TTL follows CACHE_TTL_S).',
+  '- Discover stored packets with resources/list; URI patterns via resources/templates/list.',
+  '- Read via resources/read:',
+  '  - webfetch://packet/{source_id} (LLMPacket JSON)',
+  '  - webfetch://content/{source_id} (markdown)',
+  '  - webfetch://normalized/{source_id} (NormalizedContent JSON)',
+  '  - webfetch://screenshot/{source_id} (PNG, only if captured)',
+  '- notifications/resources/list_changed is emitted when new resources are stored.',
+].join('\n');
+
 /**
  * Main entry point
  */
@@ -321,21 +389,45 @@ async function main(): Promise<void> {
     },
     {
       capabilities: {
-        tools: {},
+        tools: {
+          listChanged: false,
+        },
+        completions: {},
         prompts: {
           listChanged: false,
         },
+        resources: {
+          listChanged: true,
+        },
       },
+      instructions: SERVER_INSTRUCTIONS,
     }
   );
 
+  setResourceListChangedNotifier(() => server.sendResourceListChanged());
+
   // Handle list tools request
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: TOOLS };
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+    const { items, nextCursor } = paginateResults(TOOLS, request.params?.cursor);
+    return {
+      tools: items,
+      ...(nextCursor ? { nextCursor } : {}),
+    };
   });
 
-  server.setRequestHandler(ListPromptsRequestSchema, async () => {
-    return { prompts: PROMPTS };
+  server.setRequestHandler(ListPromptsRequestSchema, async (request) => {
+    const { items, nextCursor } = paginateResults(PROMPTS, request.params?.cursor);
+    return {
+      prompts: items,
+      ...(nextCursor ? { nextCursor } : {}),
+    };
+  });
+
+  server.setRequestHandler(CompleteRequestSchema, async (request) => {
+    return buildCompletionResult(request.params, {
+      prompts: PROMPTS,
+      resourceStore: getResourceStore(),
+    });
   });
 
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
@@ -405,9 +497,45 @@ async function main(): Promise<void> {
           ],
         };
       }
+      case 'resources_tips': {
+        return {
+          description: 'How to reuse fetched content via MCP resources',
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: buildResourcesTipsPrompt(),
+              },
+            },
+          ],
+        };
+      }
       default:
         throw new McpError(ErrorCode.InvalidParams, `Prompt ${name} not found`);
     }
+  });
+
+  server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+    const { resources } = listResources(getResourceStore());
+    const { items, nextCursor } = paginateResults(resources, request.params?.cursor);
+    return {
+      resources: items,
+      ...(nextCursor ? { nextCursor } : {}),
+    };
+  });
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async (request) => {
+    const { resourceTemplates } = listResourceTemplates();
+    const { items, nextCursor } = paginateResults(resourceTemplates, request.params?.cursor);
+    return {
+      resourceTemplates: items,
+      ...(nextCursor ? { nextCursor } : {}),
+    };
+  });
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    return readResource(getResourceStore(), request.params.uri);
   });
 
   // Handle tool calls
@@ -417,9 +545,12 @@ async function main(): Promise<void> {
     try {
       switch (name) {
         case 'fetch': {
+          const argsObject = requireRecord(args, 'arguments');
+          const url = requireString(argsObject['url'], 'url');
+          const options = optionalRecord(argsObject['options'], 'options');
           const result = await executeFetch({
-            url: (args as Record<string, unknown>)['url'] as string,
-            options: (args as Record<string, unknown>)['options'] as Record<string, unknown> | undefined,
+            url,
+            options,
           });
 
           return {
@@ -429,26 +560,46 @@ async function main(): Promise<void> {
                 text: JSON.stringify(result, null, 2),
               },
             ],
+            isError: !result.success,
           };
         }
 
         case 'extract': {
-          const input = (args as Record<string, unknown>)['input'] as Record<string, unknown>;
+          const argsObject = requireRecord(args, 'arguments');
+          const input = requireRecord(argsObject['input'], 'input');
+          const options = optionalRecord(argsObject['options'], 'options');
+
+          const urlValue = input['url'];
+          const rawBytesValue = input['raw_bytes'];
+          if (urlValue === undefined && rawBytesValue === undefined) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              'Either input.url or input.raw_bytes must be provided'
+            );
+          }
+
+          const url = urlValue === undefined ? undefined : requireString(urlValue, 'input.url');
 
           // Handle base64 raw_bytes if provided
           let rawBytes: Buffer | undefined;
-          if (input['raw_bytes'] && typeof input['raw_bytes'] === 'string') {
-            rawBytes = Buffer.from(input['raw_bytes'], 'base64');
+          if (rawBytesValue !== undefined) {
+            if (typeof rawBytesValue !== 'string') {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                'input.raw_bytes must be a base64 string'
+              );
+            }
+            rawBytes = Buffer.from(rawBytesValue, 'base64');
           }
 
           const result = await executeExtract({
             input: {
-              url: input['url'] as string | undefined,
+              url,
               raw_bytes: rawBytes,
               content_type: input['content_type'] as string | undefined,
               canonical_url: input['canonical_url'] as string | undefined,
             },
-            options: (args as Record<string, unknown>)['options'] as Record<string, unknown> | undefined,
+            options,
           });
 
           return {
@@ -458,13 +609,17 @@ async function main(): Promise<void> {
                 text: JSON.stringify(result, null, 2),
               },
             ],
+            isError: !result.success,
           };
         }
 
         case 'chunk': {
+          const argsObject = requireRecord(args, 'arguments');
+          const packet = requireRecord(argsObject['packet'], 'packet');
+          const options = optionalRecord(argsObject['options'], 'options');
           const result = executeChunk({
-            packet: (args as Record<string, unknown>)['packet'] as never,
-            options: (args as Record<string, unknown>)['options'] as Record<string, unknown> | undefined,
+            packet: packet as never,
+            options,
           });
 
           return {
@@ -474,13 +629,17 @@ async function main(): Promise<void> {
                 text: JSON.stringify(result, null, 2),
               },
             ],
+            isError: !result.success,
           };
         }
 
         case 'compact': {
+          const argsObject = requireRecord(args, 'arguments');
+          const input = requireRecord(argsObject['input'], 'input');
+          const options = optionalRecord(argsObject['options'], 'options');
           const result = executeCompact({
-            input: (args as Record<string, unknown>)['input'] as never,
-            options: (args as Record<string, unknown>)['options'] as Record<string, unknown> | undefined,
+            input: input as never,
+            options,
           });
 
           return {
@@ -490,27 +649,17 @@ async function main(): Promise<void> {
                 text: JSON.stringify(result, null, 2),
               },
             ],
+            isError: !result.success,
           };
         }
 
         default:
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: {
-                    code: 'UNKNOWN_TOOL',
-                    message: `Unknown tool: ${name}`,
-                  },
-                }),
-              },
-            ],
-            isError: true,
-          };
+          throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
       }
     } catch (err) {
+      if (err instanceof McpError) {
+        throw err;
+      }
       return {
         content: [
           {

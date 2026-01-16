@@ -119,6 +119,7 @@ Fetch and extract content from a URL.
   - `keep_tables`: Preserve table content
   - `keep_code_blocks`: Preserve code blocks
   - `remove_selectors`: CSS selectors to remove
+- `cache_ttl_s`: Cache TTL in seconds for the HTTP fetch (set to 0 to disable)
 - `format`: Output format options
   - `output`: `"llm_packet" | "raw" | "normalized"`
   - `include_raw_excerpt`: Include raw HTML snippet
@@ -178,6 +179,51 @@ This server exposes static prompt templates for user-invoked workflows:
 - `fetch_ai_search`: args `url` (required), `query` (required), `wait_ms`, `mode`
 
 Prompts are discoverable via `prompts/list` and retrievable via `prompts/get`.
+
+## MCP Completions
+
+This server supports `completion/complete` to provide argument suggestions for prompts and resource URIs.
+
+Example prompt argument completion:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "completion/complete",
+  "params": {
+    "ref": { "type": "ref/prompt", "name": "fetch_url" },
+    "argument": { "name": "mode", "value": "re" }
+  }
+}
+```
+
+Example resource URI completion (source_id suggestions):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "completion/complete",
+  "params": {
+    "ref": { "type": "ref/resource", "uri": "webfetch://packet/{source_id}" },
+    "argument": { "name": "source_id", "value": "" }
+  }
+}
+```
+
+## MCP Resources
+
+This server exposes recently fetched packets as MCP resources using a custom `webfetch://` URI scheme. Resources are stored in-memory (TTL follows `CACHE_TTL_S`), so they are not persisted across restarts.
+
+Resource list entries use `webfetch://packet/{source_id}` and include metadata like title, lastModified, and size. Reads support:
+
+- `webfetch://packet/{source_id}`: Full LLMPacket JSON (`application/json`)
+- `webfetch://content/{source_id}`: Markdown content (`text/markdown`)
+- `webfetch://normalized/{source_id}`: NormalizedContent JSON (`application/json`)
+- `webfetch://screenshot/{source_id}`: Screenshot blob (`image/png`, only if captured)
+
+The server emits `notifications/resources/list_changed` when new resources are stored.
 
 ## Output Format: LLMPacket
 

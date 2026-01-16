@@ -12,6 +12,7 @@ import { getRateLimiter, waitForRateLimit } from '../security/rate-limiter.js';
 import { checkRobots } from './robots.js';
 import { getHostname, normalizeUrl, isAllowedProtocol } from '../utils/url.js';
 import { getConfig } from '../config.js';
+import { getFetchCache } from '../utils/cache.js';
 import type { RawFetchResult, Config } from '../types.js';
 
 export interface HttpFetchOptions {
@@ -66,7 +67,13 @@ export async function httpFetch(
     max_redirects = config.maxRedirects,
     user_agent = config.userAgent,
     respect_robots = config.respectRobots,
+    cache_ttl_s = config.cacheTtlS,
   } = options;
+
+  const cacheTtlMs = cache_ttl_s && cache_ttl_s > 0 ? cache_ttl_s * 1000 : 0;
+  const cacheKey = cacheTtlMs > 0
+    ? buildCacheKey(url, headers, user_agent, max_bytes, max_redirects)
+    : null;
 
   // Validate URL protocol
   if (!isAllowedProtocol(url)) {
@@ -112,6 +119,17 @@ export async function httpFetch(
           message: 'URL is blocked by robots.txt',
           retryable: false,
         },
+      };
+    }
+  }
+
+  if (cacheKey) {
+    const cache = getFetchCache(cacheTtlMs);
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return {
+        success: true,
+        result: cloneRawFetchResult(cached),
       };
     }
   }
@@ -344,15 +362,22 @@ export async function httpFetch(
         delete responseHeaders['content-length'];
       }
 
+      const result: RawFetchResult = {
+        status: statusCode,
+        headers: responseHeaders,
+        body,
+        finalUrl: currentUrl,
+        contentType,
+      };
+
+      if (cacheKey && cacheTtlMs > 0) {
+        const cache = getFetchCache(cacheTtlMs);
+        cache.set(cacheKey, cloneRawFetchResult(result), cacheTtlMs);
+      }
+
       return {
         success: true,
-        result: {
-          status: statusCode,
-          headers: responseHeaders,
-          body,
-          finalUrl: currentUrl,
-          contentType,
-        },
+        result,
       };
 
     } catch (err) {
@@ -427,5 +452,30 @@ export async function httpFetchWithRetry(
       message: 'Unknown error after retries',
       retryable: false,
     },
+  };
+}
+
+function buildCacheKey(
+  url: string,
+  headers: Record<string, string>,
+  userAgent: string,
+  maxBytes: number,
+  maxRedirects: number,
+): string {
+  const normalizedUrl = normalizeUrl(url);
+  const headerPart = Object.entries(headers)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key.toLowerCase()}:${value}`)
+    .join('|');
+  return `${normalizedUrl}::${userAgent}::${headerPart}::${maxBytes}::${maxRedirects}`;
+}
+
+function cloneRawFetchResult(result: RawFetchResult): RawFetchResult {
+  return {
+    status: result.status,
+    headers: { ...result.headers },
+    body: Buffer.from(result.body),
+    finalUrl: result.finalUrl,
+    contentType: result.contentType,
   };
 }

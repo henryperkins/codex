@@ -113,6 +113,23 @@ describe('HTML Fetch Integration', () => {
     expect(result.packet).toBeUndefined();
   }, 30000);
 
+  it('should return normalized format when requested', async () => {
+    const result = await executeFetch({
+      url: 'https://httpbin.org/html',
+      options: {
+        mode: 'http',
+        format: { output: 'normalized' },
+        timeout_ms: 30000,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.normalized).toBeDefined();
+    expect(result.packet).toBeUndefined();
+    expect(result.normalized?.content_type).toContain('text/html');
+    expect(result.normalized?.content).toContain('Herman Melville');
+  }, 30000);
+
   it('should extract metadata from HTML', async () => {
     const result = await executeFetch({
       url: 'https://httpbin.org/html',

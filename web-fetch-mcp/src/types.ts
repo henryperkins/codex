@@ -196,6 +196,25 @@ export interface LLMPacket {
   screenshot_base64?: string;
 }
 
+export interface NormalizedContent {
+  source_id: string;
+  original_url: string;
+  canonical_url: string;
+  retrieved_at: string;
+  status: number;
+  content_type: string;
+  metadata: LLMPacketMetadata;
+  outline: OutlineEntry[];
+  key_blocks: KeyBlock[];
+  content: string;
+  source_summary: string[];
+  citations: Citation[];
+  unsafe_instructions_detected: UnsafeInstruction[];
+  warnings: Warning[];
+  raw_excerpt?: string;
+  screenshot_base64?: string;
+}
+
 export interface Chunk {
   chunk_id: string;
   chunk_index: number;
@@ -238,6 +257,7 @@ export interface CompactedPacket {
 export interface FetchResult {
   success: boolean;
   packet?: LLMPacket;
+  normalized?: NormalizedContent;
   raw?: {
     bytes: Buffer;
     content_type: string;

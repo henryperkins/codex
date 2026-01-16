@@ -8,18 +8,20 @@ import type {
   FetchOptions,
   FetchResult,
   LLMPacket,
+  NormalizedContent,
   RawFetchResult,
 } from '../types.js';
 import type { AiSearchIngestResult } from '../ai-search/index.js';
 import { httpFetchWithRetry } from '../fetcher/http-fetcher.js';
 import { browserRender, isBrowserAvailable } from '../fetcher/browser-renderer.js';
 import { checkRobots } from '../fetcher/robots.js';
-import { normalizeContent } from '../processing/normalizer.js';
+import { normalizeContent, toNormalizedContent } from '../processing/normalizer.js';
 import { getRateLimiter, waitForRateLimit } from '../security/rate-limiter.js';
 import { checkSSRF } from '../security/ssrf-guard.js';
 import { getHostname } from '../utils/url.js';
 import { getConfig } from '../config.js';
 import { ingestPacketToAiSearch } from '../ai-search/index.js';
+import { storePacketResource } from '../resources/store.js';
 
 export interface FetchToolInput {
   url: string;
@@ -29,6 +31,7 @@ export interface FetchToolInput {
 export interface FetchToolOutput {
   success: boolean;
   packet?: LLMPacket;
+  normalized?: NormalizedContent;
   raw?: {
     bytes_length: number;
     content_type: string;
@@ -301,6 +304,8 @@ export async function executeFetch(input: FetchToolInput): Promise<FetchToolOutp
       };
     }
 
+    let normalizedOutput: NormalizedContent | undefined;
+
     // Normalize content into LLMPacket
     let normalizeResult = await normalizeContent(rawResult, url, {
       extraction,
@@ -380,10 +385,19 @@ export async function executeFetch(input: FetchToolInput): Promise<FetchToolOutp
       }
     }
 
+    if (format?.output === 'normalized' && normalizeResult.packet) {
+      normalizedOutput = toNormalizedContent(normalizeResult.packet);
+    }
+
+    if (normalizeResult.packet) {
+      storePacketResource(normalizeResult.packet);
+    }
+
     return {
       success: true,
-      packet: normalizeResult.packet,
-      screenshot_base64: screenshot ? screenshot.toString('base64') : undefined,
+      packet: format?.output === 'normalized' ? undefined : normalizeResult.packet,
+      normalized: normalizedOutput,
+      screenshot_base64: screenshot ? screenshot.toString('base64') : normalizeResult.packet?.screenshot_base64,
       ai_search: aiSearchResult,
     };
 
@@ -442,6 +456,10 @@ export function getFetchInputSchema(): object {
           respect_robots: {
             type: 'boolean',
             description: 'Whether to respect robots.txt',
+          },
+          cache_ttl_s: {
+            type: 'number',
+            description: 'Cache TTL in seconds for this request (0 to disable)',
           },
           render: {
             type: 'object',

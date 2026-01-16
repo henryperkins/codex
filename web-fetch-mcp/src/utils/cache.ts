@@ -2,6 +2,8 @@
  * Simple in-memory cache with TTL
  */
 
+import type { RawFetchResult } from '../types.js';
+
 interface CacheEntry<T> {
   value: T;
   expiresAt: number;
@@ -124,9 +126,9 @@ export class SimpleCache<T> {
 }
 
 // Singleton fetch cache
-let fetchCache: SimpleCache<Buffer> | null = null;
+let fetchCache: SimpleCache<RawFetchResult> | null = null;
 
-export function getFetchCache(ttlMs: number): SimpleCache<Buffer> {
+export function getFetchCache(ttlMs: number): SimpleCache<RawFetchResult> {
   if (!fetchCache) {
     fetchCache = new SimpleCache({ defaultTtlMs: ttlMs, maxSize: 100 });
   }

@@ -8,10 +8,12 @@ import type {
   ExtractInput,
   ExtractOptions,
   LLMPacket,
+  NormalizedContent,
   RawFetchResult,
 } from '../types.js';
-import { normalizeContent, detectContentType } from '../processing/normalizer.js';
+import { normalizeContent, detectContentType, toNormalizedContent } from '../processing/normalizer.js';
 import { executeFetch } from './fetch.js';
+import { storePacketResource } from '../resources/store.js';
 
 export interface ExtractToolInput {
   input: ExtractInput;
@@ -21,6 +23,7 @@ export interface ExtractToolInput {
 export interface ExtractToolOutput {
   success: boolean;
   packet?: LLMPacket;
+  normalized?: NormalizedContent;
   error?: {
     code: string;
     message: string;
@@ -55,6 +58,7 @@ export async function executeExtract(input: ExtractToolInput): Promise<ExtractTo
       return {
         success: true,
         packet: fetchResult.packet,
+        normalized: fetchResult.normalized,
       };
     }
 
@@ -86,6 +90,15 @@ export async function executeExtract(input: ExtractToolInput): Promise<ExtractTo
             code: 'EXTRACTION_FAILED',
             message: normalizeResult.error || 'Failed to extract content',
           },
+        };
+      }
+
+      storePacketResource(normalizeResult.packet);
+
+      if (options.format?.output === 'normalized') {
+        return {
+          success: true,
+          normalized: toNormalizedContent(normalizeResult.packet),
         };
       }
 
@@ -141,6 +154,10 @@ export function getExtractInputSchema(): object {
             description: 'Canonical URL for the content',
           },
         },
+        anyOf: [
+          { required: ['url'] },
+          { required: ['raw_bytes'] },
+        ],
       },
       options: {
         type: 'object',
