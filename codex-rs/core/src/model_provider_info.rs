@@ -501,10 +501,9 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         let positive_cases = [
             "https://foo.openai.azure.com/openai",
             "https://foo.openai.azure.us/openai/deployments/bar",
+            "https://foo.cognitiveservices.azure.com/openai",
             "https://foo.cognitiveservices.azure.cn/openai",
             "https://foo.aoai.azure.com/openai",
-            "https://foo.openai.azure-api.net/openai",
-            "https://foo.z01.azurefd.net/",
         ];
         for base_url in positive_cases {
             let provider = ModelProviderInfo {
@@ -553,6 +552,10 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             "https://api.openai.com/v1",
             "https://example.com/openai",
             "https://myproxy.azurewebsites.net/openai",
+            // Azure Front Door/CDN/APIM are not automatically detected as Azure
+            // to avoid misclassifying non-Azure proxies on Azure infrastructure
+            "https://foo.openai.azure-api.net/openai",
+            "https://foo.z01.azurefd.net/",
         ];
         for base_url in negative_cases {
             let provider = ModelProviderInfo {
