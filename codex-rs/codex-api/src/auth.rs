@@ -31,7 +31,7 @@ pub(crate) fn add_auth_headers<A: AuthProvider>(
             }
         } else {
             // Standard OpenAI uses Authorization: Bearer
-            if let Ok(header) = format!("Bearer {token}").parse() {
+            if let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}")) {
                 let _ = req.headers.insert(http::header::AUTHORIZATION, header);
             }
         }
