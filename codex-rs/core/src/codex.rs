@@ -3029,6 +3029,7 @@ async fn try_run_sampling_request(
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
+    let mut created_response_id: Option<String> = None;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
@@ -3064,7 +3065,14 @@ async fn try_run_sampling_request(
             .record_responses(&handle_responses, &event);
 
         match event {
-            ResponseEvent::Created => {}
+            ResponseEvent::Created { response_id } => {
+                if let Some(response_id) = response_id
+                    && !response_id.is_empty()
+                {
+                    created_response_id = Some(response_id.clone());
+                    client_session.set_last_response_id(response_id);
+                }
+            }
             ResponseEvent::OutputItemDone(item) => {
                 let previously_active_item = active_item.take();
                 let mut ctx = HandleOutputCtx {
@@ -3110,7 +3118,16 @@ async fn try_run_sampling_request(
                 response_id,
                 token_usage,
             } => {
-                client_session.set_last_response_id(response_id);
+                let response_id = if response_id.is_empty() {
+                    created_response_id.take().unwrap_or_default()
+                } else {
+                    response_id
+                };
+                if response_id.is_empty() {
+                    client_session.set_last_response_id(String::new());
+                } else {
+                    client_session.set_last_response_id(response_id);
+                }
                 // Sync chain state with the count of items in the history (including model
                 // output items) so that the next request only sends truly new items.
                 let full_history = sess.clone_history().await.for_prompt();

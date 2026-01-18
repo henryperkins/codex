@@ -39,7 +39,9 @@ pub struct CompactionInput<'a> {
 
 #[derive(Debug)]
 pub enum ResponseEvent {
-    Created,
+    Created {
+        response_id: Option<String>,
+    },
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
     Completed {

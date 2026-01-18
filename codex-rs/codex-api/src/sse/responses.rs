@@ -202,8 +202,12 @@ pub fn process_responses_event(
             }
         }
         "response.created" => {
-            if event.response.is_some() {
-                return Ok(Some(ResponseEvent::Created {}));
+            if let Some(resp_val) = event.response {
+                let response_id = resp_val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                return Ok(Some(ResponseEvent::Created { response_id }));
             }
         }
         "response.failed" => {
@@ -752,7 +756,12 @@ mod tests {
         }
 
         fn is_created(ev: &ResponseEvent) -> bool {
-            matches!(ev, ResponseEvent::Created)
+            matches!(
+                ev,
+                ResponseEvent::Created {
+                    response_id: Some(id)
+                } if id == "c1"
+            )
         }
         fn is_output(ev: &ResponseEvent) -> bool {
             matches!(ev, ResponseEvent::OutputItemDone(_))
@@ -779,7 +788,7 @@ mod tests {
         let cases = vec![
             TestCase {
                 name: "created",
-                event: json!({"type": "response.created", "response": {}}),
+                event: json!({"type": "response.created", "response": {"id": "c1"}}),
                 expect_first: is_created,
                 expected_len: 2,
             },
