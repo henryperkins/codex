@@ -82,37 +82,36 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
 /// Returns `None` if no valid retry-after header is found.
 pub fn parse_retry_after_headers(headers: &HeaderMap) -> Option<Duration> {
     // Try retry-after-ms first (milliseconds)
-    if let Some(value) = headers.get("retry-after-ms") {
-        if let Some(s) = value.to_str().ok() {
-            if let Ok(ms) = s.parse::<u64>() {
-                return Some(Duration::from_millis(ms));
-            }
-        }
+    if let Some(value) = headers.get("retry-after-ms")
+        && let Ok(s) = value.to_str()
+        && let Ok(ms) = s.parse::<u64>()
+    {
+        return Some(Duration::from_millis(ms));
     }
 
     // Try x-ms-retry-after-ms (Azure alternative, milliseconds)
-    if let Some(value) = headers.get("x-ms-retry-after-ms") {
-        if let Some(s) = value.to_str().ok() {
-            if let Ok(ms) = s.parse::<u64>() {
-                return Some(Duration::from_millis(ms));
-            }
-        }
+    if let Some(value) = headers.get("x-ms-retry-after-ms")
+        && let Ok(s) = value.to_str()
+        && let Ok(ms) = s.parse::<u64>()
+    {
+        return Some(Duration::from_millis(ms));
     }
 
     // Try standard retry-after header (seconds)
-    if let Some(value) = headers.get("retry-after") {
-        if let Some(value_str) = value.to_str().ok() {
-            // Try parsing as integer seconds first
-            if let Ok(secs) = value_str.parse::<u64>() {
-                return Some(Duration::from_secs(secs));
-            }
-            // Try parsing as float seconds (some servers send "1.5")
-            // Guard against negative, NaN, or infinite values which panic Duration::from_secs_f64
-            if let Ok(secs) = value_str.parse::<f64>() {
-                if secs.is_finite() && secs >= 0.0 {
-                    return Some(Duration::from_secs_f64(secs));
-                }
-            }
+    if let Some(value) = headers.get("retry-after")
+        && let Ok(value_str) = value.to_str()
+    {
+        // Try parsing as integer seconds first
+        if let Ok(secs) = value_str.parse::<u64>() {
+            return Some(Duration::from_secs(secs));
+        }
+        // Try parsing as float seconds (some servers send "1.5")
+        // Guard against negative, NaN, or infinite values which panic Duration::from_secs_f64
+        if let Ok(secs) = value_str.parse::<f64>()
+            && secs.is_finite()
+            && secs >= 0.0
+        {
+            return Some(Duration::from_secs_f64(secs));
         }
     }
 
@@ -129,18 +128,18 @@ fn compute_retry_delay(
     attempt: u64,
     max_retry_delay: Option<Duration>,
 ) -> Duration {
-    if let Some(hdrs) = headers {
-        if let Some(server_delay) = parse_retry_after_headers(hdrs) {
-            // Check if server delay is within acceptable bounds
-            if let Some(max_delay) = max_retry_delay {
-                if server_delay <= max_delay {
-                    return server_delay;
-                }
-                // Server requested too long, fall back to backoff
-            } else {
-                // No max configured, trust the server
+    if let Some(hdrs) = headers
+        && let Some(server_delay) = parse_retry_after_headers(hdrs)
+    {
+        // Check if server delay is within acceptable bounds
+        if let Some(max_delay) = max_retry_delay {
+            if server_delay <= max_delay {
                 return server_delay;
             }
+            // Server requested too long, fall back to backoff
+        } else {
+            // No max configured, trust the server
+            return server_delay;
         }
     }
     // Fall back to exponential backoff
