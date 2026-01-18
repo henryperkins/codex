@@ -99,7 +99,7 @@ describe('SSRF Guard', () => {
     });
 
     it('should allow domains in allowlist', async () => {
-      const result = await validateUrlForSSRF('https://allowed.com/page', {
+      await validateUrlForSSRF('https://allowed.com/page', {
         allowlistDomains: ['allowed.com'],
         blockPrivateIp: false, // Skip DNS for this test
       });

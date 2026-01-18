@@ -96,7 +96,6 @@ Content for B.`;
       const result = chunkContent(packet, { max_tokens: 100 });
 
       // Check that heading paths are captured
-      const pathsWithA1 = result.chunks.filter(c => c.headings_path.includes('Subsection A1'));
       // Note: may or may not be in a separate chunk depending on size
     });
 

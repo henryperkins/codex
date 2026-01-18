@@ -18,10 +18,10 @@ import type {
 } from '../types.js';
 import { sha256, generateSourceId, generateBlockId } from '../utils/hash.js';
 import { normalizeUrl } from '../utils/url.js';
-import { estimateTokens, estimateReadingTime } from '../utils/tokens.js';
+import { estimateReadingTime } from '../utils/tokens.js';
 import { detectInjections } from '../security/injection-detector.js';
 import { generateOutline } from './outline.js';
-import { extractHtml, extractHeadings } from '../extractors/html-extractor.js';
+import { extractHtml } from '../extractors/html-extractor.js';
 import { extractMarkdown } from '../extractors/markdown-extractor.js';
 import { extractPdf } from '../extractors/pdf-extractor.js';
 import { extractJson } from '../extractors/json-extractor.js';
