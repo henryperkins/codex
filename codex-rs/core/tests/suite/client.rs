@@ -8,6 +8,7 @@ use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::NewThread;
 use codex_core::Prompt;
+use codex_core::ResponseChainState;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::ThreadManager;
@@ -50,6 +51,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wiremock::Mock;
@@ -1246,6 +1248,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         SessionSource::Exec,
     );
 
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let mut client = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -1254,6 +1257,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         provider,
         effort,
         summary,
+        response_chain,
         conversation_id,
         SessionSource::Exec,
     )
@@ -2008,5 +2012,133 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         serde_json::Value::Array(actual_tail.to_vec()),
         r3_tail_expected,
         "request 3 tail mismatch",
+    );
+}
+
+/// Test that Azure previous_response_id chaining only sends new items.
+///
+/// When using Azure with `previous_response_id`, the server already has:
+/// - The input items we sent
+/// - The model's output items (reasoning, function calls, etc.)
+///
+/// On follow-up requests (e.g., tool output submission), we should ONLY send
+/// the truly new items (tool outputs), not re-send items that are already
+/// stored on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_previous_response_id_only_sends_new_items() {
+    use core_test_support::responses::ev_assistant_message;
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::ev_function_call;
+    use core_test_support::responses::ev_reasoning_item;
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::mount_response_sequence;
+    use core_test_support::responses::sse;
+    use core_test_support::responses::sse_response;
+    use core_test_support::responses::start_mock_server;
+
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let call_id = "func-call-123";
+
+    // First response: model returns reasoning + function call
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_reasoning_item("rsn-1", &["thinking about it"], &[]),
+        ev_function_call(call_id, "shell", r#"{"command":["echo","hello"]}"#),
+        ev_completed("resp-1"),
+    ]);
+
+    // Second response: after tool output, model returns final message
+    let second_response = sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+
+    let responses = vec![sse_response(first_response), sse_response(second_response)];
+    let request_log = mount_response_sequence(&server, responses).await;
+
+    // Configure as Azure provider to enable previous_response_id
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.name = "azure".to_string();
+        })
+        .build(&server)
+        .await
+        .expect("build test codex");
+
+    test.submit_turn("run echo hello").await.unwrap();
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected 2 requests (initial + tool output)"
+    );
+
+    // Debug: print both request bodies
+    eprintln!(
+        "First request body: {}",
+        serde_json::to_string_pretty(&requests[0].body_json()).unwrap()
+    );
+    eprintln!(
+        "Second request body: {}",
+        serde_json::to_string_pretty(&requests[1].body_json()).unwrap()
+    );
+
+    // First request should NOT have previous_response_id
+    let first_body = requests[0].body_json();
+    assert!(
+        first_body.get("previous_response_id").is_none(),
+        "first request should not have previous_response_id"
+    );
+
+    // Second request SHOULD have previous_response_id
+    let second_body = requests[1].body_json();
+    assert_eq!(
+        second_body
+            .get("previous_response_id")
+            .and_then(|v| v.as_str()),
+        Some("resp-1"),
+        "second request should have previous_response_id = resp-1"
+    );
+
+    // Count items by type in the second request
+    let second_input = requests[1].input();
+
+    // The second request should NOT contain the reasoning item (already on server)
+    let reasoning_items: Vec<_> = second_input
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+        .collect();
+    assert!(
+        reasoning_items.is_empty(),
+        "second request should NOT contain reasoning items (already stored on server), but found: {reasoning_items:?}"
+    );
+
+    // The second request should NOT contain the function_call (already on server)
+    let function_call_items: Vec<_> = second_input
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+        .collect();
+    assert!(
+        function_call_items.is_empty(),
+        "second request should NOT contain function_call items (already stored on server), but found: {function_call_items:?}"
+    );
+
+    // The second request SHOULD contain the function_call_output (new item)
+    let output_items: Vec<_> = second_input
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call_output"))
+        .collect();
+    assert!(
+        !output_items.is_empty(),
+        "second request should contain function_call_output item"
+    );
+    assert_eq!(
+        output_items[0].get("call_id").and_then(|v| v.as_str()),
+        Some(call_id),
+        "function_call_output should have correct call_id"
     );
 }

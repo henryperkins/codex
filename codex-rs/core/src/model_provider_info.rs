@@ -167,21 +167,21 @@ impl ModelProviderInfo {
 
         // Detect Azure providers to enable 429 retry with retry-after header support
         let is_azure = self.is_azure_provider(&base_url);
-        let (retry_429, max_retry_delay) = if is_azure {
-            // Azure providers: enable 429 retry with configurable max delay
-            let max_delay = self
-                .max_retry_delay_ms
-                .map(Duration::from_millis)
-                .or(Some(Duration::from_millis(DEFAULT_AZURE_MAX_RETRY_DELAY_MS)));
-            (true, max_delay)
-        } else {
-            // Non-Azure: use configured max_retry_delay or default cap, but don't retry 429s by default
-            let max_delay = self
-                .max_retry_delay_ms
-                .map(Duration::from_millis)
-                .or(Some(Duration::from_millis(DEFAULT_MAX_RETRY_DELAY_MS)));
-            (false, max_delay)
-        };
+        let (retry_429, max_retry_delay) =
+            if is_azure {
+                // Azure providers: enable 429 retry with configurable max delay
+                let max_delay = self.max_retry_delay_ms.map(Duration::from_millis).or(Some(
+                    Duration::from_millis(DEFAULT_AZURE_MAX_RETRY_DELAY_MS),
+                ));
+                (true, max_delay)
+            } else {
+                // Non-Azure: use configured max_retry_delay or default cap, but don't retry 429s by default
+                let max_delay = self
+                    .max_retry_delay_ms
+                    .map(Duration::from_millis)
+                    .or(Some(Duration::from_millis(DEFAULT_MAX_RETRY_DELAY_MS)));
+                (false, max_delay)
+            };
 
         let retry = ApiRetryConfig {
             max_attempts: self.request_max_retries(),

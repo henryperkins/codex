@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
@@ -7,6 +8,7 @@ use codex_core::ContentItem;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
+use codex_core::ResponseChainState;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WEB_SEARCH_ELIGIBLE_HEADER;
@@ -85,6 +87,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         session_source.clone(),
     );
 
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let mut client_session = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -93,6 +96,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         provider,
         effort,
         summary,
+        response_chain,
         conversation_id,
         session_source,
     )
@@ -182,6 +186,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         session_source.clone(),
     );
 
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let mut client_session = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -190,6 +195,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         provider,
         effort,
         summary,
+        response_chain,
         conversation_id,
         session_source,
     )
@@ -337,6 +343,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         session_source.clone(),
     );
 
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let mut client = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -345,6 +352,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         provider,
         effort,
         summary,
+        response_chain,
         conversation_id,
         session_source,
     )

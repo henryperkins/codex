@@ -6,6 +6,7 @@ use codex_core::ModelClient;
 use codex_core::ModelClientSession;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
+use codex_core::ResponseChainState;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
@@ -23,6 +24,7 @@ use core_test_support::skip_if_no_network;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 const MODEL: &str = "gpt-5.2-codex";
@@ -182,6 +184,7 @@ async fn websocket_harness(server: &WebSocketTestServer) -> WebsocketTestHarness
         "test".to_string(),
         SessionSource::Exec,
     );
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let client = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -190,6 +193,7 @@ async fn websocket_harness(server: &WebSocketTestServer) -> WebsocketTestHarness
         provider.clone(),
         None,
         ReasoningSummary::Auto,
+        response_chain,
         conversation_id,
         SessionSource::Exec,
     );

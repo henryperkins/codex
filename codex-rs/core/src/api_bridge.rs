@@ -20,6 +20,7 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+        ApiError::PreviousResponseChainBroken { message } => CodexErr::InvalidRequest(message),
         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
         ApiError::Stream(msg) => CodexErr::Stream(msg, None),
         ApiError::Api { status, message } => CodexErr::UnexpectedStatus(UnexpectedResponseError {

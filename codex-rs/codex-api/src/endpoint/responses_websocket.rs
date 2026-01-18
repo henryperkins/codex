@@ -167,18 +167,19 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
                 .body()
                 .as_ref()
                 .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
-            ApiError::Transport(TransportError::Http {
+            TransportError::Http {
                 status,
                 url: Some(url.to_string()),
                 headers: Some(headers),
                 body,
-            })
+            }
+            .into()
         }
         WsError::ConnectionClosed | WsError::AlreadyClosed => {
             ApiError::Stream("websocket closed".to_string())
         }
-        WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
-        other => ApiError::Transport(TransportError::Network(other.to_string())),
+        WsError::Io(err) => TransportError::Network(err.to_string()).into(),
+        other => TransportError::Network(other.to_string()).into(),
     }
 }
 

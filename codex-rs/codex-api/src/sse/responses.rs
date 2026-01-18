@@ -86,6 +86,7 @@ struct Error {
     r#type: Option<String>,
     code: Option<String>,
     message: Option<String>,
+    param: Option<String>,
     plan_type: Option<String>,
     resets_at: Option<i64>,
 }
@@ -825,6 +826,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5.1 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
         };
@@ -839,6 +841,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5.1 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
         };
@@ -852,6 +855,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit exceeded. Try again in 35 seconds.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
         };

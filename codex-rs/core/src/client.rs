@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use crate::api_bridge::CoreAuthProvider;
@@ -69,6 +70,21 @@ use crate::tools::spec::create_tools_json_for_responses_api;
 pub const WEB_SEARCH_ELIGIBLE_HEADER: &str = "x-oai-web-search-eligible";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
+#[derive(Debug, Default)]
+pub struct ResponseChainState {
+    last_response_id: Option<String>,
+    /// Number of items from the history that are already on the server
+    /// (either sent in a previous request or part of the model's response).
+    last_known_item_count: usize,
+}
+
+impl ResponseChainState {
+    pub(crate) fn clear(&mut self) {
+        self.last_response_id = None;
+        self.last_known_item_count = 0;
+    }
+}
+
 #[derive(Debug)]
 struct ModelClientState {
     config: Arc<Config>,
@@ -80,6 +96,7 @@ struct ModelClientState {
     effort: Option<ReasoningEffortConfig>,
     summary: ReasoningSummaryConfig,
     session_source: SessionSource,
+    response_chain: Arc<Mutex<ResponseChainState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +119,7 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    response_chain: Arc<Mutex<ResponseChainState>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,6 +132,7 @@ impl ModelClient {
         provider: ModelProviderInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
+        response_chain: Arc<Mutex<ResponseChainState>>,
         conversation_id: ThreadId,
         session_source: SessionSource,
     ) -> Self {
@@ -128,6 +147,7 @@ impl ModelClient {
                 effort,
                 summary,
                 session_source,
+                response_chain,
             }),
         }
     }
@@ -138,6 +158,7 @@ impl ModelClient {
             connection: None,
             websocket_last_items: Vec::new(),
             turn_state: Arc::new(OnceLock::new()),
+            response_chain: Arc::clone(&self.state.response_chain),
         }
     }
 }
@@ -275,6 +296,77 @@ impl ModelClientSession {
         }
     }
 
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    pub fn set_last_response_id(&mut self, id: String) {
+        let mut chain = self.response_chain.lock().expect("lock poisoned");
+        if id.is_empty() {
+            chain.clear();
+        } else {
+            chain.last_response_id = Some(id);
+        }
+    }
+
+    /// Updates the chain state to record that the server now has `item_count` items
+    /// in its stored response. This is called after a response completes so that
+    /// subsequent requests only send new items.
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    pub fn sync_chain_state_with_history(&mut self, item_count: usize) {
+        if !self.supports_previous_response_id() {
+            return;
+        }
+        let mut chain = self.response_chain.lock().expect("lock poisoned");
+        if chain.last_response_id.is_some() {
+            chain.last_known_item_count = item_count;
+        }
+    }
+
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    fn select_request_input(&self, full_input: &[ResponseItem]) -> (bool, Vec<ResponseItem>) {
+        if !self.supports_previous_response_id() {
+            return (false, full_input.to_vec());
+        }
+
+        let mut chain = self.response_chain.lock().expect("lock poisoned");
+
+        if chain.last_response_id.is_none() {
+            return (false, full_input.to_vec());
+        }
+
+        let known_count = chain.last_known_item_count;
+        if known_count == 0 {
+            chain.clear();
+            return (false, full_input.to_vec());
+        }
+
+        // If full_input has fewer items than what we've sent, the history was
+        // modified (e.g., compaction) - chain is broken.
+        if full_input.len() < known_count {
+            chain.clear();
+            return (false, full_input.to_vec());
+        }
+
+        // If we have the same count, there's nothing new to send, but we still
+        // need to make a request. Send full history without chaining.
+        if full_input.len() == known_count {
+            return (false, full_input.to_vec());
+        }
+
+        // Send only the NEW items (after the known count)
+        (true, full_input[known_count..].to_vec())
+    }
+
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    fn mark_request_successful(&mut self, item_count: usize) {
+        let mut chain = self.response_chain.lock().expect("lock poisoned");
+        chain.last_known_item_count = item_count;
+    }
+
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    fn invalidate_response_chain(&mut self) {
+        let mut chain = self.response_chain.lock().expect("lock poisoned");
+        chain.clear();
+    }
+
     fn build_responses_request(&self, prompt: &Prompt) -> Result<ApiPrompt> {
         let model_info = self.state.model_info.clone();
         let instructions = prompt.get_full_instructions(&model_info).into_owned();
@@ -282,6 +374,7 @@ impl ModelClientSession {
         Ok(build_api_prompt(prompt, instructions, tools_json))
     }
 
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     fn build_responses_options(
         &self,
         prompt: &Prompt,
@@ -326,6 +419,12 @@ impl ModelClientSession {
 
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let conversation_id = self.state.conversation_id.to_string();
+        let previous_response_id = if self.supports_previous_response_id() {
+            let chain = self.response_chain.lock().expect("lock poisoned");
+            chain.last_response_id.clone()
+        } else {
+            None
+        };
 
         ApiResponsesOptions {
             reasoning,
@@ -335,6 +434,7 @@ impl ModelClientSession {
             store_override: None,
             conversation_id: Some(conversation_id),
             session_source: Some(self.state.session_source.clone()),
+            previous_response_id,
             extra_headers: build_responses_headers(&self.state.config, Some(&self.turn_state)),
             compression,
             turn_state: Some(Arc::clone(&self.turn_state)),
@@ -360,8 +460,9 @@ impl ModelClientSession {
         &self,
         api_prompt: &ApiPrompt,
         options: &ApiResponsesOptions,
+        use_chain: bool,
     ) -> ResponsesWsRequest {
-        if let Some(append_items) = self.get_incremental_items(&api_prompt.input) {
+        if !use_chain && let Some(append_items) = self.get_incremental_items(&api_prompt.input) {
             return ResponsesWsRequest::ResponseAppend(ResponseAppendWsRequest {
                 input: append_items,
             });
@@ -373,6 +474,7 @@ impl ModelClientSession {
             prompt_cache_key,
             text,
             store_override,
+            previous_response_id,
             ..
         } = options;
 
@@ -390,6 +492,7 @@ impl ModelClientSession {
             include: include.clone(),
             prompt_cache_key: prompt_cache_key.clone(),
             text: text.clone(),
+            previous_response_id: previous_response_id.clone(),
         };
 
         ResponsesWsRequest::ResponseCreate(payload)
@@ -407,6 +510,7 @@ impl ModelClientSession {
         };
 
         if needs_new {
+            self.invalidate_response_chain();
             let mut headers = options.extra_headers.clone();
             headers.extend(build_conversation_headers(options.conversation_id.clone()));
             let new_conn: ApiWebSocketConnection =
@@ -499,7 +603,7 @@ impl ModelClientSession {
     ///
     /// Handles SSE fixtures, reasoning summaries, verbosity, and the
     /// `text` controls used for output schemas.
-    async fn stream_responses_api(&self, prompt: &Prompt) -> Result<ResponseStream> {
+    async fn stream_responses_api(&mut self, prompt: &Prompt) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
             let stream =
@@ -510,6 +614,8 @@ impl ModelClientSession {
 
         let auth_manager = self.state.auth_manager.clone();
         let api_prompt = self.build_responses_request(prompt)?;
+        let full_input = api_prompt.input.clone();
+        let (mut use_chain, mut request_input) = self.select_request_input(&full_input);
 
         let mut auth_recovery = auth_manager
             .as_ref()
@@ -531,15 +637,34 @@ impl ModelClientSession {
             let client = ApiResponsesClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
 
-            let options = self.build_responses_options(prompt, compression);
+            let api_prompt_to_send = ApiPrompt {
+                input: request_input.clone(),
+                ..api_prompt.clone()
+            };
+
+            let mut options = self.build_responses_options(prompt, compression);
+            if !use_chain {
+                options.previous_response_id = None;
+            }
 
             let stream_result = client
-                .stream_prompt(&self.state.model_info.slug, &api_prompt, options)
+                .stream_prompt(&self.state.model_info.slug, &api_prompt_to_send, options)
                 .await;
 
             match stream_result {
                 Ok(stream) => {
+                    self.mark_request_successful(full_input.len());
                     return Ok(map_response_stream(stream, self.state.otel_manager.clone()));
+                }
+                Err(ApiError::PreviousResponseChainBroken { message }) if use_chain => {
+                    warn!(
+                        message,
+                        "previous_response_id chain broken, retrying with full history"
+                    );
+                    self.invalidate_response_chain();
+                    use_chain = false;
+                    request_input = full_input.clone();
+                    continue;
                 }
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UNAUTHORIZED =>
@@ -556,6 +681,8 @@ impl ModelClientSession {
     async fn stream_responses_websocket(&mut self, prompt: &Prompt) -> Result<ResponseStream> {
         let auth_manager = self.state.auth_manager.clone();
         let api_prompt = self.build_responses_request(prompt)?;
+        let full_input = api_prompt.input.clone();
+        let (mut use_chain, mut request_input) = self.select_request_input(&full_input);
 
         let mut auth_recovery = auth_manager
             .as_ref()
@@ -572,8 +699,16 @@ impl ModelClientSession {
             let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
             let compression = self.responses_request_compression(auth.as_ref());
 
-            let options = self.build_responses_options(prompt, compression);
-            let request = self.prepare_websocket_request(&api_prompt, &options);
+            let api_prompt_to_send = ApiPrompt {
+                input: request_input.clone(),
+                ..api_prompt.clone()
+            };
+
+            let mut options = self.build_responses_options(prompt, compression);
+            if !use_chain {
+                options.previous_response_id = None;
+            }
+            let request = self.prepare_websocket_request(&api_prompt_to_send, &options, use_chain);
 
             let connection = match self
                 .websocket_connection(api_provider.clone(), api_auth.clone(), &options)
@@ -589,16 +724,25 @@ impl ModelClientSession {
                 Err(err) => return Err(map_api_error(err)),
             };
 
-            let stream_result = connection
-                .stream_request(request)
-                .await
-                .map_err(map_api_error)?;
-            self.websocket_last_items = api_prompt.input.clone();
-
-            return Ok(map_response_stream(
-                stream_result,
-                self.state.otel_manager.clone(),
-            ));
+            let stream_result = connection.stream_request(request).await;
+            match stream_result {
+                Ok(stream) => {
+                    self.websocket_last_items = full_input.clone();
+                    self.mark_request_successful(full_input.len());
+                    return Ok(map_response_stream(stream, self.state.otel_manager.clone()));
+                }
+                Err(ApiError::PreviousResponseChainBroken { message }) if use_chain => {
+                    warn!(
+                        message,
+                        "previous_response_id chain broken, retrying with full history"
+                    );
+                    self.invalidate_response_chain();
+                    use_chain = false;
+                    request_input = full_input.clone();
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
         }
     }
 
@@ -608,6 +752,30 @@ impl ModelClientSession {
         let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
         let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
         (request_telemetry, sse_telemetry)
+    }
+
+    fn supports_previous_response_id(&self) -> bool {
+        if !matches!(
+            self.state.provider.wire_api,
+            WireApi::Responses | WireApi::ResponsesWebsocket
+        ) {
+            return false;
+        }
+
+        if self.state.provider.name.eq_ignore_ascii_case("azure") {
+            return true;
+        }
+
+        let Some(base_url) = &self.state.provider.base_url else {
+            return false;
+        };
+        let base = base_url.to_ascii_lowercase();
+        base.contains("openai.azure.")
+            || base.contains("cognitiveservices.azure.")
+            || base.contains("aoai.azure.")
+            || base.contains("azure-api.")
+            || base.contains("azurefd.")
+            || base.contains("windows.net/openai")
     }
 }
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -81,6 +82,7 @@ use crate::ModelProviderInfo;
 use crate::WireApi;
 use crate::client::ModelClient;
 use crate::client::ModelClientSession;
+use crate::client::ResponseChainState;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::compact::collect_user_messages;
@@ -378,6 +380,7 @@ pub(crate) struct Session {
     tx_event: Sender<Event>,
     agent_status: watch::Sender<AgentStatus>,
     state: Mutex<SessionState>,
+    response_chain: Arc<StdMutex<ResponseChainState>>,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     features: Features,
@@ -518,6 +521,7 @@ impl Session {
         session_configuration: &SessionConfiguration,
         per_turn_config: Config,
         model_info: ModelInfo,
+        response_chain: Arc<StdMutex<ResponseChainState>>,
         conversation_id: ThreadId,
         sub_id: String,
     ) -> TurnContext {
@@ -535,6 +539,7 @@ impl Session {
             provider,
             session_configuration.collaboration_mode.reasoning_effort(),
             session_configuration.model_reasoning_summary,
+            response_chain,
             conversation_id,
             session_configuration.session_source.clone(),
         );
@@ -697,6 +702,7 @@ impl Session {
                     .map(Arc::new);
         }
         let state = SessionState::new(session_configuration.clone());
+        let response_chain = Arc::new(StdMutex::new(ResponseChainState::default()));
 
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
@@ -720,6 +726,7 @@ impl Session {
             tx_event: tx_event.clone(),
             agent_status,
             state: Mutex::new(state),
+            response_chain: Arc::clone(&response_chain),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
             active_turn: Mutex::new(None),
@@ -989,6 +996,7 @@ impl Session {
             &session_configuration,
             per_turn_config,
             model_info,
+            Arc::clone(&self.response_chain),
             self.conversation_id,
             sub_id,
         );
@@ -1402,9 +1410,18 @@ impl Session {
         self.record_conversation_items(ctx, &[item]).await;
     }
 
+    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    pub(crate) fn invalidate_response_chain(&self) {
+        let mut chain = self.response_chain.lock().expect("lock poisoned");
+        chain.clear();
+    }
+
     pub(crate) async fn replace_history(&self, items: Vec<ResponseItem>) {
-        let mut state = self.state.lock().await;
-        state.replace_history(items);
+        {
+            let mut state = self.state.lock().await;
+            state.replace_history(items);
+        }
+        self.invalidate_response_chain();
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -2567,6 +2584,7 @@ async fn spawn_review_thread(
         provider,
         per_turn_config.model_reasoning_effort,
         per_turn_config.model_reasoning_summary,
+        Arc::clone(&sess.response_chain),
         sess.conversation_id,
         parent_turn_context.client.get_session_source(),
     );
@@ -3089,9 +3107,14 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::Completed {
-                response_id: _,
+                response_id,
                 token_usage,
             } => {
+                client_session.set_last_response_id(response_id);
+                // Sync chain state with the count of items in the history (including model
+                // output items) so that the next request only sends truly new items.
+                let full_history = sess.clone_history().await.for_prompt();
+                client_session.sync_chain_state_with_history(full_history.len());
                 sess.update_token_usage_info(&turn_context, token_usage.as_ref())
                     .await;
                 should_emit_turn_diff = true;
@@ -3891,6 +3914,7 @@ mod tests {
             agent_control,
         };
 
+        let response_chain = Arc::new(StdMutex::new(ResponseChainState::default()));
         let turn_context = Session::make_turn_context(
             Some(Arc::clone(&auth_manager)),
             &otel_manager,
@@ -3898,6 +3922,7 @@ mod tests {
             &session_configuration,
             per_turn_config,
             model_info,
+            Arc::clone(&response_chain),
             conversation_id,
             "turn_id".to_string(),
         );
@@ -3907,6 +3932,7 @@ mod tests {
             tx_event,
             agent_status: agent_status_tx,
             state: Mutex::new(state),
+            response_chain,
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
             active_turn: Mutex::new(None),
@@ -3991,6 +4017,7 @@ mod tests {
             agent_control,
         };
 
+        let response_chain = Arc::new(StdMutex::new(ResponseChainState::default()));
         let turn_context = Arc::new(Session::make_turn_context(
             Some(Arc::clone(&auth_manager)),
             &otel_manager,
@@ -3998,6 +4025,7 @@ mod tests {
             &session_configuration,
             per_turn_config,
             model_info,
+            Arc::clone(&response_chain),
             conversation_id,
             "turn_id".to_string(),
         ));
@@ -4007,6 +4035,7 @@ mod tests {
             tx_event,
             agent_status: agent_status_tx,
             state: Mutex::new(state),
+            response_chain,
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
             active_turn: Mutex::new(None),
