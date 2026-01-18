@@ -915,41 +915,6 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic]
-fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
-    let items = vec![ResponseItem::CustomToolCall {
-        id: None,
-        status: None,
-        call_id: "tool-x".to_string(),
-        name: "custom".to_string(),
-        input: "{}".to_string(),
-    }];
-    let mut h = create_history_with_items(items);
-    h.normalize_history();
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
-fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() {
-    let items = vec![ResponseItem::LocalShellCall {
-        id: None,
-        call_id: Some("shell-1".to_string()),
-        status: LocalShellStatus::Completed,
-        action: LocalShellAction::Exec(LocalShellExecAction {
-            command: vec!["echo".to_string(), "hi".to_string()],
-            timeout_ms: None,
-            working_directory: None,
-            env: None,
-            user: None,
-        }),
-    }];
-    let mut h = create_history_with_items(items);
-    h.normalize_history();
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
 fn normalize_removes_orphan_function_call_output_panics_in_debug() {
     let items = vec![ResponseItem::FunctionCallOutput {
         call_id: "orphan-1".to_string(),

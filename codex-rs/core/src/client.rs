@@ -478,7 +478,10 @@ impl ModelClientSession {
             ..
         } = options;
 
-        let store = store_override.unwrap_or(false);
+        // For Azure endpoints, default store=true to enable server-side conversation
+        // state and response chaining via previous_response_id. This matches the
+        // SSE path behavior in codex-api's ResponsesRequestBuilder.
+        let store = store_override.unwrap_or_else(|| self.is_azure_endpoint());
         let payload = ResponseCreateWsRequest {
             model: self.state.model_info.slug.clone(),
             instructions: api_prompt.instructions.clone(),
@@ -762,6 +765,16 @@ impl ModelClientSession {
             return false;
         }
 
+        self.is_azure_endpoint()
+    }
+
+    /// Detects if this provider is an Azure Responses API endpoint.
+    ///
+    /// Azure endpoints require special handling for response chaining:
+    /// - `store=true` by default to enable server-side conversation state
+    /// - Item IDs attached to response items for tracking
+    /// - `previous_response_id` for response chaining
+    fn is_azure_endpoint(&self) -> bool {
         if self.state.provider.name.eq_ignore_ascii_case("azure") {
             return true;
         }

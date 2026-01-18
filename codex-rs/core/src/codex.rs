@@ -25,6 +25,7 @@ use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::stream_events_utils::HandleOutputCtx;
+use crate::stream_events_utils::InFlightFuture;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::terminal;
@@ -52,7 +53,6 @@ use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
-use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use mcp_types::CallToolResult;
@@ -167,6 +167,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -2952,18 +2953,38 @@ struct SamplingRequestResult {
 }
 
 async fn drain_in_flight(
-    in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
+    in_flight: &mut FuturesOrdered<InFlightFuture<'static>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
-        match res {
+        match res.result {
             Ok(response_input) => {
                 sess.record_conversation_items(&turn_context, &[response_input.into()])
                     .await;
             }
             Err(err) => {
-                error_or_panic(format!("in-flight tool future failed during drain: {err}"));
+                tracing::error!(
+                    "in-flight tool future failed during drain for {} ({}): {err}",
+                    res.tool_name,
+                    res.call_id
+                );
+                let response_item = if res.outputs_custom {
+                    ResponseItem::CustomToolCallOutput {
+                        call_id: res.call_id,
+                        output: "aborted".to_string(),
+                    }
+                } else {
+                    ResponseItem::FunctionCallOutput {
+                        call_id: res.call_id,
+                        output: FunctionCallOutputPayload {
+                            content: "aborted".to_string(),
+                            ..Default::default()
+                        },
+                    }
+                };
+                sess.record_conversation_items(&turn_context, &[response_item])
+                    .await;
             }
         }
     }
@@ -3023,8 +3044,7 @@ async fn try_run_sampling_request(
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
-        FuturesOrdered::new();
+    let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
@@ -3261,6 +3281,8 @@ mod tests {
     use crate::exec::ExecToolCallOutput;
     use crate::function_tool::FunctionCallError;
     use crate::shell::default_user_shell;
+    use crate::stream_events_utils::InFlightFuture;
+    use crate::stream_events_utils::InFlightToolResult;
     use crate::tools::format_exec_output_str;
 
     use codex_protocol::models::FunctionCallOutputPayload;
@@ -4320,6 +4342,60 @@ mod tests {
             }
             other => panic!("expected FunctionCallError::Fatal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_records_aborted_output_on_error() {
+        let (session, turn_context) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+
+        let call_id = "call-1".to_string();
+        let call_id_for_future = call_id.clone();
+        let call_id_for_expected = call_id.clone();
+
+        let call_item = ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+            call_id,
+        };
+
+        session
+            .record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&call_item))
+            .await;
+
+        let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
+        let tool_future: InFlightFuture<'static> = Box::pin(async move {
+            InFlightToolResult {
+                call_id: call_id_for_future,
+                tool_name: "shell".to_string(),
+                outputs_custom: false,
+                result: Err(CodexErr::Fatal("boom".to_string())),
+            }
+        });
+        in_flight.push_back(tool_future);
+
+        drain_in_flight(
+            &mut in_flight,
+            Arc::clone(&session),
+            Arc::clone(&turn_context),
+        )
+        .await
+        .expect("drain in-flight");
+
+        let history = session.clone_history().await;
+        let expected = vec![
+            call_item,
+            ResponseItem::FunctionCallOutput {
+                call_id: call_id_for_expected,
+                output: FunctionCallOutputPayload {
+                    content: "aborted".to_string(),
+                    ..Default::default()
+                },
+            },
+        ];
+        assert_eq!(history.raw_items(), expected.as_slice());
     }
 
     async fn sample_rollout(

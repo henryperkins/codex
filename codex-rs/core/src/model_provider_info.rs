@@ -323,6 +323,13 @@ impl ModelProviderInfo {
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
+
+    pub fn is_azure(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .map(|base_url| self.is_azure_provider(base_url))
+            .unwrap_or_else(|| self.name.eq_ignore_ascii_case("azure"))
+    }
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;

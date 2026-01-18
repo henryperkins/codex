@@ -66,6 +66,13 @@ impl ApiError {
             || (msg_lower.contains("previous") && msg_lower.contains("not found"))
             || (param.starts_with("input") && msg_lower.contains("not found"))
             || (param == "input" && msg_lower.contains("duplicate item"))
+            // Catch "No tool output found for custom tool call" errors which indicate
+            // the server is expecting tool outputs from a previous response in the chain.
+            || (param == "input" && msg_lower.contains("no tool output found"))
+            // Catch Azure Responses API "Function call output is missing for call id" errors
+            // which occur when previous_response_id references a response with pending tool
+            // calls but the continuation request doesn't include the required tool outputs.
+            || (param == "input" && msg_lower.contains("output is missing"))
         {
             return Some(ApiError::PreviousResponseChainBroken {
                 message: error.message.unwrap_or_default(),
@@ -132,5 +139,27 @@ mod tests {
             panic!("expected PreviousResponseChainBroken");
         };
         assert!(message.contains("Duplicate item found"));
+    }
+
+    #[test]
+    fn detects_missing_tool_output_error() {
+        let body = r#"{"error":{"message":"No tool output found for custom tool call call_fkAS1VFErJlgn1HWNhgd4VPH.","type":"invalid_request_error","param":"input","code":null}}"#;
+        let result = ApiError::from_bad_request_body(body).expect("chain error");
+        let ApiError::PreviousResponseChainBroken { message } = result else {
+            panic!("expected PreviousResponseChainBroken");
+        };
+        assert!(message.contains("No tool output found"));
+    }
+
+    #[test]
+    fn detects_function_call_output_missing_error() {
+        // Azure Responses API returns this format when previous_response_id references
+        // a response with pending tool calls but no tool outputs are provided.
+        let body = r#"{"error":{"message":"Function call output is missing for call id call-ABC123.","type":"invalid_request_error","param":"input","code":null}}"#;
+        let result = ApiError::from_bad_request_body(body).expect("chain error");
+        let ApiError::PreviousResponseChainBroken { message } = result else {
+            panic!("expected PreviousResponseChainBroken");
+        };
+        assert!(message.contains("output is missing"));
     }
 }

@@ -186,6 +186,7 @@ impl ModelsManager {
     ) -> CoreResult<()> {
         if !config.features.enabled(Feature::RemoteModels)
             || self.auth_manager.get_auth_mode() == Some(AuthMode::ApiKey)
+            || config.model_provider.is_azure()
         {
             return Ok(());
         }
@@ -201,19 +202,21 @@ impl ModelsManager {
                 if self.try_load_cache().await {
                     return Ok(());
                 }
-                self.fetch_and_update_models().await
+                self.fetch_and_update_models(config).await
             }
             RefreshStrategy::Online => {
                 // Always fetch from network
-                self.fetch_and_update_models().await
+                self.fetch_and_update_models(config).await
             }
         }
     }
 
-    async fn fetch_and_update_models(&self) -> CoreResult<()> {
+    async fn fetch_and_update_models(&self, config: &Config) -> CoreResult<()> {
         let auth = self.auth_manager.auth().await;
-        let api_provider = self.provider.to_api_provider(Some(AuthMode::ChatGPT))?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
+        let api_provider = config
+            .model_provider
+            .to_api_provider(Some(AuthMode::ChatGPT))?;
+        let api_auth = auth_provider_from_auth(auth.clone(), &config.model_provider)?;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let client = ModelsClient::new(transport, api_provider, api_auth);
 
@@ -437,6 +440,8 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
+        config.model_provider_id = "mock".to_string();
+        config.model_provider = provider.clone();
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
 
@@ -499,6 +504,8 @@ mod tests {
             AuthCredentialsStoreMode::File,
         ));
         let provider = provider_for(server.uri());
+        config.model_provider_id = "mock".to_string();
+        config.model_provider = provider.clone();
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
 
@@ -554,6 +561,8 @@ mod tests {
             AuthCredentialsStoreMode::File,
         ));
         let provider = provider_for(server.uri());
+        config.model_provider_id = "mock".to_string();
+        config.model_provider = provider.clone();
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
 
@@ -624,6 +633,8 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
+        config.model_provider_id = "mock".to_string();
+        config.model_provider = provider.clone();
         let mut manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
         manager.cache_manager.set_ttl(Duration::ZERO);
