@@ -1,3 +1,4 @@
+use crate::azure::attach_item_ids_to_json;
 use crate::error::ApiError;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
@@ -172,6 +173,27 @@ pub enum ResponsesWsRequest {
     ResponseCreate(ResponseCreateWsRequest),
     #[serde(rename = "response.append")]
     ResponseAppend(ResponseAppendWsRequest),
+}
+
+impl ResponsesWsRequest {
+    /// Serializes the request to JSON, optionally injecting item IDs for Azure.
+    ///
+    /// For Azure endpoints, the `ResponseItem` struct has `skip_serializing` on ID
+    /// fields, so we need to patch them into the JSON after serialization.
+    pub fn to_json_value(&self, inject_azure_ids: bool) -> Result<Value, ApiError> {
+        let mut json = serde_json::to_value(self)
+            .map_err(|e| ApiError::Stream(format!("failed to encode websocket request: {e}")))?;
+
+        if inject_azure_ids {
+            let original_items = match self {
+                ResponsesWsRequest::ResponseCreate(req) => &req.input,
+                ResponsesWsRequest::ResponseAppend(req) => &req.input,
+            };
+            attach_item_ids_to_json(&mut json, original_items);
+        }
+
+        Ok(json)
+    }
 }
 
 pub fn create_text_param_for_request(

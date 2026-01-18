@@ -1,5 +1,6 @@
 use crate::auth::AuthProvider;
 use crate::auth::add_auth_headers;
+use crate::auth::is_azure_endpoint;
 use crate::common::CompactionInput;
 use crate::error::ApiError;
 use crate::provider::Provider;
@@ -51,11 +52,12 @@ impl<T: HttpTransport, A: AuthProvider> CompactClient<T, A> {
         extra_headers: HeaderMap,
     ) -> Result<Vec<ResponseItem>, ApiError> {
         let path = self.path()?;
+        let is_azure = is_azure_endpoint(&self.provider.name, &self.provider.base_url);
         let builder = || {
             let mut req = self.provider.build_request(Method::POST, path);
             req.headers.extend(extra_headers.clone());
             req.body = Some(body.clone());
-            add_auth_headers(&self.auth, req)
+            add_auth_headers(&self.auth, req, is_azure)
         };
 
         let resp = run_with_request_telemetry(

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod azure;
 pub mod common;
 pub mod endpoint;
 pub mod error;
@@ -14,6 +15,8 @@ pub use codex_client::ReqwestTransport;
 pub use codex_client::TransportError;
 
 pub use crate::auth::AuthProvider;
+pub use crate::azure::attach_item_ids_to_json;
+pub use crate::azure::is_azure_base_url;
 pub use crate::common::CompactionInput;
 pub use crate::common::Prompt;
 pub use crate::common::ResponseAppendWsRequest;

@@ -1,4 +1,5 @@
 use crate::auth::AuthProvider;
+use crate::auth::is_azure_endpoint;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::ResponsesWsRequest;
@@ -51,14 +52,13 @@ impl ResponsesWebsocketConnection {
     pub async fn stream_request(
         &self,
         request: ResponsesWsRequest,
+        inject_azure_ids: bool,
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let stream = Arc::clone(&self.stream);
         let idle_timeout = self.idle_timeout;
-        let request_body = serde_json::to_value(&request).map_err(|err| {
-            ApiError::Stream(format!("failed to encode websocket request: {err}"))
-        })?;
+        let request_body = request.to_json_value(inject_azure_ids)?;
 
         tokio::spawn(async move {
             let mut guard = stream.lock().await;
@@ -107,9 +107,10 @@ impl<A: AuthProvider> ResponsesWebsocketClient<A> {
         let ws_url = Url::parse(&self.provider.url_for_path("responses"))
             .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
 
+        let is_azure = is_azure_endpoint(&self.provider.name, &self.provider.base_url);
         let mut headers = self.provider.headers.clone();
         headers.extend(extra_headers);
-        apply_auth_headers(&mut headers, &self.auth);
+        apply_auth_headers(&mut headers, &self.auth, is_azure);
 
         let stream = connect_websocket(ws_url, headers, turn_state).await?;
         Ok(ResponsesWebsocketConnection::new(
@@ -119,12 +120,23 @@ impl<A: AuthProvider> ResponsesWebsocketClient<A> {
     }
 }
 
-// TODO (pakrym): share with /auth
-fn apply_auth_headers(headers: &mut HeaderMap, auth: &impl AuthProvider) {
-    if let Some(token) = auth.bearer_token()
-        && let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}"))
-    {
-        let _ = headers.insert(http::header::AUTHORIZATION, header);
+/// Applies authentication headers based on provider type.
+///
+/// For Azure endpoints, the token is sent as `api-key` header.
+/// For other endpoints, it's sent as `Authorization: Bearer <token>`.
+fn apply_auth_headers(headers: &mut HeaderMap, auth: &impl AuthProvider, is_azure: bool) {
+    if let Some(token) = auth.bearer_token() {
+        if is_azure {
+            // Azure OpenAI uses api-key header
+            if let Ok(header) = HeaderValue::from_str(&token) {
+                let _ = headers.insert("api-key", header);
+            }
+        } else {
+            // Standard OpenAI uses Authorization: Bearer
+            if let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                let _ = headers.insert(http::header::AUTHORIZATION, header);
+            }
+        }
     }
     if let Some(account_id) = auth.account_id()
         && let Ok(header) = HeaderValue::from_str(&account_id)

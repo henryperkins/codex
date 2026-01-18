@@ -1,3 +1,4 @@
+use crate::azure::attach_item_ids_to_json;
 use crate::common::Reasoning;
 use crate::common::ResponsesApiRequest;
 use crate::common::TextControls;
@@ -130,7 +131,9 @@ impl<'a> ResponsesRequestBuilder<'a> {
             .store_override
             .unwrap_or_else(|| provider.is_azure_responses_endpoint());
 
-        let previous_response_id = if provider.is_azure_responses_endpoint() {
+        let is_azure = provider.is_azure_responses_endpoint();
+        let has_previous_response_id = self.previous_response_id.is_some();
+        let previous_response_id = if is_azure {
             self.previous_response_id
         } else {
             None
@@ -155,8 +158,11 @@ impl<'a> ResponsesRequestBuilder<'a> {
         let mut body = serde_json::to_value(&req)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
-        if store && provider.is_azure_responses_endpoint() {
-            attach_item_ids(&mut body, input);
+        // Inject Azure IDs when:
+        // 1. store=true AND is_azure (normal case), OR
+        // 2. previous_response_id is set AND is_azure (chaining requires IDs even if store=false)
+        if is_azure && (store || has_previous_response_id) {
+            attach_item_ids_to_json(&mut body, input);
         }
 
         let mut headers = self.headers;
@@ -170,33 +176,6 @@ impl<'a> ResponsesRequestBuilder<'a> {
             headers,
             compression: self.compression,
         })
-    }
-}
-
-fn attach_item_ids(payload_json: &mut Value, original_items: &[ResponseItem]) {
-    let Some(input_value) = payload_json.get_mut("input") else {
-        return;
-    };
-    let Value::Array(items) = input_value else {
-        return;
-    };
-
-    for (value, item) in items.iter_mut().zip(original_items.iter()) {
-        if let ResponseItem::Reasoning { id, .. }
-        | ResponseItem::Message { id: Some(id), .. }
-        | ResponseItem::WebSearchCall { id: Some(id), .. }
-        | ResponseItem::FunctionCall { id: Some(id), .. }
-        | ResponseItem::LocalShellCall { id: Some(id), .. }
-        | ResponseItem::CustomToolCall { id: Some(id), .. } = item
-        {
-            if id.is_empty() {
-                continue;
-            }
-
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id.clone()));
-            }
-        }
     }
 }
 

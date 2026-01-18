@@ -1,5 +1,6 @@
 use crate::auth::AuthProvider;
 use crate::auth::add_auth_headers;
+use crate::auth::is_azure_endpoint;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::telemetry::run_with_request_telemetry;
@@ -43,6 +44,7 @@ impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
         client_version: &str,
         extra_headers: HeaderMap,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
+        let is_azure = is_azure_endpoint(&self.provider.name, &self.provider.base_url);
         let builder = || {
             let mut req = self.provider.build_request(Method::GET, self.path());
             req.headers.extend(extra_headers.clone());
@@ -50,7 +52,7 @@ impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
             let separator = if req.url.contains('?') { '&' } else { '?' };
             req.url = format!("{}{}client_version={client_version}", req.url, separator);
 
-            add_auth_headers(&self.auth, req)
+            add_auth_headers(&self.auth, req, is_azure)
         };
 
         let resp = run_with_request_telemetry(

@@ -7,6 +7,7 @@
 
 use codex_api::Provider as ApiProvider;
 use codex_api::WireApi as ApiWireApi;
+use codex_api::is_azure_base_url;
 use codex_api::provider::RetryConfig as ApiRetryConfig;
 use codex_app_server_protocol::AuthMode;
 use http::HeaderMap;
@@ -218,19 +219,11 @@ impl ModelProviderInfo {
     /// - Provider name being "azure" (case-insensitive), or
     /// - Base URL containing Azure-specific domain patterns
     fn is_azure_provider(&self, base_url: &str) -> bool {
-        // Check provider name
         if self.name.eq_ignore_ascii_case("azure") {
             return true;
         }
 
-        // Check base URL for Azure markers
-        let base_lower = base_url.to_ascii_lowercase();
-        base_lower.contains("openai.azure.")
-            || base_lower.contains("cognitiveservices.azure.")
-            || base_lower.contains("aoai.azure.")
-            || base_lower.contains("azure-api.")
-            || base_lower.contains("azurefd.")
-            || base_lower.contains("windows.net/openai")
+        is_azure_base_url(base_url)
     }
 
     /// If `env_key` is Some, returns the API key for this provider if present

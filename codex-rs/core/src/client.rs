@@ -27,6 +27,7 @@ use codex_api::common::Reasoning;
 use codex_api::common::ResponsesWsRequest;
 use codex_api::create_text_param_for_request;
 use codex_api::error::ApiError;
+use codex_api::is_azure_base_url;
 use codex_api::requests::responses::Compression;
 use codex_app_server_protocol::AuthMode;
 use codex_otel::OtelManager;
@@ -461,11 +462,14 @@ impl ModelClientSession {
         api_prompt: &ApiPrompt,
         options: &ApiResponsesOptions,
         use_chain: bool,
-    ) -> ResponsesWsRequest {
+    ) -> (ResponsesWsRequest, bool) {
+        let is_azure = self.is_azure_endpoint();
+
         if !use_chain && let Some(append_items) = self.get_incremental_items(&api_prompt.input) {
-            return ResponsesWsRequest::ResponseAppend(ResponseAppendWsRequest {
+            let request = ResponsesWsRequest::ResponseAppend(ResponseAppendWsRequest {
                 input: append_items,
             });
+            return (request, is_azure);
         }
 
         let ApiResponsesOptions {
@@ -481,7 +485,13 @@ impl ModelClientSession {
         // For Azure endpoints, default store=true to enable server-side conversation
         // state and response chaining via previous_response_id. This matches the
         // SSE path behavior in codex-api's ResponsesRequestBuilder.
-        let store = store_override.unwrap_or_else(|| self.is_azure_endpoint());
+        let store = store_override.unwrap_or(is_azure);
+
+        // Inject Azure IDs when:
+        // 1. store=true AND is_azure (normal case), OR
+        // 2. previous_response_id is set AND is_azure (chaining requires IDs even if store=false)
+        let inject_azure_ids = is_azure && (store || previous_response_id.is_some());
+
         let payload = ResponseCreateWsRequest {
             model: self.state.model_info.slug.clone(),
             instructions: api_prompt.instructions.clone(),
@@ -498,7 +508,10 @@ impl ModelClientSession {
             previous_response_id: previous_response_id.clone(),
         };
 
-        ResponsesWsRequest::ResponseCreate(payload)
+        (
+            ResponsesWsRequest::ResponseCreate(payload),
+            inject_azure_ids,
+        )
     }
 
     async fn websocket_connection(
@@ -711,7 +724,8 @@ impl ModelClientSession {
             if !use_chain {
                 options.previous_response_id = None;
             }
-            let request = self.prepare_websocket_request(&api_prompt_to_send, &options, use_chain);
+            let (request, inject_azure_ids) =
+                self.prepare_websocket_request(&api_prompt_to_send, &options, use_chain);
 
             let connection = match self
                 .websocket_connection(api_provider.clone(), api_auth.clone(), &options)
@@ -727,7 +741,7 @@ impl ModelClientSession {
                 Err(err) => return Err(map_api_error(err)),
             };
 
-            let stream_result = connection.stream_request(request).await;
+            let stream_result = connection.stream_request(request, inject_azure_ids).await;
             match stream_result {
                 Ok(stream) => {
                     self.websocket_last_items = full_input.clone();
@@ -779,16 +793,11 @@ impl ModelClientSession {
             return true;
         }
 
-        let Some(base_url) = &self.state.provider.base_url else {
-            return false;
-        };
-        let base = base_url.to_ascii_lowercase();
-        base.contains("openai.azure.")
-            || base.contains("cognitiveservices.azure.")
-            || base.contains("aoai.azure.")
-            || base.contains("azure-api.")
-            || base.contains("azurefd.")
-            || base.contains("windows.net/openai")
+        self.state
+            .provider
+            .base_url
+            .as_deref()
+            .is_some_and(is_azure_base_url)
     }
 }
 

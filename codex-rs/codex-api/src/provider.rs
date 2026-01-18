@@ -1,3 +1,4 @@
+use crate::azure::is_azure_base_url;
 use codex_client::Request;
 use codex_client::RequestCompression;
 use codex_client::RetryOn;
@@ -63,24 +64,49 @@ pub struct Provider {
 
 impl Provider {
     pub fn url_for_path(&self, path: &str) -> String {
-        let base = self.base_url.trim_end_matches('/');
         let path = path.trim_start_matches('/');
-        let mut url = if path.is_empty() {
-            base.to_string()
+
+        // Split base URL into path and existing query string, if any
+        let (base_path, existing_query) = if let Some(idx) = self.base_url.find('?') {
+            let (p, q) = self.base_url.split_at(idx);
+            (p.trim_end_matches('/'), Some(&q[1..])) // q[1..] to skip the '?'
         } else {
-            format!("{base}/{path}")
+            (self.base_url.trim_end_matches('/'), None)
         };
 
+        // Build the path portion
+        let mut url = if path.is_empty() {
+            base_path.to_string()
+        } else {
+            format!("{base_path}/{path}")
+        };
+
+        // Collect all query params: existing from base URL + explicit query_params
+        let mut all_params: Vec<String> = Vec::new();
+
+        // Include existing query string from base URL (already encoded)
+        if let Some(qs) = existing_query
+            && !qs.is_empty()
+        {
+            all_params.push(qs.to_string());
+        }
+
+        // Add explicit query params (with encoding)
         if let Some(params) = &self.query_params
             && !params.is_empty()
         {
             let qs = params
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
+            all_params.push(qs);
+        }
+
+        // Append combined query string
+        if !all_params.is_empty() {
             url.push('?');
-            url.push_str(&qs);
+            url.push_str(&all_params.join("&"));
         }
 
         url
@@ -106,19 +132,6 @@ impl Provider {
             return true;
         }
 
-        self.base_url.to_ascii_lowercase().contains("openai.azure.")
-            || matches_azure_responses_base_url(&self.base_url)
+        is_azure_base_url(&self.base_url)
     }
-}
-
-fn matches_azure_responses_base_url(base_url: &str) -> bool {
-    const AZURE_MARKERS: [&str; 5] = [
-        "cognitiveservices.azure.",
-        "aoai.azure.",
-        "azure-api.",
-        "azurefd.",
-        "windows.net/openai",
-    ];
-    let base = base_url.to_ascii_lowercase();
-    AZURE_MARKERS.iter().any(|marker| base.contains(marker))
 }

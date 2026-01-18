@@ -1,5 +1,6 @@
 use crate::auth::AuthProvider;
 use crate::auth::add_auth_headers;
+use crate::auth::is_azure_endpoint;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
 use crate::provider::Provider;
@@ -65,6 +66,7 @@ impl<T: HttpTransport, A: AuthProvider> StreamingClient<T, A> {
         spawner: StreamSpawner,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        let is_azure = is_azure_endpoint(&self.provider.name, &self.provider.base_url);
         let builder = || {
             let mut req = self.provider.build_request(Method::POST, path);
             req.headers.extend(extra_headers.clone());
@@ -74,7 +76,7 @@ impl<T: HttpTransport, A: AuthProvider> StreamingClient<T, A> {
             );
             req.body = Some(body.clone());
             req.compression = compression;
-            add_auth_headers(&self.auth, req)
+            add_auth_headers(&self.auth, req, is_azure)
         };
 
         let stream_response = run_with_request_telemetry(
