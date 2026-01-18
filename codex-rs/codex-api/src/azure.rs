@@ -29,7 +29,8 @@ pub fn is_azure_base_url(base_url: &str) -> bool {
     let Ok(url) = url::Url::parse(base_url) else {
         // Fallback for unparseable URLs: check for azure markers in the string
         let base_lower = base_url.to_ascii_lowercase();
-        return base_lower.contains("openai.azure.") || base_lower.contains("cognitiveservices.azure.");
+        return base_lower.contains("openai.azure.")
+            || base_lower.contains("cognitiveservices.azure.");
     };
 
     let Some(host) = url.host_str() else {

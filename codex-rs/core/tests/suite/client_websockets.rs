@@ -216,3 +216,155 @@ async fn stream_until_complete(session: &mut ModelClientSession, prompt: &Prompt
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_websocket_includes_previous_response_id_and_item_ids() {
+    skip_if_no_network!();
+
+    // First connection: initial request
+    let first_connection = vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]];
+
+    // Second connection: follow-up request should include previous_response_id
+    let second_connection = vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]];
+
+    let server = start_websocket_server(vec![first_connection, second_connection]).await;
+
+    // Create Azure provider - use name "azure" for automatic detection
+    let azure_provider = ModelProviderInfo {
+        name: "azure".into(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::ResponsesWebsocket,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        requires_openai_auth: false,
+        max_retry_delay_ms: None,
+    };
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home).await;
+    config.model = Some(MODEL.to_string());
+    let config = Arc::new(config);
+    let model_info = ModelsManager::construct_model_info_offline(MODEL, &config);
+    let conversation_id = ThreadId::new();
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let otel_manager = OtelManager::new(
+        conversation_id,
+        MODEL,
+        model_info.slug.as_str(),
+        None,
+        Some("test@test.com".to_string()),
+        auth_manager.get_auth_mode(),
+        false,
+        "test".to_string(),
+        SessionSource::Exec,
+    );
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
+    let client = ModelClient::new(
+        Arc::clone(&config),
+        None,
+        model_info,
+        otel_manager,
+        azure_provider,
+        None,
+        ReasoningSummary::Auto,
+        response_chain,
+        conversation_id,
+        SessionSource::Exec,
+    );
+
+    let mut session = client.new_session();
+
+    // First request
+    let prompt_one = prompt_with_input(vec![ResponseItem::Message {
+        id: Some("msg-1".into()),
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "hello".into(),
+        }],
+    }]);
+    stream_until_complete(&mut session, &prompt_one).await;
+
+    // Second request
+    let prompt_two = prompt_with_input(vec![
+        ResponseItem::Message {
+            id: Some("msg-1".into()),
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: "hello".into(),
+            }],
+        },
+        ResponseItem::Message {
+            id: Some("msg-2".into()),
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: "world".into(),
+            }],
+        },
+    ]);
+    stream_until_complete(&mut session, &prompt_two).await;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2, "expected 2 WebSocket connections");
+
+    let first_request = &connections[0][0];
+    let first_body = first_request.body_json();
+
+    // First request should NOT have previous_response_id
+    assert!(
+        first_body.get("previous_response_id").is_none(),
+        "first request should not have previous_response_id"
+    );
+
+    // First request should have item IDs attached (Azure-specific)
+    let first_input = first_body
+        .get("input")
+        .expect("input field")
+        .as_array()
+        .expect("input array");
+    assert_eq!(
+        first_input[0].get("id").and_then(|v| v.as_str()),
+        Some("msg-1"),
+        "first request should have item ID attached"
+    );
+
+    // Second request: this will be response.create since it's not a prefix
+    // but it SHOULD have previous_response_id since this is Azure
+    let second_request = &connections[1][0];
+    let second_body = second_request.body_json();
+
+    // For Azure, subsequent requests should include previous_response_id
+    assert_eq!(
+        second_body
+            .get("previous_response_id")
+            .and_then(|v| v.as_str()),
+        Some("resp-1"),
+        "second request should have previous_response_id = resp-1"
+    );
+
+    // Second request should also have item IDs attached
+    let second_input = second_body
+        .get("input")
+        .expect("input field")
+        .as_array()
+        .expect("input array");
+    assert_eq!(second_input.len(), 2, "second request should have 2 items");
+    assert_eq!(
+        second_input[0].get("id").and_then(|v| v.as_str()),
+        Some("msg-1"),
+        "second request should have first item ID"
+    );
+    assert_eq!(
+        second_input[1].get("id").and_then(|v| v.as_str()),
+        Some("msg-2"),
+        "second request should have second item ID"
+    );
+
+    server.shutdown().await;
+}
