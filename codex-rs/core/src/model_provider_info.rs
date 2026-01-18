@@ -7,6 +7,7 @@
 
 use codex_api::Provider as ApiProvider;
 use codex_api::WireApi as ApiWireApi;
+use codex_api::is_azure_base_url;
 use codex_api::provider::RetryConfig as ApiRetryConfig;
 use codex_app_server_protocol::AuthMode;
 use http::HeaderMap;
@@ -27,6 +28,17 @@ const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
 const MAX_STREAM_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `request_max_retries`.
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
+/// Default maximum retry delay for Azure providers (60 seconds).
+///
+/// Azure servers may request arbitrarily long delays via `retry-after` headers.
+/// This caps the delay to prevent excessively long waits, falling back to
+/// exponential backoff if the server requests more.
+const DEFAULT_AZURE_MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Default maximum retry delay for non-Azure providers (120 seconds).
+///
+/// Provides a sane default cap to prevent misbehaving servers from causing
+/// unreasonably long waits, while being more permissive than Azure's default.
+const DEFAULT_MAX_RETRY_DELAY_MS: u64 = 120_000;
 pub const CHAT_WIRE_API_DEPRECATION_SUMMARY: &str = r#"Support for the "chat" wire API is deprecated and will soon be removed. Update your model provider definition in config.toml to use wire_api = "responses"."#;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
@@ -99,6 +111,11 @@ pub struct ModelProviderInfo {
     /// the connection as lost.
     pub stream_idle_timeout_ms: Option<u64>,
 
+    /// Maximum delay (in milliseconds) to wait when server sends retry-after headers.
+    /// If the server requests a longer delay, fall back to exponential backoff.
+    /// For Azure providers, defaults to 60000 (60 seconds) if not specified.
+    pub max_retry_delay_ms: Option<u64>,
+
     /// Does this provider require an OpenAI API Key or ChatGPT login token? If true,
     /// user is presented with login screen on first run, and login preference and token/key
     /// are stored in auth.json. If false (which is the default), login screen is skipped,
@@ -148,12 +165,32 @@ impl ModelProviderInfo {
             .unwrap_or_else(|| default_base_url.to_string());
 
         let headers = self.build_header_map()?;
+
+        // Detect Azure providers to enable 429 retry with retry-after header support
+        let is_azure = self.is_azure_provider(&base_url);
+        let (retry_429, max_retry_delay) =
+            if is_azure {
+                // Azure providers: enable 429 retry with configurable max delay
+                let max_delay = self.max_retry_delay_ms.map(Duration::from_millis).or(Some(
+                    Duration::from_millis(DEFAULT_AZURE_MAX_RETRY_DELAY_MS),
+                ));
+                (true, max_delay)
+            } else {
+                // Non-Azure: use configured max_retry_delay or default cap, but don't retry 429s by default
+                let max_delay = self
+                    .max_retry_delay_ms
+                    .map(Duration::from_millis)
+                    .or(Some(Duration::from_millis(DEFAULT_MAX_RETRY_DELAY_MS)));
+                (false, max_delay)
+            };
+
         let retry = ApiRetryConfig {
             max_attempts: self.request_max_retries(),
             base_delay: Duration::from_millis(200),
-            retry_429: false,
+            retry_429,
             retry_5xx: true,
             retry_transport: true,
+            max_retry_delay,
         };
 
         Ok(ApiProvider {
@@ -169,6 +206,24 @@ impl ModelProviderInfo {
             retry,
             stream_idle_timeout: self.stream_idle_timeout(),
         })
+    }
+
+    /// Detects if this provider is an Azure OpenAI endpoint.
+    ///
+    /// Azure providers get special handling:
+    /// - Automatic retry on HTTP 429 (rate limiting) responses
+    /// - Respect for `retry-after-ms`, `x-ms-retry-after-ms`, and `retry-after` headers
+    /// - Default 60-second maximum retry delay
+    ///
+    /// Detection is based on either:
+    /// - Provider name being "azure" (case-insensitive), or
+    /// - Base URL containing Azure-specific domain patterns
+    fn is_azure_provider(&self, base_url: &str) -> bool {
+        if self.name.eq_ignore_ascii_case("azure") {
+            return true;
+        }
+
+        is_azure_base_url(base_url)
     }
 
     /// If `env_key` is Some, returns the API key for this provider if present
@@ -253,12 +308,20 @@ impl ModelProviderInfo {
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            max_retry_delay_ms: None,
             requires_openai_auth: true,
         }
     }
 
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
+    }
+
+    pub fn is_azure(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .map(|base_url| self.is_azure_provider(base_url))
+            .unwrap_or_else(|| self.name.eq_ignore_ascii_case("azure"))
     }
 }
 
@@ -331,6 +394,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         request_max_retries: None,
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
+        max_retry_delay_ms: None,
         requires_openai_auth: false,
     }
 }
@@ -359,6 +423,7 @@ base_url = "http://localhost:11434/v1"
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            max_retry_delay_ms: None,
             requires_openai_auth: false,
         };
 
@@ -389,6 +454,7 @@ query_params = { api-version = "2025-04-01-preview" }
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            max_retry_delay_ms: None,
             requires_openai_auth: false,
         };
 
@@ -422,6 +488,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            max_retry_delay_ms: None,
             requires_openai_auth: false,
         };
 
@@ -434,10 +501,9 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         let positive_cases = [
             "https://foo.openai.azure.com/openai",
             "https://foo.openai.azure.us/openai/deployments/bar",
+            "https://foo.cognitiveservices.azure.com/openai",
             "https://foo.cognitiveservices.azure.cn/openai",
             "https://foo.aoai.azure.com/openai",
-            "https://foo.openai.azure-api.net/openai",
-            "https://foo.z01.azurefd.net/",
         ];
         for base_url in positive_cases {
             let provider = ModelProviderInfo {
@@ -453,6 +519,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 request_max_retries: None,
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
+                max_retry_delay_ms: None,
                 requires_openai_auth: false,
             };
             let api = provider.to_api_provider(None).expect("api provider");
@@ -475,6 +542,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            max_retry_delay_ms: None,
             requires_openai_auth: false,
         };
         let named_api = named_provider.to_api_provider(None).expect("api provider");
@@ -484,6 +552,10 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             "https://api.openai.com/v1",
             "https://example.com/openai",
             "https://myproxy.azurewebsites.net/openai",
+            // Azure Front Door/CDN/APIM are not automatically detected as Azure
+            // to avoid misclassifying non-Azure proxies on Azure infrastructure
+            "https://foo.openai.azure-api.net/openai",
+            "https://foo.z01.azurefd.net/",
         ];
         for base_url in negative_cases {
             let provider = ModelProviderInfo {
@@ -499,6 +571,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 request_max_retries: None,
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
+                max_retry_delay_ms: None,
                 requires_openai_auth: false,
             };
             let api = provider.to_api_provider(None).expect("api provider");

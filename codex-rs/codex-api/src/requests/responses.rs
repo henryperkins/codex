@@ -1,3 +1,4 @@
+use crate::azure::attach_item_ids_to_json;
 use crate::common::Reasoning;
 use crate::common::ResponsesApiRequest;
 use crate::common::TextControls;
@@ -38,6 +39,7 @@ pub struct ResponsesRequestBuilder<'a> {
     text: Option<TextControls>,
     conversation_id: Option<String>,
     session_source: Option<SessionSource>,
+    previous_response_id: Option<String>,
     store_override: Option<bool>,
     headers: HeaderMap,
     compression: Compression,
@@ -83,6 +85,11 @@ impl<'a> ResponsesRequestBuilder<'a> {
         self
     }
 
+    pub fn previous_response_id(mut self, id: Option<String>) -> Self {
+        self.previous_response_id = id;
+        self
+    }
+
     pub fn conversation(mut self, conversation_id: Option<String>) -> Self {
         self.conversation_id = conversation_id;
         self
@@ -124,6 +131,14 @@ impl<'a> ResponsesRequestBuilder<'a> {
             .store_override
             .unwrap_or_else(|| provider.is_azure_responses_endpoint());
 
+        let is_azure = provider.is_azure_responses_endpoint();
+        let has_previous_response_id = self.previous_response_id.is_some();
+        let previous_response_id = if is_azure {
+            self.previous_response_id
+        } else {
+            None
+        };
+
         let req = ResponsesApiRequest {
             model,
             instructions,
@@ -137,13 +152,17 @@ impl<'a> ResponsesRequestBuilder<'a> {
             include: self.include,
             prompt_cache_key: self.prompt_cache_key,
             text: self.text,
+            previous_response_id,
         };
 
         let mut body = serde_json::to_value(&req)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
-        if store && provider.is_azure_responses_endpoint() {
-            attach_item_ids(&mut body, input);
+        // Inject Azure IDs when:
+        // 1. store=true AND is_azure (normal case), OR
+        // 2. previous_response_id is set AND is_azure (chaining requires IDs even if store=false)
+        if is_azure && (store || has_previous_response_id) {
+            attach_item_ids_to_json(&mut body, input);
         }
 
         let mut headers = self.headers;
@@ -157,33 +176,6 @@ impl<'a> ResponsesRequestBuilder<'a> {
             headers,
             compression: self.compression,
         })
-    }
-}
-
-fn attach_item_ids(payload_json: &mut Value, original_items: &[ResponseItem]) {
-    let Some(input_value) = payload_json.get_mut("input") else {
-        return;
-    };
-    let Value::Array(items) = input_value else {
-        return;
-    };
-
-    for (value, item) in items.iter_mut().zip(original_items.iter()) {
-        if let ResponseItem::Reasoning { id, .. }
-        | ResponseItem::Message { id: Some(id), .. }
-        | ResponseItem::WebSearchCall { id: Some(id), .. }
-        | ResponseItem::FunctionCall { id: Some(id), .. }
-        | ResponseItem::LocalShellCall { id: Some(id), .. }
-        | ResponseItem::CustomToolCall { id: Some(id), .. } = item
-        {
-            if id.is_empty() {
-                continue;
-            }
-
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id.clone()));
-            }
-        }
     }
 }
 
@@ -210,6 +202,7 @@ mod tests {
                 retry_429: false,
                 retry_5xx: true,
                 retry_transport: true,
+                max_retry_delay: None,
             },
             stream_idle_timeout: Duration::from_secs(5),
         }
@@ -234,10 +227,15 @@ mod tests {
         let request = ResponsesRequestBuilder::new("gpt-test", "inst", &input)
             .conversation(Some("conv-1".into()))
             .session_source(Some(SessionSource::SubAgent(SubAgentSource::Review)))
+            .previous_response_id(Some("resp-123".into()))
             .build(&provider)
             .expect("request");
 
         assert_eq!(request.body.get("store"), Some(&Value::Bool(true)));
+        assert_eq!(
+            request.body.get("previous_response_id"),
+            Some(&Value::String("resp-123".into()))
+        );
 
         let ids: Vec<Option<String>> = request
             .body
@@ -257,5 +255,22 @@ mod tests {
             request.headers.get("x-openai-subagent"),
             Some(&HeaderValue::from_static("review"))
         );
+    }
+
+    #[test]
+    fn previous_response_id_excluded_for_non_azure() {
+        let provider = provider("openai", "https://api.openai.com/v1");
+        let input = vec![ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: Vec::new(),
+        }];
+
+        let request = ResponsesRequestBuilder::new("gpt-test", "inst", &input)
+            .previous_response_id(Some("resp-123".into()))
+            .build(&provider)
+            .expect("request");
+
+        assert!(request.body.get("previous_response_id").is_none());
     }
 }

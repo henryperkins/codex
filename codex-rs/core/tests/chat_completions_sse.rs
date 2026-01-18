@@ -1,6 +1,7 @@
 use assert_matches::assert_matches;
 use codex_core::AuthManager;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tracing_test::traced_test;
 
 use codex_core::CodexAuth;
@@ -8,6 +9,7 @@ use codex_core::ContentItem;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
+use codex_core::ResponseChainState;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
@@ -57,6 +59,7 @@ async fn run_stream_with_bytes(sse_body: &[u8]) -> Vec<ResponseEvent> {
         request_max_retries: Some(0),
         stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(5_000),
+        max_retry_delay_ms: None,
         requires_openai_auth: false,
     };
 
@@ -89,6 +92,7 @@ async fn run_stream_with_bytes(sse_body: &[u8]) -> Vec<ResponseEvent> {
         SessionSource::Exec,
     );
 
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let mut client = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -97,6 +101,7 @@ async fn run_stream_with_bytes(sse_body: &[u8]) -> Vec<ResponseEvent> {
         provider,
         effort,
         summary,
+        response_chain,
         conversation_id,
         SessionSource::Exec,
     )

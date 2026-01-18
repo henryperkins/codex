@@ -3529,6 +3529,7 @@ model_verbosity = "high"
             request_max_retries: Some(4),
             stream_max_retries: Some(10),
             stream_idle_timeout_ms: Some(300_000),
+            max_retry_delay_ms: None,
             requires_openai_auth: false,
         };
         let model_provider_map = {

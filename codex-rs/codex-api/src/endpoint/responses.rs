@@ -35,6 +35,7 @@ pub struct ResponsesOptions {
     pub store_override: Option<bool>,
     pub conversation_id: Option<String>,
     pub session_source: Option<SessionSource>,
+    pub previous_response_id: Option<String>,
     pub extra_headers: HeaderMap,
     pub compression: Compression,
     pub turn_state: Option<Arc<OnceLock<String>>>,
@@ -86,6 +87,7 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
             store_override,
             conversation_id,
             session_source,
+            previous_response_id,
             extra_headers,
             compression,
             turn_state,
@@ -100,6 +102,7 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
             .text(text)
             .conversation(conversation_id)
             .session_source(session_source)
+            .previous_response_id(previous_response_id)
             .store_override(store_override)
             .extra_headers(extra_headers)
             .compression(compression)

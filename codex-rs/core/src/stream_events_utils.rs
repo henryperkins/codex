@@ -10,6 +10,7 @@ use crate::error::CodexErr;
 use crate::error::Result;
 use crate::function_tool::FunctionCallError;
 use crate::parse_turn_item;
+use crate::tools::context::ToolPayload;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -22,8 +23,14 @@ use tracing::instrument;
 /// Handle a completed output item from the model stream, recording it and
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
-pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
+pub(crate) struct InFlightToolResult {
+    pub call_id: String,
+    pub tool_name: String,
+    pub outputs_custom: bool,
+    pub result: Result<ResponseInputItem>,
+}
+
+pub(crate) type InFlightFuture<'f> = Pin<Box<dyn Future<Output = InFlightToolResult> + Send + 'f>>;
 
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
@@ -57,12 +64,22 @@ pub(crate) async fn handle_output_item_done(
                 .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
                 .await;
 
+            let call_id = call.call_id.clone();
+            let tool_name = call.tool_name.clone();
+            let outputs_custom = matches!(call.payload, ToolPayload::Custom { .. });
+            let tool_runtime = ctx.tool_runtime.clone();
             let cancellation_token = ctx.cancellation_token.child_token();
-            let tool_future: InFlightFuture<'static> = Box::pin(
-                ctx.tool_runtime
-                    .clone()
-                    .handle_tool_call(call, cancellation_token),
-            );
+            let tool_future: InFlightFuture<'static> = Box::pin(async move {
+                let result = tool_runtime
+                    .handle_tool_call(call, cancellation_token)
+                    .await;
+                InFlightToolResult {
+                    call_id,
+                    tool_name,
+                    outputs_custom,
+                    result,
+                }
+            });
 
             output.needs_follow_up = true;
             output.tool_future = Some(tool_future);

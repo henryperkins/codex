@@ -74,6 +74,7 @@ fn provider(name: &str, wire: WireApi) -> Provider {
             retry_429: false,
             retry_5xx: false,
             retry_transport: true,
+            max_retry_delay: None,
         },
         stream_idle_timeout: Duration::from_millis(50),
     }

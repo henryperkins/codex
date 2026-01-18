@@ -21,6 +21,7 @@ eventsource-stream = { workspace = true }
 regex-lite = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
 url = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

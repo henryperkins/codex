@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use codex_app_server_protocol::AuthMode;
 use codex_core::ContentItem;
@@ -10,6 +11,7 @@ use codex_core::LocalShellStatus;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
+use codex_core::ResponseChainState;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
 use codex_core::models_manager::manager::ModelsManager;
@@ -58,6 +60,7 @@ async fn run_request(input: Vec<ResponseItem>) -> Value {
         request_max_retries: Some(0),
         stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(5_000),
+        max_retry_delay_ms: None,
         requires_openai_auth: false,
     };
 
@@ -88,6 +91,7 @@ async fn run_request(input: Vec<ResponseItem>) -> Value {
         SessionSource::Exec,
     );
 
+    let response_chain = Arc::new(Mutex::new(ResponseChainState::default()));
     let mut client_session = ModelClient::new(
         Arc::clone(&config),
         None,
@@ -96,6 +100,7 @@ async fn run_request(input: Vec<ResponseItem>) -> Value {
         provider,
         effort,
         summary,
+        response_chain,
         conversation_id,
         SessionSource::Exec,
     )

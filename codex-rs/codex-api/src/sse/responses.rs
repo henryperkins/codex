@@ -86,6 +86,7 @@ struct Error {
     r#type: Option<String>,
     code: Option<String>,
     message: Option<String>,
+    param: Option<String>,
     plan_type: Option<String>,
     resets_at: Option<i64>,
 }
@@ -201,8 +202,12 @@ pub fn process_responses_event(
             }
         }
         "response.created" => {
-            if event.response.is_some() {
-                return Ok(Some(ResponseEvent::Created {}));
+            if let Some(resp_val) = event.response {
+                let response_id = resp_val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                return Ok(Some(ResponseEvent::Created { response_id }));
             }
         }
         "response.failed" => {
@@ -751,7 +756,12 @@ mod tests {
         }
 
         fn is_created(ev: &ResponseEvent) -> bool {
-            matches!(ev, ResponseEvent::Created)
+            matches!(
+                ev,
+                ResponseEvent::Created {
+                    response_id: Some(id)
+                } if id == "c1"
+            )
         }
         fn is_output(ev: &ResponseEvent) -> bool {
             matches!(ev, ResponseEvent::OutputItemDone(_))
@@ -778,7 +788,7 @@ mod tests {
         let cases = vec![
             TestCase {
                 name: "created",
-                event: json!({"type": "response.created", "response": {}}),
+                event: json!({"type": "response.created", "response": {"id": "c1"}}),
                 expect_first: is_created,
                 expected_len: 2,
             },
@@ -825,6 +835,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5.1 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
         };
@@ -839,6 +850,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5.1 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
         };
@@ -852,6 +864,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit exceeded. Try again in 35 seconds.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
         };
