@@ -1,4 +1,8 @@
-# Implementation Plan for `previous_response_id` (Azure OpenAI)
+# Azure OpenAI `previous_response_id` Implementation
+
+## Status
+
+✅ **Implemented** - The `previous_response_id` feature for the Azure OpenAI Responses API is implemented and working for both HTTP/SSE and WebSocket connections.
 
 ## Azure Responses API Reference
 
@@ -25,7 +29,7 @@ Based on the Azure OpenAPI spec, the following endpoints and fields are supporte
 | `reasoning` | object | ✅ | `{effort, summary}` |
 | `store` | boolean | ✅ | |
 | `stream` | boolean | ✅ | |
-| `previous_response_id` | string \| null | ❌ **TODO** | Chain conversations |
+| `previous_response_id` | string \| null | ✅ | Chain conversations |
 | `background` | boolean \| null | ❌ | Long-running tasks |
 | `prompt_cache_key` | string | ✅ | Prompt caching |
 | `prompt_cache_retention` | "in-memory" \| "24h" | ❌ | Cache duration |
@@ -41,7 +45,7 @@ Based on the Azure OpenAPI spec, the following endpoints and fields are supporte
 ### Response Fields (Azure)
 | Field | Type | Notes |
 |-------|------|-------|
-| `id` | string | **Use this for `previous_response_id`** |
+| `id` | string | **Used for `previous_response_id` in next request** |
 | `object` | "response" | Always "response" |
 | `status` | enum | "completed", "failed", "in_progress", "cancelled", "queued", "incomplete" |
 | `created_at` | integer | Unix timestamp |
@@ -54,283 +58,63 @@ Based on the Azure OpenAPI spec, the following endpoints and fields are supporte
 
 ---
 
-## Overview
+## How It Works
 
-The key insight from the exploration is that `response_id` is already captured but **discarded** at line 2977 in `codex.rs`. The infrastructure exists, it just needs to be wired up.
+The `previous_response_id` feature enables efficient conversation chaining for Azure OpenAI by allowing the server to maintain conversation state. When a `previous_response_id` is included in a request, Azure can retrieve the previous conversation context from its storage instead of requiring the client to resend all previous messages.
+
+### Data Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Data Flow                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  Response SSE ──► ResponseEvent::Completed { response_id } ──────┐  │
-│                                                                  │  │
-│                                          Currently discarded ◄───┘  │
-│                                                                      │
-│  ┌─────────────────── NEEDS TO BE ADDED ───────────────────────┐   │
-│  │                                                              │   │
-│  │  Store response_id ──► ModelClientSession.last_response_id   │   │
-│  │                              │                               │   │
-│  │                              ▼                               │   │
-│  │  Next request: ResponsesApiRequest.previous_response_id      │   │
-│  │                                                              │   │
-│  └──────────────────────────────────────────────────────────────┘   │
+│  Response SSE ──► ResponseEvent::Completed { response_id }          │
+│                                      │                               │
+│                                      ▼                               │
+│                   ModelClientSession.last_response_id                │
+│                                      │                               │
+│                                      ▼                               │
+│              Next request: ResponsesApiRequest.previous_response_id  │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Files to Modify (in order)
+### Implementation Details
 
-| File | Change |
-|------|--------|
-| `codex-api/src/common.rs` | Add `previous_response_id` to request struct |
-| `codex-api/src/requests/responses.rs` | Add field to builder |
-| `codex-api/src/endpoint/responses.rs` | Pass through in options |
-| `core/src/client.rs` | Store and pass `response_id` |
-| `core/src/codex.rs` | Capture `response_id` from completed event |
+The feature is implemented across several files:
 
----
+| File | Implementation |
+|------|----------------|
+| `codex-api/src/common.rs` | `ResponsesApiRequest` includes `previous_response_id` field |
+| `codex-api/src/requests/responses.rs` | `ResponsesRequestBuilder` supports `.previous_response_id()` |
+| `codex-api/src/endpoint/responses.rs` | `ResponsesOptions` passes through `previous_response_id` |
+| `core/src/client.rs` | `ModelClientSession` stores and provides `last_response_id` |
+| `core/src/codex.rs` | Captures `response_id` from `ResponseEvent::Completed` |
 
-## Step 1: Add `previous_response_id` to Request Struct
+### Azure-Only Behavior
 
-**File:** `codex-rs/codex-api/src/common.rs`
+The `previous_response_id` field is only included in requests when:
+1. The provider is detected as an Azure endpoint (via `provider.is_azure_responses_endpoint()`)
+2. A previous response ID is available from the last completed response
 
-```rust
-#[derive(Debug, Serialize)]
-pub struct ResponsesApiRequest<'a> {
-    pub model: &'a str,
-    pub instructions: &'a str,
-    pub input: &'a [ResponseItem],
-    pub tools: &'a [serde_json::Value],
-    pub tool_choice: &'static str,
-    pub parallel_tool_calls: bool,
-    pub reasoning: Option<Reasoning>,
-    pub store: bool,
-    pub stream: bool,
-    pub include: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<TextControls>,
-    // ADD THIS:
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-}
-```
+### Benefits
 
-Also update `ResponseCreateWsRequest` for WebSocket support.
+1. **Reduced bandwidth**: Only new input items need to be sent, not the entire conversation history
+2. **Lower latency**: Smaller request payloads result in faster transmission
+3. **Token efficiency**: Azure doesn't need to reprocess the entire conversation context
+4. **Consistency**: Azure maintains the canonical conversation state
 
----
+### Testing
 
-## Step 2: Add to Request Builder
-
-**File:** `codex-rs/codex-api/src/requests/responses.rs`
-
-```rust
-#[derive(Default)]
-pub struct ResponsesRequestBuilder<'a> {
-    // ... existing fields ...
-    previous_response_id: Option<String>,  // ADD THIS
-}
-
-impl<'a> ResponsesRequestBuilder<'a> {
-    // ADD THIS METHOD:
-    pub fn previous_response_id(mut self, id: Option<String>) -> Self {
-        self.previous_response_id = id;
-        self
-    }
-
-    pub fn build(self, provider: &Provider) -> Result<ResponsesRequest, ApiError> {
-        // ... existing code ...
-
-        let req = ResponsesApiRequest {
-            model,
-            instructions,
-            input,
-            tools,
-            tool_choice: "auto",
-            parallel_tool_calls: self.parallel_tool_calls,
-            reasoning: self.reasoning,
-            store,
-            stream: true,
-            include: self.include,
-            prompt_cache_key: self.prompt_cache_key,
-            text: self.text,
-            previous_response_id: self.previous_response_id,  // ADD THIS
-        };
-
-        // ... rest of build ...
-    }
-}
-```
-
----
-
-## Step 3: Pass Through in Endpoint Options
-
-**File:** `codex-rs/codex-api/src/endpoint/responses.rs`
-
-```rust
-pub struct ResponsesOptions {
-    // ... existing fields ...
-    pub previous_response_id: Option<String>,  // ADD THIS
-}
-
-// In stream_prompt():
-let request = ResponsesRequestBuilder::new(model, &prompt.instructions, &prompt.input)
-    .tools(&prompt.tools)
-    .parallel_tool_calls(prompt.parallel_tool_calls)
-    .reasoning(reasoning)
-    .include(include)
-    .prompt_cache_key(prompt_cache_key)
-    .text(text)
-    .conversation(conversation_id)
-    .session_source(session_source)
-    .store_override(store_override)
-    .extra_headers(extra_headers)
-    .compression(compression)
-    .previous_response_id(options.previous_response_id.clone())  // ADD THIS
-    .build(self.streaming.provider())?;
-```
-
----
-
-## Step 4: Store and Pass in Client Session
-
-**File:** `codex-rs/core/src/client.rs`
-
-```rust
-pub struct ModelClientSession {
-    state: Arc<ModelClientState>,
-    connection: Option<ApiWebSocketConnection>,
-    websocket_last_items: Vec<ResponseItem>,
-    last_response_id: Option<String>,  // ADD THIS
-}
-
-impl ModelClientSession {
-    // ADD THIS METHOD:
-    pub fn set_last_response_id(&mut self, id: String) {
-        self.last_response_id = Some(id);
-    }
-
-    // ADD THIS METHOD:
-    pub fn last_response_id(&self) -> Option<&str> {
-        self.last_response_id.as_deref()
-    }
-
-    // MODIFY build_responses_options():
-    fn build_responses_options(&self, /* ... */) -> ResponsesOptions {
-        ResponsesOptions {
-            // ... existing fields ...
-            previous_response_id: self.last_response_id.clone(),  // ADD THIS
-        }
-    }
-}
-```
-
----
-
-## Step 5: Capture Response ID from Completed Event
-
-**File:** `codex-rs/core/src/codex.rs` (around line 2977)
-
-Currently:
-```rust
-ResponseEvent::Completed {
-    response_id: _,  // DISCARDED!
-    token_usage,
-} => {
-    sess.update_token_usage_info(&turn_context, token_usage.as_ref()).await;
-    // ...
-}
-```
-
-Change to:
-```rust
-ResponseEvent::Completed {
-    response_id,
-    token_usage,
-} => {
-    // Store the response_id for the next turn
-    client_session.set_last_response_id(response_id);
-
-    sess.update_token_usage_info(&turn_context, token_usage.as_ref()).await;
-    // ...
-}
-```
-
----
-
-## Step 6 (Optional): Azure-Only Behavior
-
-If you want to only use `previous_response_id` for Azure providers:
-
-**File:** `codex-rs/codex-api/src/requests/responses.rs`
-
-```rust
-pub fn build(self, provider: &Provider) -> Result<ResponsesRequest, ApiError> {
-    // ... existing code ...
-
-    // Only include previous_response_id for Azure
-    let previous_response_id = if provider.is_azure_responses_endpoint() {
-        self.previous_response_id
-    } else {
-        None
-    };
-
-    let req = ResponsesApiRequest {
-        // ...
-        previous_response_id,
-    };
-
-    // ...
-}
-```
-
----
-
-## Step 7 (Optional): Optimize Input for Azure
-
-When using `previous_response_id`, you can send only the **new** input items instead of full history:
-
-**File:** `codex-rs/core/src/client.rs`
-
-```rust
-fn build_prompt_for_request(&self, prompt: &Prompt) -> Prompt {
-    // If we have a previous_response_id, only send new items
-    if self.last_response_id.is_some() && self.state.provider.is_azure() {
-        Prompt {
-            instructions: prompt.instructions.clone(),
-            input: prompt.input.last().cloned().into_iter().collect(), // Only last item
-            tools: prompt.tools.clone(),
-            parallel_tool_calls: prompt.parallel_tool_calls,
-            output_schema: prompt.output_schema.clone(),
-        }
-    } else {
-        prompt.clone()
-    }
-}
-```
-
-⚠️ **Caution:** This optimization requires careful handling - you need to ensure the server has the full context stored.
-
----
-
-## Testing Considerations
-
-1. **Add test for Azure response ID capture:**
-```rust
-#[tokio::test]
-async fn azure_stores_response_id_for_chaining() {
-    // Mock Azure endpoint
-    // Verify response_id is captured
-    // Verify next request includes previous_response_id
-}
-```
-
-2. **Verify backwards compatibility:** Non-Azure providers should continue to work with full history.
-
-3. **Test conversation resume:** Verify that `previous_response_id` correctly chains conversations.
+Azure `previous_response_id` chaining is tested in:
+- `codex-rs/core/tests/suite/client.rs::azure_previous_response_id_only_sends_new_items` (SSE)
+- `codex-rs/core/tests/suite/client_websockets.rs::azure_websocket_includes_previous_response_id_and_item_ids` (WebSocket)
+- Integration tests verify that:
+  - First request does NOT include `previous_response_id`
+  - Subsequent requests DO include `previous_response_id` from the previous response
+  - Only new items are sent in follow-up requests (not the full history)
+  - Item IDs are correctly attached for Azure requests
 
 ---
 
