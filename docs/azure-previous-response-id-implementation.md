@@ -2,7 +2,7 @@
 
 ## Status
 
-✅ **Implemented** - The `previous_response_id` feature for Azure OpenAI Responses API is fully implemented and working.
+✅ **Implemented** - The `previous_response_id` feature for the Azure OpenAI Responses API is implemented and working for both HTTP/SSE and WebSocket connections.
 
 ## Azure Responses API Reference
 
@@ -108,11 +108,13 @@ The `previous_response_id` field is only included in requests when:
 ### Testing
 
 Azure `previous_response_id` chaining is tested in:
-- `codex-rs/core/tests/suite/client.rs::azure_previous_response_id_only_sends_new_items`
+- `codex-rs/core/tests/suite/client.rs::azure_previous_response_id_only_sends_new_items` (SSE)
+- `codex-rs/core/tests/suite/client_websockets.rs::azure_websocket_includes_previous_response_id_and_item_ids` (WebSocket)
 - Integration tests verify that:
   - First request does NOT include `previous_response_id`
   - Subsequent requests DO include `previous_response_id` from the previous response
   - Only new items are sent in follow-up requests (not the full history)
+  - Item IDs are correctly attached for Azure requests
 
 ---
 

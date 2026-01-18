@@ -27,10 +27,12 @@ const AZURE_DOMAIN_SUFFIXES: &[&str] = &[
 /// run on Azure Front Door, APIM, or CDN infrastructure.
 pub fn is_azure_base_url(base_url: &str) -> bool {
     let Ok(url) = url::Url::parse(base_url) else {
-        // Fallback for unparseable URLs: check for azure markers in the string
+        // Fallback for unparseable URLs: apply the same suffix-based matching
+        // on the raw string to avoid substring-based false positives.
         let base_lower = base_url.to_ascii_lowercase();
-        return base_lower.contains("openai.azure.")
-            || base_lower.contains("cognitiveservices.azure.");
+        return AZURE_DOMAIN_SUFFIXES
+            .iter()
+            .any(|suffix| base_lower.ends_with(suffix));
     };
 
     let Some(host) = url.host_str() else {
@@ -60,7 +62,7 @@ pub fn attach_item_ids_to_json(payload_json: &mut Value, original_items: &[Respo
         return;
     };
 
-    // SAFETY: This function assumes 1:1 ordering between serialized input and
+    // INVARIANT: This function assumes 1:1 ordering between serialized input and
     // original_items. If future changes introduce filtering or reordering,
     // this check will catch the mismatch early.
     if items.len() != original_items.len() {
