@@ -26,7 +26,7 @@ pub(crate) fn add_auth_headers<A: AuthProvider>(
     if let Some(token) = auth.bearer_token() {
         if is_azure {
             // Azure OpenAI uses api-key header
-            if let Ok(header) = token.parse() {
+            if let Ok(header) = HeaderValue::from_str(&token) {
                 let _ = req.headers.insert("api-key", header);
             }
         } else {
