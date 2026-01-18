@@ -41,8 +41,6 @@ function createPacket(overrides: Partial<LLMPacket> = {}): LLMPacket {
         warnings: [],
         hashes,
         ...overrides,
-        metadata,
-        hashes,
     };
 }
 

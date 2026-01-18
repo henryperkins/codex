@@ -259,7 +259,6 @@ function summarizeXmlStructure(obj: unknown, depth: number): string {
 
   const record = obj as Record<string, unknown>;
   const keys = Object.keys(record).filter(k => !k.startsWith('@_'));
-  const attrs = Object.keys(record).filter(k => k.startsWith('@_'));
 
   const lines: string[] = [];
   const indent = '  '.repeat(depth);

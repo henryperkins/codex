@@ -21,7 +21,7 @@ import {
   ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { loadConfig, validateConfig, getConfig } from './config.js';
+import { loadConfig, validateConfig } from './config.js';
 import { executeFetch, getFetchInputSchema } from './tools/fetch.js';
 import { executeExtract, getExtractInputSchema } from './tools/extract.js';
 import { executeChunk, getChunkInputSchema } from './tools/chunk.js';

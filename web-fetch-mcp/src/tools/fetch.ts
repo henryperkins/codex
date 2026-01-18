@@ -350,9 +350,7 @@ export async function executeFetch(input: FetchToolInput): Promise<FetchToolOutp
           });
           if (renderNormalize.success && renderNormalize.packet) {
             normalizeResult = renderNormalize;
-            rawResult = renderAttempt.result;
             screenshot = renderAttempt.screenshot;
-            usedRender = true;
           }
         }
       }

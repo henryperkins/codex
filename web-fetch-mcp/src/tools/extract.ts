@@ -11,7 +11,7 @@ import type {
   NormalizedContent,
   RawFetchResult,
 } from '../types.js';
-import { normalizeContent, detectContentType, toNormalizedContent } from '../processing/normalizer.js';
+import { normalizeContent, toNormalizedContent } from '../processing/normalizer.js';
 import { executeFetch } from './fetch.js';
 import { storePacketResource } from '../resources/store.js';
 
