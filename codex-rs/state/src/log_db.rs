@@ -340,6 +340,7 @@ mod tests {
             target: "log-db-test".to_string(),
             message: Some(message.to_string()),
             thread_id: None,
+            process_uuid: None,
             module_path: None,
             file: None,
             line: None,

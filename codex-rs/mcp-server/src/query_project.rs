@@ -821,9 +821,9 @@ impl RepoHybridIndex {
             OnceLock::new();
         let refresh_lock = {
             let locks = REFRESH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut guard = locks
-                .lock()
-                .expect("repo index refresh lock map should not be poisoned");
+            let mut guard = locks.lock().map_err(|_| {
+                anyhow::anyhow!("repo index refresh lock map should not be poisoned")
+            })?;
             match guard.get(repo_root) {
                 Some(lock) => Arc::clone(lock),
                 None => {
