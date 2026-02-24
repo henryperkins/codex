@@ -339,6 +339,9 @@ impl ContextManager {
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(&mut self.items);
 
+        // reasoning items must be followed by another model-generated item.
+        normalize::remove_orphan_reasoning(&mut self.items);
+
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
