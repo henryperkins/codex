@@ -5161,6 +5161,11 @@ async fn run_sampling_request(
 
     let mut retries = 0;
     loop {
+        let (history_snapshot, server_reasoning_included_snapshot) = {
+            let state = sess.state.lock().await;
+            (state.clone_history(), state.server_reasoning_included())
+        };
+
         let err = match try_run_sampling_request(
             Arc::clone(&router),
             Arc::clone(&sess),
@@ -5177,18 +5182,30 @@ async fn run_sampling_request(
             Ok(output) => {
                 return Ok(output);
             }
-            Err(CodexErr::ContextWindowExceeded) => {
+            Err(err) => {
+                {
+                    let mut state = sess.state.lock().await;
+                    state.history = history_snapshot;
+                    state.set_server_reasoning_included(server_reasoning_included_snapshot);
+                }
+                trace!("restored sampling-attempt state after failed stream");
+                err
+            }
+        };
+
+        let err = match err {
+            CodexErr::ContextWindowExceeded => {
                 sess.set_total_tokens_full(&turn_context).await;
                 return Err(CodexErr::ContextWindowExceeded);
             }
-            Err(CodexErr::UsageLimitReached(e)) => {
+            CodexErr::UsageLimitReached(e) => {
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(err) => err,
+            err => err,
         };
 
         if !err.is_retryable() {
@@ -7330,6 +7347,42 @@ mod tests {
 
         let history = sess.clone_history().await;
         assert_eq!(initial_context, history.raw_items());
+    }
+
+    #[tokio::test]
+    async fn failed_sampling_attempt_restore_drops_partial_reasoning_from_history() {
+        let (sess, turn_context) = make_session_and_context().await;
+        let initial_context = sess.build_initial_context(&turn_context).await;
+        sess.record_into_history(&initial_context, &turn_context)
+            .await;
+
+        let (history_snapshot, server_reasoning_included_snapshot) = {
+            let state = sess.state.lock().await;
+            (state.clone_history(), state.server_reasoning_included())
+        };
+
+        sess.record_into_history(
+            &[ResponseItem::Reasoning {
+                id: "rs_partial".to_string(),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("encrypted".to_string()),
+            }],
+            &turn_context,
+        )
+        .await;
+        sess.set_server_reasoning_included(true).await;
+
+        {
+            let mut state = sess.state.lock().await;
+            state.history = history_snapshot;
+            state.set_server_reasoning_included(server_reasoning_included_snapshot);
+        }
+
+        let history = sess.clone_history().await;
+        assert_eq!(history.raw_items(), initial_context);
+        let state = sess.state.lock().await;
+        assert_eq!(state.server_reasoning_included(), false);
     }
 
     #[tokio::test]

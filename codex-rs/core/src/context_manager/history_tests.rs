@@ -351,6 +351,29 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
 }
 
 #[test]
+fn for_prompt_drops_trailing_reasoning_without_follower() {
+    let modalities = default_input_modalities();
+    let history = create_history_with_items(vec![user_msg("u1"), reasoning_msg("thinking...")]);
+    assert_eq!(history.for_prompt(&modalities), vec![user_msg("u1")]);
+}
+
+#[test]
+fn for_prompt_drops_reasoning_followed_by_user_message() {
+    let modalities = default_input_modalities();
+    let history = create_history_with_items(vec![reasoning_msg("thinking..."), user_msg("u1")]);
+    assert_eq!(history.for_prompt(&modalities), vec![user_msg("u1")]);
+}
+
+#[test]
+fn for_prompt_preserves_reasoning_with_model_generated_follower() {
+    let modalities = default_input_modalities();
+    let reasoning = reasoning_msg("thinking...");
+    let assistant = assistant_msg("answer");
+    let history = create_history_with_items(vec![reasoning.clone(), assistant.clone()]);
+    assert_eq!(history.for_prompt(&modalities), vec![reasoning, assistant]);
+}
+
+#[test]
 fn get_history_for_prompt_drops_ghost_commits() {
     let items = vec![ResponseItem::GhostSnapshot {
         ghost_commit: GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new()),

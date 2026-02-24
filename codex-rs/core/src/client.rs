@@ -1297,14 +1297,24 @@ impl WebsocketTelemetry for ApiTelemetry {
 
 #[cfg(test)]
 mod tests {
+    use super::LastResponse;
     use super::ModelClient;
+    use super::ModelClientSession;
+    use super::ResponsesWebsocketVersion;
+    use codex_api::ResponseCreateWsRequest;
+    use codex_api::ResponsesApiRequest;
+    use codex_api::common::ResponsesWsRequest;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::HashMap;
+    use tokio::sync::oneshot;
 
     fn test_model_client(session_source: SessionSource) -> ModelClient {
         let provider = crate::model_provider_info::create_oss_provider_with_base_url(
@@ -1368,6 +1378,48 @@ mod tests {
         )
     }
 
+    fn user_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn assistant_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
+        ResponsesApiRequest {
+            model: "gpt-test".to_string(),
+            instructions: "test instructions".to_string(),
+            input,
+            tools: vec![],
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+            previous_response_id: None,
+            prompt_cache_key: None,
+            text: None,
+        }
+    }
+
     #[test]
     fn build_subagent_headers_sets_other_subagent_label() {
         let client = test_model_client(SessionSource::SubAgent(SubAgentSource::Other(
@@ -1391,5 +1443,171 @@ mod tests {
             .await
             .expect("empty summarize request should succeed");
         assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn get_incremental_items_returns_suffix_for_strict_extension() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, assistant.clone(), follow_up.clone()]);
+        let last_response = LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: true,
+        };
+
+        let incremental = ModelClientSession::get_incremental_items(
+            &previous_request,
+            &request,
+            Some(&last_response),
+        );
+
+        assert_eq!(incremental, Some(vec![follow_up]));
+    }
+
+    #[test]
+    fn get_incremental_items_returns_none_when_non_input_fields_change() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let mut request = test_request(vec![first_user, assistant.clone(), follow_up]);
+        request.tool_choice = "required".to_string();
+        let last_response = LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: true,
+        };
+
+        let incremental = ModelClientSession::get_incremental_items(
+            &previous_request,
+            &request,
+            Some(&last_response),
+        );
+
+        assert_eq!(incremental, None);
+    }
+
+    #[test]
+    fn get_incremental_items_requires_strict_extension() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, assistant.clone()]);
+        let last_response = LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: true,
+        };
+
+        let incremental = ModelClientSession::get_incremental_items(
+            &previous_request,
+            &request,
+            Some(&last_response),
+        );
+
+        assert_eq!(incremental, None);
+    }
+
+    #[test]
+    fn prepare_azure_http_request_sets_previous_response_id_and_trims_input() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, assistant.clone(), follow_up.clone()]);
+        let mut session = test_model_client(SessionSource::Cli).new_session();
+        session.http_last_request = Some(previous_request);
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: false,
+        })
+        .expect("should send last response");
+        session.http_last_response_rx = Some(rx);
+
+        let prepared = session.prepare_azure_http_request(request);
+        assert_eq!(prepared.previous_response_id, Some("resp-1".to_string()));
+        assert_eq!(prepared.input, vec![follow_up]);
+    }
+
+    #[test]
+    fn prepare_websocket_request_v2_uses_previous_response_id_with_incremental_input() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, assistant.clone(), follow_up.clone()]);
+        let payload = ResponseCreateWsRequest::from(&request);
+        let mut session = test_model_client(SessionSource::Cli).new_session();
+        session.websocket_last_request = Some(previous_request);
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: true,
+        })
+        .expect("should send last response");
+        session.websocket_last_response_rx = Some(rx);
+
+        let ws_request =
+            session.prepare_websocket_request(payload, &request, ResponsesWebsocketVersion::V2);
+        match ws_request {
+            ResponsesWsRequest::ResponseCreate(req) => {
+                assert_eq!(req.previous_response_id, Some("resp-1".to_string()));
+                assert_eq!(req.input, vec![follow_up]);
+            }
+            ResponsesWsRequest::ResponseAppend(_) => {
+                panic!("expected response.create request")
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_websocket_request_v1_uses_response_append_when_server_allows() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, assistant.clone(), follow_up.clone()]);
+        let mut payload = ResponseCreateWsRequest::from(&request);
+        let mut metadata = HashMap::new();
+        metadata.insert("x-codex-turn-metadata".to_string(), "metadata".to_string());
+        payload.client_metadata = Some(metadata.clone());
+
+        let mut session = test_model_client(SessionSource::Cli).new_session();
+        session.websocket_last_request = Some(previous_request);
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: true,
+        })
+        .expect("should send last response");
+        session.websocket_last_response_rx = Some(rx);
+
+        let ws_request =
+            session.prepare_websocket_request(payload, &request, ResponsesWebsocketVersion::V1);
+        match ws_request {
+            ResponsesWsRequest::ResponseAppend(req) => {
+                assert_eq!(req.input, vec![follow_up]);
+                assert_eq!(req.client_metadata, Some(metadata));
+            }
+            ResponsesWsRequest::ResponseCreate(_) => {
+                panic!("expected response.append request")
+            }
+        }
     }
 }

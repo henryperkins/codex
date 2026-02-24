@@ -153,6 +153,37 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     });
 }
 
+pub(crate) fn remove_orphan_reasoning(items: &mut Vec<ResponseItem>) {
+    let mut index = 0usize;
+    while index < items.len() {
+        let should_drop = match &items[index] {
+            ResponseItem::Reasoning { .. } => {
+                let has_valid_follower = match items.get(index + 1) {
+                    Some(ResponseItem::Reasoning { .. })
+                    | Some(ResponseItem::FunctionCall { .. })
+                    | Some(ResponseItem::LocalShellCall { .. })
+                    | Some(ResponseItem::WebSearchCall { .. })
+                    | Some(ResponseItem::CustomToolCall { .. })
+                    | Some(ResponseItem::Compaction { .. }) => true,
+                    Some(ResponseItem::Message { role, .. }) => role == "assistant",
+                    _ => false,
+                };
+                if !has_valid_follower {
+                    info!("dropping orphan reasoning item at index {index}");
+                }
+                !has_valid_follower
+            }
+            _ => false,
+        };
+
+        if should_drop {
+            items.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &ResponseItem) {
     match item {
         ResponseItem::FunctionCall { call_id, .. } => {
