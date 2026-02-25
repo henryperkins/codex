@@ -37,6 +37,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::openai_models::ModelPreset;
@@ -1667,6 +1668,7 @@ async fn make_chatwidget_manual(
         adaptive_chunking: crate::streaming::chunking::AdaptiveChunkingPolicy::default(),
         stream_controller: None,
         plan_stream_controller: None,
+        last_copyable_output: None,
         running_commands: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
@@ -1720,6 +1722,8 @@ async fn make_chatwidget_manual(
         status_line_branch_pending: false,
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
+        realtime_conversation: RealtimeConversationUiState::default(),
+        last_rendered_user_message_event: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -2776,6 +2780,7 @@ async fn exec_approval_emits_proposed_command_and_decision_history() {
         network_approval_context: None,
         proposed_execpolicy_amendment: None,
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
@@ -2823,6 +2828,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
         network_approval_context: None,
         proposed_execpolicy_amendment: None,
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
@@ -2876,6 +2882,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
         network_approval_context: None,
         proposed_execpolicy_amendment: None,
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
@@ -4592,10 +4599,10 @@ async fn collab_mode_applies_default_preset() {
 
 #[tokio::test]
 async fn user_turn_includes_personality_from_config() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("bengalfox")).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2-codex")).await;
     chat.set_feature_enabled(Feature::Personality, true);
     chat.thread_id = Some(ThreadId::new());
-    chat.set_model("bengalfox");
+    chat.set_model("gpt-5.2-codex");
     chat.set_personality(Personality::Friendly);
 
     chat.bottom_pane
@@ -4643,6 +4650,69 @@ async fn slash_index_shows_current_index_defaults() {
 }
 
 #[tokio::test]
+async fn slash_copy_state_tracks_turn_complete_final_reply() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Final reply **markdown**".to_string()),
+        }),
+    });
+
+    assert_eq!(
+        chat.last_copyable_output,
+        Some("Final reply **markdown**".to_string())
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_state_tracks_plan_item_completion() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let plan_text = "## Plan\n\n1. Build it\n2. Test it".to_string();
+
+    chat.handle_codex_event(Event {
+        id: "item-plan".into(),
+        msg: EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            item: TurnItem::Plan(PlanItem {
+                id: "plan-1".to_string(),
+                text: plan_text.clone(),
+            }),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+        }),
+    });
+
+    assert_eq!(chat.last_copyable_output, Some(plan_text));
+}
+
+#[tokio::test]
+async fn slash_copy_reports_when_no_copyable_output_exists() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Copy);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert_snapshot!("slash_copy_no_output_info_message", rendered);
+    assert!(
+        rendered.contains(
+            "`/copy` is unavailable before the first Codex output or right after a rollback."
+        ),
+        "expected no-output message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
 async fn slash_index_with_args_sends_persist_event() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -4657,6 +4727,139 @@ async fn slash_index_with_args_sends_persist_event() {
             require_embeddings: None,
             embedding_model: None,
         })
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_state_is_preserved_during_running_task() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Previous completed reply".to_string()),
+        }),
+    });
+    chat.on_task_started();
+
+    assert_eq!(
+        chat.last_copyable_output,
+        Some("Previous completed reply".to_string())
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_state_clears_on_thread_rollback() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Reply that will be rolled back".to_string()),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "rollback-1".into(),
+        msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+    });
+
+    assert_eq!(chat.last_copyable_output, None);
+}
+
+#[tokio::test]
+async fn slash_copy_is_unavailable_when_legacy_agent_message_is_not_repeated_on_turn_complete() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::AgentMessage(AgentMessageEvent {
+            message: "Legacy final message".into(),
+            phase: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.dispatch_command(SlashCommand::Copy);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains(
+            "`/copy` is unavailable before the first Codex output or right after a rollback."
+        ),
+        "expected unavailable message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_is_unavailable_when_legacy_agent_message_item_is_not_repeated_on_turn_complete()
+{
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    complete_assistant_message(&mut chat, "msg-1", "Legacy item final message", None);
+    let _ = drain_insert_history(&mut rx);
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.dispatch_command(SlashCommand::Copy);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains(
+            "`/copy` is unavailable before the first Codex output or right after a rollback."
+        ),
+        "expected unavailable message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Reply that will be rolled back".to_string()),
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_codex_event(Event {
+        id: "rollback-1".into(),
+        msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.dispatch_command(SlashCommand::Copy);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains(
+            "`/copy` is unavailable before the first Codex output or right after a rollback."
+        ),
+        "expected rollback-cleared copy state message, got {rendered:?}"
     );
 }
 
@@ -5756,7 +5959,7 @@ async fn model_selection_popup_snapshot() {
 
 #[tokio::test]
 async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("bengalfox")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2-codex")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_personality_popup();
 
@@ -5804,8 +6007,8 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
 
 #[tokio::test]
 async fn server_overloaded_error_does_not_switch_models() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("boomslang")).await;
-    chat.set_model("boomslang");
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2-codex")).await;
+    chat.set_model("gpt-5.2-codex");
     while rx.try_recv().is_ok() {}
     while op_rx.try_recv().is_ok() {}
 
@@ -5820,7 +6023,7 @@ async fn server_overloaded_error_does_not_switch_models() {
     while let Ok(event) = rx.try_recv() {
         if let AppEvent::UpdateModel(model) = event {
             assert_eq!(
-                model, "boomslang",
+                model, "gpt-5.2-codex",
                 "did not expect model switch on server-overloaded error"
             );
         }
@@ -6515,6 +6718,7 @@ async fn approval_modal_exec_snapshot() -> anyhow::Result<()> {
             "world".into(),
         ])),
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
@@ -6574,6 +6778,7 @@ async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
             "world".into(),
         ])),
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
@@ -6620,6 +6825,7 @@ async fn approval_modal_exec_multiline_prefix_hides_execpolicy_option_snapshot()
         network_approval_context: None,
         proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(command)),
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
@@ -6985,6 +7191,7 @@ async fn status_widget_and_approval_modal_snapshot() {
             "hello world".into(),
         ])),
         proposed_network_policy_amendments: None,
+        additional_permissions: None,
         parsed_cmd: vec![],
     };
     chat.handle_codex_event(Event {
