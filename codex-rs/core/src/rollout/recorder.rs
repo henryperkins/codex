@@ -1355,6 +1355,7 @@ mod tests {
             &[],
             None,
             default_provider.as_str(),
+            None,
         )
         .await?;
         assert_eq!(page.items.len(), 1);
