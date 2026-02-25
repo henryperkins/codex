@@ -1096,6 +1096,7 @@ mod tests {
             reason: None,
             network_approval_context: None,
             proposed_execpolicy_amendment: None,
+            proposed_network_policy_amendments: None,
             additional_permissions: None,
         }
     }
@@ -1494,8 +1495,9 @@ mod tests {
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 permissions: None,
-                path: PathBuf::from("test-skill"),
+                path_to_skills_md: PathBuf::from("test-skill"),
                 scope: SkillScope::User,
             }]),
         });

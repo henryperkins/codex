@@ -8,6 +8,7 @@ use crate::exec::is_likely_sandbox_denied;
 use crate::features::Feature;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::ShellType;
+use crate::skills::SkillMetadata;
 use crate::tools::runtimes::build_command_spec;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
@@ -16,6 +17,7 @@ use codex_execpolicy::Decision;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::RejectConfig;
@@ -30,8 +32,8 @@ use codex_shell_escalation::ExecParams;
 use codex_shell_escalation::ExecResult;
 use codex_shell_escalation::ShellCommandExecutor;
 use codex_shell_escalation::Stopwatch;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,15 +108,22 @@ pub(super) async fn try_run_zsh_fork(
         justification,
         arg0,
     };
-
+    let main_execve_wrapper_exe = ctx
+        .session
+        .services
+        .main_execve_wrapper_exe
+        .clone()
+        .ok_or_else(|| {
+            ToolError::Rejected(
+                "zsh fork feature enabled, but execve wrapper is not configured".to_string(),
+            )
+        })?;
     let exec_params = ExecParams {
         command: script,
         workdir: req.cwd.to_string_lossy().to_string(),
         timeout_ms: Some(effective_timeout.as_millis() as u64),
         login: Some(login),
     };
-    let execve_wrapper =
-        shell_execve_wrapper().map_err(|err| ToolError::Rejected(format!("{err}")))?;
 
     // Note that Stopwatch starts immediately upon creation, so currently we try
     // to minimize the time between creating the Stopwatch and starting the
@@ -132,8 +141,11 @@ pub(super) async fn try_run_zsh_fork(
         stopwatch: stopwatch.clone(),
     };
 
-    let escalate_server =
-        EscalateServer::new(shell_zsh_path.clone(), execve_wrapper, escalation_policy);
+    let escalate_server = EscalateServer::new(
+        shell_zsh_path.clone(),
+        main_execve_wrapper_exe,
+        escalation_policy,
+    );
 
     let exec_result = escalate_server
         .exec(exec_params, cancel_token, &command_executor)
@@ -164,11 +176,13 @@ impl CoreShellActionProvider {
 
     async fn prompt(
         &self,
-        command: &[String],
-        workdir: &Path,
+        program: &AbsolutePathBuf,
+        argv: &[String],
+        workdir: &AbsolutePathBuf,
         stopwatch: &Stopwatch,
+        additional_permissions: Option<PermissionProfile>,
     ) -> anyhow::Result<ReviewDecision> {
-        let command = command.to_vec();
+        let command = join_program_and_argv(program, argv);
         let workdir = workdir.to_path_buf();
         let session = self.session.clone();
         let turn = self.turn.clone();
@@ -186,55 +200,49 @@ impl CoreShellActionProvider {
                         None,
                         None,
                         None,
-                        None,
+                        additional_permissions,
                     )
                     .await
             })
             .await)
     }
-}
 
-#[async_trait::async_trait]
-impl EscalationPolicy for CoreShellActionProvider {
-    async fn determine_action(
-        &self,
-        file: &Path,
-        argv: &[String],
-        workdir: &Path,
-    ) -> anyhow::Result<EscalateAction> {
-        let command = std::iter::once(file.to_string_lossy().to_string())
-            .chain(argv.iter().cloned())
-            .collect::<Vec<_>>();
-        let (commands, used_complex_parsing) =
-            if let Some(commands) = parse_shell_lc_plain_commands(&command) {
-                (commands, false)
-            } else if let Some(single_command) = parse_shell_lc_single_command_prefix(&command) {
-                (vec![single_command], true)
-            } else {
-                (vec![command.clone()], false)
+    /// Because we should be intercepting execve(2) calls, `program` should be
+    /// an absolute path. The idea is that we check to see whether it matches
+    /// any skills.
+    async fn find_skill(&self, program: &AbsolutePathBuf) -> Option<SkillMetadata> {
+        let force_reload = false;
+        let skills_outcome = self
+            .session
+            .services
+            .skills_manager
+            .skills_for_cwd(&self.turn.cwd, force_reload)
+            .await;
+
+        let program_path = program.as_path();
+        for skill in skills_outcome.skills {
+            // We intentionally ignore "enabled" status here for now.
+            let Some(skill_root) = skill.path_to_skills_md.parent() else {
+                continue;
             };
+            if program_path.starts_with(skill_root.join("scripts")) {
+                return Some(skill);
+            }
+        }
 
-        let fallback = |cmd: &[String]| {
-            crate::exec_policy::render_decision_for_unmatched_command(
-                self.approval_policy,
-                &self.sandbox_policy,
-                cmd,
-                self.sandbox_permissions,
-                used_complex_parsing,
-            )
-        };
-        let evaluation = {
-            let policy = self.policy.read().await;
-            policy.check_multiple(commands.iter(), &fallback)
-        };
-        // When true, means the Evaluation was due to *.rules, not the
-        // fallback function.
-        let decision_driven_by_policy =
-            Self::decision_driven_by_policy(&evaluation.matched_rules, evaluation.decision);
-        let needs_escalation =
-            self.sandbox_permissions.requires_escalated_permissions() || decision_driven_by_policy;
+        None
+    }
 
-        Ok(match evaluation.decision {
+    async fn process_decision(
+        &self,
+        decision: Decision,
+        needs_escalation: bool,
+        program: &AbsolutePathBuf,
+        argv: &[String],
+        workdir: &AbsolutePathBuf,
+        additional_permissions: Option<PermissionProfile>,
+    ) -> anyhow::Result<EscalateAction> {
+        let action = match decision {
             Decision::Forbidden => EscalateAction::Deny {
                 reason: Some("Execution forbidden by policy".to_string()),
             },
@@ -248,7 +256,16 @@ impl EscalationPolicy for CoreShellActionProvider {
                         reason: Some("Execution forbidden by policy".to_string()),
                     }
                 } else {
-                    match self.prompt(&command, workdir, &self.stopwatch).await? {
+                    match self
+                        .prompt(
+                            program,
+                            argv,
+                            workdir,
+                            &self.stopwatch,
+                            additional_permissions,
+                        )
+                        .await?
+                    {
                         ReviewDecision::Approved
                         | ReviewDecision::ApprovedExecpolicyAmendment { .. }
                         | ReviewDecision::ApprovedForSession => {
@@ -281,8 +298,96 @@ impl EscalationPolicy for CoreShellActionProvider {
                     }
                 }
             }
-            Decision::Allow => EscalateAction::Escalate,
-        })
+            Decision::Allow => {
+                if needs_escalation {
+                    EscalateAction::Escalate
+                } else {
+                    EscalateAction::Run
+                }
+            }
+        };
+        tracing::debug!(
+            "Policy decision for command {program:?} is {decision:?}, leading to escalation action {action:?}",
+        );
+        Ok(action)
+    }
+}
+
+#[async_trait::async_trait]
+impl EscalationPolicy for CoreShellActionProvider {
+    async fn determine_action(
+        &self,
+        program: &AbsolutePathBuf,
+        argv: &[String],
+        workdir: &AbsolutePathBuf,
+    ) -> anyhow::Result<EscalateAction> {
+        tracing::debug!(
+            "Determining escalation action for command {program:?} with args {argv:?} in {workdir:?}"
+        );
+
+        // In the usual case, the execve wrapper reports the command being
+        // executed in `program`, so a direct skill lookup is sufficient.
+        if let Some(skill) = self.find_skill(program).await {
+            // For now, we always prompt for scripts that look like they belong
+            // to skills, which means we ignore exec policy rules for those
+            // scripts.
+            tracing::debug!("Matched {program:?} to skill {skill:?}, prompting for approval");
+            // TODO(mbolin): We should read the permissions associated with the
+            // skill and use those specific permissions in the
+            // EscalateAction::Run case, rather than always escalating when a
+            // skill matches.
+            let needs_escalation = true;
+            return self
+                .process_decision(
+                    Decision::Prompt,
+                    needs_escalation,
+                    program,
+                    argv,
+                    workdir,
+                    skill.permission_profile.clone(),
+                )
+                .await;
+        }
+
+        let command = join_program_and_argv(program, argv);
+        let (commands, used_complex_parsing) =
+            if let Some(commands) = parse_shell_lc_plain_commands(&command) {
+                (commands, false)
+            } else if let Some(single_command) = parse_shell_lc_single_command_prefix(&command) {
+                (vec![single_command], true)
+            } else {
+                (vec![command.clone()], false)
+            };
+
+        let fallback = |cmd: &[String]| {
+            crate::exec_policy::render_decision_for_unmatched_command(
+                self.approval_policy,
+                &self.sandbox_policy,
+                cmd,
+                self.sandbox_permissions,
+                used_complex_parsing,
+            )
+        };
+        let evaluation = {
+            let policy = self.policy.read().await;
+            policy.check_multiple(commands.iter(), &fallback)
+        };
+        // When true, means the Evaluation was due to *.rules, not the
+        // fallback function.
+        let decision_driven_by_policy =
+            Self::decision_driven_by_policy(&evaluation.matched_rules, evaluation.decision);
+        let needs_escalation =
+            self.sandbox_permissions.requires_escalated_permissions() || decision_driven_by_policy;
+
+        self.process_decision(
+            evaluation.decision,
+            needs_escalation,
+            program,
+            argv,
+            workdir,
+            None,
+        )
+        .await
     }
 }
 
@@ -342,34 +447,6 @@ impl ShellCommandExecutor for CoreShellCommandExecutor {
     }
 }
 
-// TODO(mbolin): This should be passed down from codex-arg0 like codex_linux_sandbox_exe.
-fn shell_execve_wrapper() -> anyhow::Result<PathBuf> {
-    const EXECVE_WRAPPER: &str = "codex-execve-wrapper";
-
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(EXECVE_WRAPPER);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    let exe = std::env::current_exe()?;
-    let sibling = exe
-        .parent()
-        .map(|parent| parent.join(EXECVE_WRAPPER))
-        .ok_or_else(|| anyhow::anyhow!("failed to determine codex-execve-wrapper path"))?;
-    if sibling.is_file() {
-        return Ok(sibling);
-    }
-
-    Err(anyhow::anyhow!(
-        "failed to locate {EXECVE_WRAPPER} in PATH or next to current executable ({})",
-        exe.display()
-    ))
-}
-
 #[derive(Debug, Eq, PartialEq)]
 struct ParsedShellCommand {
     script: String,
@@ -421,13 +498,27 @@ fn map_exec_result(
     Ok(output)
 }
 
+/// Convert an intercepted exec `(program, argv)` into a command vector suitable
+/// for display and policy parsing.
+///
+/// The intercepted `argv` includes `argv[0]`, but once we have normalized the
+/// executable path in `program`, we should replace the original `argv[0]`
+/// rather than duplicating it as an apparent user argument.
+fn join_program_and_argv(program: &AbsolutePathBuf, argv: &[String]) -> Vec<String> {
+    std::iter::once(program.to_string_lossy().to_string())
+        .chain(argv.iter().skip(1).cloned())
+        .collect::<Vec<_>>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::ParsedShellCommand;
     use super::extract_shell_script;
+    use super::join_program_and_argv;
     use super::map_exec_result;
     use crate::exec::SandboxType;
     use codex_shell_escalation::ExecResult;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::time::Duration;
 
@@ -446,6 +537,24 @@ mod tests {
                 script: "echo hi".to_string(),
                 login: false,
             }
+        );
+    }
+
+    #[test]
+    fn join_program_and_argv_replaces_original_argv_zero() {
+        assert_eq!(
+            join_program_and_argv(
+                &AbsolutePathBuf::from_absolute_path("/tmp/tool").unwrap(),
+                &["./tool".into(), "--flag".into(), "value".into()],
+            ),
+            vec!["/tmp/tool", "--flag", "value"]
+        );
+        assert_eq!(
+            join_program_and_argv(
+                &AbsolutePathBuf::from_absolute_path("/tmp/tool").unwrap(),
+                &["./tool".into()]
+            ),
+            vec!["/tmp/tool"]
         );
     }
 
