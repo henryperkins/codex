@@ -267,6 +267,7 @@ pub(crate) fn create_tool_for_query_project() -> Tool {
             "Search the current repository for relevant code snippets.\n\
              Call this before directly reading files so you start from ranked, relevant locations.\n\
              Use `query` for what you want to find, and optionally narrow with `file_globs` or `repo_root`.\n\
+             `repo_root` must stay inside the current working directory.\n\
              Returns ranked matches with file path, line range, snippet, and score.\n\
              Automatically performs an incremental index refresh before searching."
                 .into(),
@@ -527,6 +528,7 @@ pub(crate) async fn handle_query_project(
             params.alpha,
             &file_globs,
             embedding_model.clone(),
+            config.query_project_index.require_embeddings,
         )
         .await
     {
@@ -742,16 +744,27 @@ fn call_tool_success(payload: serde_json::Value) -> CallToolResult {
 }
 
 fn resolve_repo_root(repo_root: Option<&str>) -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    resolve_repo_root_from_cwd(repo_root, cwd.as_path())
+}
+
+fn resolve_repo_root_from_cwd(repo_root: Option<&str>, cwd: &Path) -> anyhow::Result<PathBuf> {
+    let canonical_cwd = cwd.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize current working directory `{}`",
+            cwd.display()
+        )
+    })?;
     let root = match repo_root {
         Some(repo_root) if !repo_root.trim().is_empty() => {
             let path = PathBuf::from(repo_root);
             if path.is_absolute() {
                 path
             } else {
-                std::env::current_dir()?.join(path)
+                canonical_cwd.join(path)
             }
         }
-        _ => std::env::current_dir()?,
+        _ => canonical_cwd.clone(),
     };
     let canonical_root = root.canonicalize().with_context(|| {
         format!(
@@ -763,6 +776,13 @@ fn resolve_repo_root(repo_root: Option<&str>) -> anyhow::Result<PathBuf> {
         anyhow::bail!(
             "repository root must be a directory: `{}`",
             canonical_root.display()
+        );
+    }
+    if canonical_root != canonical_cwd && !canonical_root.starts_with(&canonical_cwd) {
+        anyhow::bail!(
+            "repository root `{}` must be within the current working directory `{}`",
+            canonical_root.display(),
+            canonical_cwd.display()
         );
     }
     Ok(canonical_root)
@@ -1160,6 +1180,7 @@ impl RepoHybridIndex {
         alpha: f32,
         file_globs: &[String],
         embedding_model: String,
+        require_embeddings: bool,
     ) -> anyhow::Result<SearchOutcome> {
         let glob_set = build_glob_set(file_globs)?;
         let lexical_scores = self
@@ -1174,7 +1195,11 @@ impl RepoHybridIndex {
         let mut vector_scores = Vec::new();
         let mut effective_alpha = 0.0;
         let mut embedding_fallback_reason = None;
-        if self.embedding_ready().await? {
+        let embedding_ready = self.embedding_ready().await?;
+        if require_embeddings && !embedding_ready {
+            anyhow::bail!("embeddings are required but the index is not embedding-ready");
+        }
+        if embedding_ready {
             match embed_texts(
                 &self.embeddings_client,
                 &embedding_model,
@@ -1201,11 +1226,17 @@ impl RepoHybridIndex {
                             .await?;
                         effective_alpha = alpha;
                     } else {
+                        if require_embeddings {
+                            anyhow::bail!("embeddings are required but query embedding was empty");
+                        }
                         effective_alpha = 0.0;
                         embedding_fallback_reason = fallback_reason;
                     }
                 }
-                Err(_) => {
+                Err(err) => {
+                    if require_embeddings {
+                        return Err(err).context("failed to embed query in strict mode");
+                    }
                     effective_alpha = 0.0;
                     embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
                 }
@@ -1847,6 +1878,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_repo_root_rejects_paths_outside_cwd() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path().join("cwd");
+        let inside = cwd.join("repo");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&inside).expect("create inside dir");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+
+        let inside_resolved = resolve_repo_root_from_cwd(Some("repo"), cwd.as_path())
+            .expect("inside path should resolve");
+        assert_eq!(
+            inside_resolved,
+            inside.canonicalize().expect("inside canonical")
+        );
+
+        let err = resolve_repo_root_from_cwd(Some("../outside"), cwd.as_path())
+            .expect_err("outside path should be rejected");
+        assert!(
+            err.to_string()
+                .contains("must be within the current working directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_embedding_mode_uses_required_when_api_key_is_present() {
         let mode =
             resolve_embedding_mode_from_api_key(false, Some("test-key"), OPENAI_API_KEY_ENV_VAR)
@@ -2035,7 +2091,7 @@ mod tests {
             .await
             .expect("refresh");
         let outcome = index
-            .search("needle", 5, 1.0, &[], "model".to_string())
+            .search("needle", 5, 1.0, &[], "model".to_string(), false)
             .await
             .expect("search");
 
@@ -2047,6 +2103,29 @@ mod tests {
             "expected lexical match in results: {outcome:?}"
         );
         assert_eq!(outcome.embedding_fallback_reason, None);
+    }
+
+    #[tokio::test]
+    async fn strict_search_fails_without_embedding_ready_index() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let index = RepoHybridIndex::open(repo_root).await.expect("open index");
+        index
+            .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
+            .await
+            .expect("refresh");
+
+        let err = index
+            .search("needle", 5, 0.5, &[], "model".to_string(), true)
+            .await
+            .expect_err("strict mode should fail when embeddings are unavailable");
+        assert!(
+            err.to_string()
+                .contains("embeddings are required but the index is not embedding-ready"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2065,7 +2144,14 @@ mod tests {
         assert_eq!(first.stats.updated_files, 1);
         assert_eq!(second.stats.updated_files, 0);
         assert_eq!(second.stats.removed_files, 0);
-        assert_eq!(second.embedding_status.ready, first.embedding_status.ready);
+        assert_eq!(
+            first.embedding_status.ready,
+            first.embedding_status.mode_used.ready()
+        );
+        assert_eq!(
+            second.embedding_status.ready,
+            second.embedding_status.mode_used.ready()
+        );
     }
 
     #[tokio::test]
