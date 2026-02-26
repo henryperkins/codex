@@ -381,14 +381,32 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         provider: ModelProviderInfo,
     ) -> Self {
+        Self::with_provider_and_catalog_for_tests(codex_home, auth_manager, provider, None)
+    }
+
+    /// Construct a manager with a specific provider and optional model catalog for testing.
+    pub(crate) fn with_provider_and_catalog_for_tests(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        provider: ModelProviderInfo,
+        model_catalog: Option<ModelsResponse>,
+    ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
-        Self {
-            remote_models: RwLock::new(
+        let catalog_mode = if model_catalog.is_some() {
+            CatalogMode::Custom
+        } else {
+            CatalogMode::Default
+        };
+        let remote_models = model_catalog
+            .map(|catalog| catalog.models)
+            .unwrap_or_else(|| {
                 Self::load_remote_models_from_file()
-                    .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}")),
-            ),
-            catalog_mode: CatalogMode::Default,
+                    .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}"))
+            });
+        Self {
+            remote_models: RwLock::new(remote_models),
+            catalog_mode,
             collaboration_modes_config: CollaborationModesConfig::default(),
             auth_manager,
             etag: RwLock::new(None),

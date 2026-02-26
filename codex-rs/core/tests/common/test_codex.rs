@@ -174,6 +174,7 @@ impl TestCodexBuilder {
             auth.clone(),
             config.model_provider.clone(),
             config.codex_home.clone(),
+            config.model_catalog.clone(),
         );
         let thread_manager = Arc::new(thread_manager);
 
