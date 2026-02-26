@@ -694,6 +694,11 @@ pub struct Tui {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct QueryProjectIndex {
+    /// Backend to use for vector similarity operations.
+    /// Defaults to `local`.
+    #[serde(default)]
+    pub backend: QueryProjectIndexBackend,
+
     /// Whether to start a background warm-up after MCP initialization.
     /// Defaults to `true`.
     #[serde(default = "default_true")]
@@ -711,21 +716,79 @@ pub struct QueryProjectIndex {
     /// Optional default include globs for indexing/search.
     #[serde(default)]
     pub file_globs: Vec<String>,
+
+    /// Backend-specific settings when `backend = "qdrant"`.
+    #[serde(default)]
+    pub qdrant: QueryProjectIndexQdrant,
 }
 
 impl Default for QueryProjectIndex {
     fn default() -> Self {
         Self {
+            backend: QueryProjectIndexBackend::default(),
             auto_warm: true,
             require_embeddings: false,
             embedding_model: None,
             file_globs: Vec::new(),
+            qdrant: QueryProjectIndexQdrant::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryProjectIndexBackend {
+    #[default]
+    Local,
+    Qdrant,
+}
+
+/// Qdrant settings for `query_project` vector search.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct QueryProjectIndexQdrant {
+    /// Qdrant URL, for example `https://cluster.eu-central.aws.cloud.qdrant.io:6334`.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Environment variable name containing the Qdrant API key.
+    #[serde(default = "default_qdrant_api_key_env")]
+    pub api_key_env: String,
+
+    /// Prefix for deterministic per-repo collection names.
+    #[serde(default = "default_qdrant_collection_prefix")]
+    pub collection_prefix: String,
+
+    /// Request timeout for Qdrant operations, in milliseconds.
+    #[serde(default = "default_qdrant_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for QueryProjectIndexQdrant {
+    fn default() -> Self {
+        Self {
+            url: None,
+            api_key_env: default_qdrant_api_key_env(),
+            collection_prefix: default_qdrant_collection_prefix(),
+            timeout_ms: default_qdrant_timeout_ms(),
         }
     }
 }
 
 const fn default_true() -> bool {
     true
+}
+
+fn default_qdrant_api_key_env() -> String {
+    "QDRANT_API_KEY".to_string()
+}
+
+fn default_qdrant_collection_prefix() -> String {
+    "codex_repo_".to_string()
+}
+
+const fn default_qdrant_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Settings for notices we display to users via the tui and app-server clients

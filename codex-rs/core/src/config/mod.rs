@@ -1992,6 +1992,7 @@ impl Config {
 
         let query_project_index = cfg.query_project_index.unwrap_or_default();
         let query_project_index = QueryProjectIndex {
+            backend: query_project_index.backend,
             auto_warm: query_project_index.auto_warm,
             require_embeddings: query_project_index.require_embeddings,
             embedding_model: query_project_index.embedding_model.and_then(|model| {
@@ -2014,6 +2015,33 @@ impl Config {
                     }
                 })
                 .collect(),
+            qdrant: crate::config::types::QueryProjectIndexQdrant {
+                url: query_project_index.qdrant.url.and_then(|url| {
+                    let trimmed = url.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }),
+                api_key_env: {
+                    let trimmed = query_project_index.qdrant.api_key_env.trim();
+                    if trimmed.is_empty() {
+                        "QDRANT_API_KEY".to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                },
+                collection_prefix: {
+                    let trimmed = query_project_index.qdrant.collection_prefix.trim();
+                    if trimmed.is_empty() {
+                        "codex_repo_".to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                },
+                timeout_ms: query_project_index.qdrant.timeout_ms.max(1),
+            },
         };
 
         let log_dir = cfg
@@ -5681,6 +5709,37 @@ trust_level = "untrusted"
     }
 
     #[test]
+    fn config_toml_deserializes_query_project_index_qdrant_settings() {
+        let toml = r#"
+[query_project_index]
+backend = "qdrant"
+
+[query_project_index.qdrant]
+url = "https://cluster.example.com:6334"
+api_key_env = "QDRANT_TEST_KEY"
+collection_prefix = "repo_idx_"
+timeout_ms = 4321
+"#;
+        let cfg: ConfigToml = toml::from_str(toml)
+            .expect("TOML deserialization should succeed for query_project_index.qdrant");
+        let index = cfg
+            .query_project_index
+            .expect("query_project_index should be present");
+
+        assert_eq!(
+            index.backend,
+            crate::config::types::QueryProjectIndexBackend::Qdrant
+        );
+        assert_eq!(
+            index.qdrant.url.as_deref(),
+            Some("https://cluster.example.com:6334")
+        );
+        assert_eq!(index.qdrant.api_key_env, "QDRANT_TEST_KEY");
+        assert_eq!(index.qdrant.collection_prefix, "repo_idx_");
+        assert_eq!(index.qdrant.timeout_ms, 4321);
+    }
+
+    #[test]
     fn config_loads_mcp_oauth_callback_port_from_toml() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let toml = r#"
@@ -5741,6 +5800,53 @@ mcp_oauth_callback_url = "https://example.com/callback"
             config.mcp_oauth_callback_url.as_deref(),
             Some("https://example.com/callback")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn config_loads_query_project_index_qdrant_defaults_and_trims() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[query_project_index]
+backend = "qdrant"
+embedding_model = "   "
+file_globs = ["src/**/*.rs", "  ", "\n"]
+
+[query_project_index.qdrant]
+url = "   "
+api_key_env = "   "
+collection_prefix = "   "
+timeout_ms = 0
+"#,
+        )
+        .expect("TOML deserialization should succeed for qdrant defaults");
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.query_project_index.backend,
+            crate::config::types::QueryProjectIndexBackend::Qdrant
+        );
+        assert_eq!(config.query_project_index.embedding_model, None);
+        assert_eq!(
+            config.query_project_index.file_globs,
+            vec!["src/**/*.rs".to_string()]
+        );
+        assert_eq!(config.query_project_index.qdrant.url, None);
+        assert_eq!(
+            config.query_project_index.qdrant.api_key_env,
+            "QDRANT_API_KEY"
+        );
+        assert_eq!(
+            config.query_project_index.qdrant.collection_prefix,
+            "codex_repo_"
+        );
+        assert_eq!(config.query_project_index.qdrant.timeout_ms, 1);
         Ok(())
     }
 

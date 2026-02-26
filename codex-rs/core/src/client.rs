@@ -191,6 +191,11 @@ pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
     http_last_request: Option<ResponsesApiRequest>,
+    /// Last completed HTTP response for Azure-style chaining.
+    ///
+    /// Keeping this cached lets retries reuse the same chaining state when a request fails before
+    /// a new stream is established (for example, a 401 that triggers auth recovery).
+    http_last_completed_response: Option<LastResponse>,
     http_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     /// Turn state for sticky routing.
     ///
@@ -267,6 +272,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             http_last_request: None,
+            http_last_completed_response: None,
             http_last_response_rx: None,
             turn_state: Arc::new(OnceLock::new()),
         }
@@ -664,15 +670,18 @@ impl ModelClientSession {
         Self::get_last_response(&mut self.websocket_session.last_response_rx)
     }
 
-    fn get_last_http_response(&mut self) -> Option<LastResponse> {
-        Self::get_last_response(&mut self.http_last_response_rx)
+    fn poll_last_http_response(&mut self) {
+        if let Some(last_response) = Self::get_last_response(&mut self.http_last_response_rx) {
+            self.http_last_completed_response = Some(last_response);
+        }
     }
 
     fn prepare_azure_http_request(
         &mut self,
         mut request: ResponsesApiRequest,
     ) -> ResponsesApiRequest {
-        let Some(last_response) = self.get_last_http_response() else {
+        self.poll_last_http_response();
+        let Some(last_response) = self.http_last_completed_response.as_ref() else {
             return request;
         };
 
@@ -685,9 +694,9 @@ impl ModelClientSession {
             return request;
         };
         let incremental_items =
-            Self::get_incremental_items(previous_request, &request, Some(&last_response), false);
+            Self::get_incremental_items(previous_request, &request, Some(last_response), false);
         if let Some(append_items) = incremental_items {
-            request.previous_response_id = Some(last_response.response_id);
+            request.previous_response_id = Some(last_response.response_id.clone());
             request.input = append_items;
         }
 
@@ -896,6 +905,7 @@ impl ModelClientSession {
                         map_response_stream(stream, otel_manager.clone());
                     if is_azure_responses_endpoint {
                         self.http_last_request = Some(request_for_state);
+                        self.http_last_completed_response = None;
                         self.http_last_response_rx = Some(last_response_rx);
                     }
                     return Ok(stream);
@@ -1605,6 +1615,75 @@ mod tests {
 
         let prepared = session.prepare_azure_http_request(request);
         assert_eq!(prepared.previous_response_id, Some("resp-1".to_string()));
+        assert_eq!(prepared.input, vec![follow_up]);
+    }
+
+    #[test]
+    fn prepare_azure_http_request_reuses_cached_response_for_retry() {
+        let first_user = user_message("u1");
+        let assistant = assistant_message("a1");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, assistant.clone(), follow_up.clone()]);
+        let mut session = test_model_client(SessionSource::Cli).new_session();
+        session.http_last_request = Some(previous_request);
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant],
+            can_append: false,
+        })
+        .expect("should send last response");
+        session.http_last_response_rx = Some(rx);
+
+        let first_prepared = session.prepare_azure_http_request(request.clone());
+        assert_eq!(
+            first_prepared.previous_response_id,
+            Some("resp-1".to_string())
+        );
+        assert_eq!(first_prepared.input, vec![follow_up.clone()]);
+
+        let retry_prepared = session.prepare_azure_http_request(request);
+        assert_eq!(
+            retry_prepared.previous_response_id,
+            Some("resp-1".to_string())
+        );
+        assert_eq!(retry_prepared.input, vec![follow_up]);
+    }
+
+    #[test]
+    fn prepare_azure_http_request_prefers_newly_completed_response() {
+        let first_user = user_message("u1");
+        let stale_assistant = assistant_message("stale");
+        let new_assistant = assistant_message("fresh");
+        let follow_up = user_message("u2");
+
+        let previous_request = test_request(vec![first_user.clone()]);
+        let request = test_request(vec![first_user, new_assistant.clone(), follow_up.clone()]);
+        let mut session = test_model_client(SessionSource::Cli).new_session();
+        session.http_last_request = Some(previous_request);
+        session.http_last_completed_response = Some(LastResponse {
+            response_id: "resp-stale".to_string(),
+            items_added: vec![stale_assistant],
+            can_append: false,
+        });
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(LastResponse {
+            response_id: "resp-fresh".to_string(),
+            items_added: vec![new_assistant],
+            can_append: false,
+        })
+        .expect("should send last response");
+        session.http_last_response_rx = Some(rx);
+
+        let prepared = session.prepare_azure_http_request(request);
+        assert_eq!(
+            prepared.previous_response_id,
+            Some("resp-fresh".to_string())
+        );
         assert_eq!(prepared.input, vec![follow_up]);
     }
 

@@ -1,10 +1,23 @@
 use anyhow::Context;
 use codex_core::config::Config;
+use codex_core::config::types::QueryProjectIndex;
+use codex_core::config::types::QueryProjectIndexBackend;
 use futures::TryStreamExt;
 use globset::Glob;
 use globset::GlobSet;
 use globset::GlobSetBuilder;
 use ignore::WalkBuilder;
+use qdrant_client::Qdrant;
+use qdrant_client::qdrant::Condition;
+use qdrant_client::qdrant::CreateCollectionBuilder;
+use qdrant_client::qdrant::DeletePointsBuilder;
+use qdrant_client::qdrant::Distance;
+use qdrant_client::qdrant::Filter;
+use qdrant_client::qdrant::PointStruct;
+use qdrant_client::qdrant::QueryPointsBuilder;
+use qdrant_client::qdrant::UpsertPointsBuilder;
+use qdrant_client::qdrant::VectorParamsBuilder;
+use qdrant_client::qdrant::point_id::PointIdOptions;
 use reqwest::StatusCode;
 use rmcp::model::CallToolResult;
 use rmcp::model::Content;
@@ -15,6 +28,8 @@ use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use sha1::Digest;
+use sha1::Sha1;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -62,8 +77,10 @@ const EMBEDDING_CONNECT_TIMEOUT_SECS: u64 = 10;
 const QUERY_LOG_PREVIEW_CHARS: usize = 96;
 const METADATA_EMBEDDING_MODEL: &str = "embedding_model";
 const METADATA_EMBEDDING_READY: &str = "embedding_ready";
+const METADATA_VECTOR_BACKEND: &str = "vector_backend";
 const EMBEDDING_REASON_MISSING_API_KEY: &str = "missing_api_key";
 const EMBEDDING_REASON_QUERY_FAILED: &str = "embedding_query_failed";
+const QDRANT_PAYLOAD_PATH_KEY: &str = "path";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -294,8 +311,7 @@ pub(crate) fn create_tool_for_repo_index_refresh() -> Tool {
         input_schema,
         output_schema: None,
         description: Some(
-            "Incrementally refreshes the local repository hybrid-search index (SQLite + FTS + embeddings)."
-                .into(),
+            "Incrementally refreshes the repository hybrid-search index (local SQLite/FTS plus configured vector backend).".into(),
         ),
         annotations: None,
         execution: None,
@@ -337,6 +353,7 @@ pub(crate) async fn handle_repo_index_refresh(
         embedding_model,
         params.force_full,
         require_embeddings,
+        &config.query_project_index,
     )
     .await
     {
@@ -362,6 +379,7 @@ pub(crate) async fn auto_warm_query_project_index(
         config.query_project_index.embedding_model.clone(),
         false,
         config.query_project_index.require_embeddings,
+        &config.query_project_index,
     )
     .await
 }
@@ -372,8 +390,9 @@ async fn refresh_repo_index(
     embedding_model: Option<String>,
     force_full: bool,
     require_embeddings: bool,
+    index_config: &QueryProjectIndex,
 ) -> anyhow::Result<RepoIndexWarmOutcome> {
-    let index = RepoHybridIndex::open(&repo_root)
+    let index = RepoHybridIndex::open(&repo_root, index_config)
         .await
         .with_context(|| format!("failed to initialize index at `{}`", repo_root.display()))?;
     let embedding_model = embedding_model_or_default(embedding_model);
@@ -485,7 +504,7 @@ pub(crate) async fn handle_query_project(
         }
     };
 
-    let index = match RepoHybridIndex::open(&repo_root).await {
+    let index = match RepoHybridIndex::open(&repo_root, &config.query_project_index).await {
         Ok(index) => index,
         Err(err) => {
             return query_project_failure(
@@ -660,6 +679,8 @@ fn should_force_full_refresh(
     stored_model: Option<&str>,
     embedding_model: &str,
     stored_ready: bool,
+    stored_backend: Option<&str>,
+    current_backend: &str,
 ) -> bool {
     if force_full {
         return true;
@@ -668,6 +689,9 @@ fn should_force_full_refresh(
         return false;
     }
     if stored_model != Some(embedding_model) {
+        return true;
+    }
+    if stored_backend != Some(current_backend) {
         return true;
     }
     require_embeddings && !stored_ready
@@ -812,10 +836,230 @@ struct RepoHybridIndex {
     pool: SqlitePool,
     refresh_lock: Arc<AsyncMutex<()>>,
     embeddings_client: reqwest::Client,
+    vector_backend: VectorBackend,
+}
+
+#[derive(Clone, Debug)]
+enum VectorBackend {
+    Local,
+    Qdrant(QdrantVectorStore),
+}
+
+#[derive(Clone)]
+struct QdrantVectorStore {
+    client: Qdrant,
+    collection_name: String,
+}
+
+impl std::fmt::Debug for QdrantVectorStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QdrantVectorStore")
+            .field("collection_name", &self.collection_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VectorBackend {
+    fn from_config(repo_root: &Path, index_config: &QueryProjectIndex) -> anyhow::Result<Self> {
+        match index_config.backend {
+            QueryProjectIndexBackend::Local => Ok(Self::Local),
+            QueryProjectIndexBackend::Qdrant => {
+                let qdrant_config = &index_config.qdrant;
+                let url = qdrant_config.url.as_deref().context(
+                    "query_project qdrant backend requires query_project_index.qdrant.url",
+                )?;
+                let timeout = Duration::from_millis(qdrant_config.timeout_ms);
+                let mut builder = Qdrant::from_url(url).timeout(timeout);
+                if let Ok(api_key) = std::env::var(qdrant_config.api_key_env.as_str())
+                    && !api_key.trim().is_empty()
+                {
+                    builder = builder.api_key(api_key);
+                }
+                let client = builder.build().context("failed to create qdrant client")?;
+                let collection_name =
+                    qdrant_collection_name(repo_root, qdrant_config.collection_prefix.as_str());
+                Ok(Self::Qdrant(QdrantVectorStore {
+                    client,
+                    collection_name,
+                }))
+            }
+        }
+    }
+
+    fn qdrant_store(&self) -> Option<&QdrantVectorStore> {
+        match self {
+            Self::Local => None,
+            Self::Qdrant(store) => Some(store),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Qdrant(_) => "qdrant",
+        }
+    }
+}
+
+impl QdrantVectorStore {
+    async fn clear_collection(&self) -> anyhow::Result<()> {
+        if self
+            .client
+            .collection_exists(self.collection_name.as_str())
+            .await?
+        {
+            self.client
+                .delete_collection(self.collection_name.as_str())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_collection(&self, vector_size: usize, recreate: bool) -> anyhow::Result<()> {
+        let exists = self
+            .client
+            .collection_exists(self.collection_name.as_str())
+            .await?;
+        if recreate && exists {
+            self.client
+                .delete_collection(self.collection_name.as_str())
+                .await?;
+        } else if exists {
+            return Ok(());
+        }
+
+        self.client
+            .create_collection(
+                CreateCollectionBuilder::new(self.collection_name.as_str()).vectors_config(
+                    VectorParamsBuilder::new(vector_size as u64, Distance::Cosine),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_path(&self, path: &str) -> anyhow::Result<()> {
+        if !self
+            .client
+            .collection_exists(self.collection_name.as_str())
+            .await?
+        {
+            return Ok(());
+        }
+        let filter = Filter::must([Condition::matches(
+            QDRANT_PAYLOAD_PATH_KEY,
+            path.to_string(),
+        )]);
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(self.collection_name.as_str())
+                    .points(filter)
+                    .wait(true),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn upsert_chunks(
+        &self,
+        path: &str,
+        chunk_ids: &[i64],
+        embeddings: &[Vec<f32>],
+    ) -> anyhow::Result<()> {
+        let points = chunk_ids
+            .iter()
+            .zip(embeddings.iter())
+            .filter_map(|(chunk_id, embedding)| {
+                u64::try_from(*chunk_id).ok().map(|point_id| {
+                    PointStruct::new(
+                        point_id,
+                        embedding.clone(),
+                        [(QDRANT_PAYLOAD_PATH_KEY, path.to_string().into())],
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            return Ok(());
+        }
+        self.client
+            .upsert_points(
+                UpsertPointsBuilder::new(self.collection_name.as_str(), points).wait(true),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn vector_scores(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        glob_set: Option<&GlobSet>,
+        candidate_ids: Option<&[i64]>,
+    ) -> anyhow::Result<Vec<(i64, f32)>> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let candidate_limit = limit.saturating_mul(VECTOR_CANDIDATE_MULTIPLIER).max(limit);
+        if !self
+            .client
+            .collection_exists(self.collection_name.as_str())
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryPointsBuilder::new(self.collection_name.as_str())
+            .query(query_embedding.to_vec())
+            .limit(candidate_limit as u64)
+            .with_payload(true);
+
+        if let Some(candidate_ids) = candidate_ids {
+            let ids = candidate_ids
+                .iter()
+                .filter_map(|id| u64::try_from(*id).ok())
+                .collect::<Vec<_>>();
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            query = query.filter(Filter::must([Condition::has_id(ids)]));
+        }
+
+        let response = self.client.query(query).await?;
+        let mut scores = Vec::with_capacity(response.result.len());
+        for point in response.result {
+            let Some(point_id) = point.id.and_then(|id| id.point_id_options) else {
+                continue;
+            };
+            let chunk_id = match point_id {
+                PointIdOptions::Num(id) => match i64::try_from(id) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                },
+                PointIdOptions::Uuid(_) => continue,
+            };
+            if let Some(glob_set) = glob_set {
+                let Some(path) = point
+                    .payload
+                    .get(QDRANT_PAYLOAD_PATH_KEY)
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                if !glob_set.is_match(path) {
+                    continue;
+                }
+            }
+            scores.push((chunk_id, point.score));
+        }
+        scores.sort_by(sort_score_desc);
+        scores.truncate(candidate_limit);
+        Ok(scores)
+    }
 }
 
 impl RepoHybridIndex {
-    async fn open(repo_root: &Path) -> anyhow::Result<Self> {
+    async fn open(repo_root: &Path, index_config: &QueryProjectIndex) -> anyhow::Result<Self> {
         let index_dir = repo_root.join(INDEX_DIR);
         std::fs::create_dir_all(&index_dir).with_context(|| {
             format!("failed to create index directory `{}`", index_dir.display())
@@ -858,6 +1102,7 @@ impl RepoHybridIndex {
             pool,
             refresh_lock,
             embeddings_client,
+            vector_backend: VectorBackend::from_config(repo_root, index_config)?,
         };
         index.ensure_schema().await?;
         Ok(index)
@@ -976,6 +1221,8 @@ impl RepoHybridIndex {
         let glob_set = build_glob_set(file_globs)?;
         let stored_model = self.load_metadata(METADATA_EMBEDDING_MODEL).await?;
         let stored_ready = self.embedding_ready().await?;
+        let stored_backend = self.load_metadata(METADATA_VECTOR_BACKEND).await?;
+        let current_backend = self.vector_backend.name();
         let force_full = should_force_full_refresh(
             force_full,
             embedding_mode,
@@ -983,9 +1230,19 @@ impl RepoHybridIndex {
             stored_model.as_deref(),
             embedding_model.as_str(),
             stored_ready,
+            stored_backend.as_deref(),
+            current_backend,
         );
+        let vector_store = if matches!(embedding_mode, EmbeddingMode::Required) {
+            self.vector_backend.qdrant_store()
+        } else {
+            None
+        };
         if force_full {
             self.clear_all().await?;
+            if let Some(vector_store) = vector_store {
+                vector_store.clear_collection().await?;
+            }
         }
 
         let repo_root = self.repo_root.clone();
@@ -1004,6 +1261,7 @@ impl RepoHybridIndex {
             removed_files: 0,
             indexed_chunks: 0,
         };
+        let mut qdrant_collection_initialized = false;
 
         let scanned_paths: HashSet<&str> = scanned_files.keys().map(String::as_str).collect();
         for (path, _existing) in existing_files
@@ -1017,6 +1275,9 @@ impl RepoHybridIndex {
             }
             let mut tx = self.pool.begin().await?;
             remove_file_from_index(&mut tx, path).await?;
+            if let Some(vector_store) = vector_store {
+                vector_store.delete_path(path).await?;
+            }
             tx.commit().await?;
             stats.removed_files += 1;
         }
@@ -1036,6 +1297,9 @@ impl RepoHybridIndex {
                 None => {
                     let mut tx = self.pool.begin().await?;
                     remove_file_from_index(&mut tx, path).await?;
+                    if let Some(vector_store) = vector_store {
+                        vector_store.delete_path(path).await?;
+                    }
                     tx.commit().await?;
                     continue;
                 }
@@ -1054,6 +1318,9 @@ impl RepoHybridIndex {
                 .bind(scanned.size_bytes)
                 .execute(&mut *tx)
                 .await?;
+                if let Some(vector_store) = vector_store {
+                    vector_store.delete_path(path).await?;
+                }
                 tx.commit().await?;
                 stats.updated_files += 1;
                 continue;
@@ -1088,7 +1355,8 @@ impl RepoHybridIndex {
             .execute(&mut *tx)
             .await?;
 
-            for (chunk, embedding) in chunks.into_iter().zip(embeddings.into_iter()) {
+            let mut inserted_chunk_ids = Vec::with_capacity(embeddings.len());
+            for (chunk, embedding) in chunks.into_iter().zip(embeddings.iter()) {
                 let embedding_json = serde_json::to_string(&embedding)?;
                 let content = chunk.content;
                 let insert_result = sqlx::query(
@@ -1103,6 +1371,7 @@ impl RepoHybridIndex {
                 .execute(&mut *tx)
                 .await?;
                 let chunk_id = insert_result.last_insert_rowid();
+                inserted_chunk_ids.push(chunk_id);
                 sqlx::query(
                     "INSERT INTO chunks_fts(rowid, content, path, chunk_id) VALUES (?, ?, ?, ?)",
                 )
@@ -1113,12 +1382,25 @@ impl RepoHybridIndex {
                 .execute(&mut *tx)
                 .await?;
             }
+            if let Some(vector_store) = vector_store {
+                if !qdrant_collection_initialized
+                    && let Some(dimension) = embeddings.first().map(Vec::len)
+                {
+                    vector_store.ensure_collection(dimension, false).await?;
+                    qdrant_collection_initialized = true;
+                }
+                vector_store
+                    .upsert_chunks(path, inserted_chunk_ids.as_slice(), embeddings.as_slice())
+                    .await?;
+            }
             tx.commit().await?;
             stats.updated_files += 1;
         }
 
         stats.indexed_chunks = self.count_chunks().await?;
         self.set_metadata(METADATA_EMBEDDING_MODEL, &embedding_model)
+            .await?;
+        self.set_metadata(METADATA_VECTOR_BACKEND, current_backend)
             .await?;
         let ready = embedding_mode.ready();
         self.set_metadata(
@@ -1216,15 +1498,28 @@ impl RepoHybridIndex {
                         } else {
                             Some(lexical_candidate_ids.as_slice())
                         };
-                        vector_scores = self
+                        match self
                             .vector_scores(
                                 &query_embedding,
                                 limit,
                                 glob_set.as_ref(),
                                 vector_prefilter,
                             )
-                            .await?;
-                        effective_alpha = alpha;
+                            .await
+                        {
+                            Ok(scores) => {
+                                effective_alpha = if scores.is_empty() { 0.0 } else { alpha };
+                                vector_scores = scores;
+                            }
+                            Err(err) => {
+                                if require_embeddings {
+                                    return Err(err)
+                                        .context("failed to query vector backend in strict mode");
+                                }
+                                effective_alpha = 0.0;
+                                embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
+                            }
+                        }
                     } else {
                         if require_embeddings {
                             anyhow::bail!("embeddings are required but query embedding was empty");
@@ -1307,6 +1602,22 @@ impl RepoHybridIndex {
     }
 
     async fn vector_scores(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        glob_set: Option<&GlobSet>,
+        candidate_ids: Option<&[i64]>,
+    ) -> anyhow::Result<Vec<(i64, f32)>> {
+        if let Some(vector_store) = self.vector_backend.qdrant_store() {
+            return vector_store
+                .vector_scores(query_embedding, limit, glob_set, candidate_ids)
+                .await;
+        }
+        self.vector_scores_local(query_embedding, limit, glob_set, candidate_ids)
+            .await
+    }
+
+    async fn vector_scores_local(
         &self,
         query_embedding: &[f32],
         limit: usize,
@@ -1638,6 +1949,30 @@ fn should_skip_index_path(path: &str) -> bool {
         || path.starts_with(".codex/repo_hybrid_index/")
 }
 
+fn qdrant_collection_name(repo_root: &Path, prefix: &str) -> String {
+    let mut sanitized_prefix = prefix
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => ch,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized_prefix.is_empty() {
+        sanitized_prefix = "codex_repo_".to_string();
+    }
+    if !sanitized_prefix.ends_with('_') && !sanitized_prefix.ends_with('-') {
+        sanitized_prefix.push('_');
+    }
+    if sanitized_prefix.len() > 64 {
+        sanitized_prefix.truncate(64);
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(repo_root.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    format!("{sanitized_prefix}{digest:x}")
+}
+
 async fn read_text_file(path: &Path) -> anyhow::Result<Option<String>> {
     let bytes = tokio::fs::read(path)
         .await
@@ -1842,6 +2177,43 @@ mod tests {
     }
 
     #[test]
+    fn qdrant_collection_name_is_deterministic_and_sanitized() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let first = qdrant_collection_name(&repo_root, " codex repo ");
+        let second = qdrant_collection_name(&repo_root, " codex repo ");
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("codex_repo_"));
+        assert!(
+            first
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        );
+    }
+
+    #[test]
+    fn qdrant_backend_requires_url() {
+        let index_config = QueryProjectIndex {
+            backend: QueryProjectIndexBackend::Qdrant,
+            ..Default::default()
+        };
+        let err = VectorBackend::from_config(Path::new("/tmp/repo"), &index_config)
+            .expect_err("missing qdrant url should error");
+        assert!(
+            err.to_string().contains("query_project_index.qdrant.url"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_backend_local_returns_none_for_qdrant_store() {
+        assert!(VectorBackend::Local.qdrant_store().is_none());
+    }
+
+    #[test]
     fn normalize_scores_handles_constant_values() {
         let normalized = normalize_scores(&[(1, 2.0), (2, 2.0)]);
         assert_eq!(normalized.get(&1).copied(), Some(1.0));
@@ -1945,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn force_full_refresh_stays_disabled_for_non_strict_optional_embeddings() {
+    fn force_full_refresh_disabled_for_not_ready_optional_embeddings() {
         let should_force = should_force_full_refresh(
             false,
             EmbeddingMode::Required,
@@ -1953,6 +2325,23 @@ mod tests {
             Some(DEFAULT_EMBEDDING_MODEL),
             DEFAULT_EMBEDDING_MODEL,
             false,
+            Some("local"),
+            "local",
+        );
+        assert!(!should_force);
+    }
+
+    #[test]
+    fn force_full_refresh_stays_disabled_when_already_ready() {
+        let should_force = should_force_full_refresh(
+            false,
+            EmbeddingMode::Required,
+            true,
+            Some(DEFAULT_EMBEDDING_MODEL),
+            DEFAULT_EMBEDDING_MODEL,
+            true,
+            Some("local"),
+            "local",
         );
         assert!(!should_force);
     }
@@ -1966,6 +2355,8 @@ mod tests {
             Some(DEFAULT_EMBEDDING_MODEL),
             DEFAULT_EMBEDDING_MODEL,
             false,
+            Some("local"),
+            "local",
         );
         assert!(should_force);
     }
@@ -1979,8 +2370,40 @@ mod tests {
             Some("text-embedding-3-small"),
             "text-embedding-3-large",
             false,
+            Some("local"),
+            "local",
         );
         assert!(should_force);
+    }
+
+    #[test]
+    fn force_full_refresh_is_enabled_when_vector_backend_changes() {
+        let should_force = should_force_full_refresh(
+            false,
+            EmbeddingMode::Required,
+            false,
+            Some(DEFAULT_EMBEDDING_MODEL),
+            DEFAULT_EMBEDDING_MODEL,
+            true,
+            Some("local"),
+            "qdrant",
+        );
+        assert!(should_force);
+    }
+
+    #[test]
+    fn force_full_refresh_disabled_when_backend_matches() {
+        let should_force = should_force_full_refresh(
+            false,
+            EmbeddingMode::Required,
+            false,
+            Some(DEFAULT_EMBEDDING_MODEL),
+            DEFAULT_EMBEDDING_MODEL,
+            true,
+            Some("qdrant"),
+            "qdrant",
+        );
+        assert!(!should_force);
     }
 
     #[test]
@@ -2023,7 +2446,9 @@ mod tests {
         std::fs::write(repo_root.join("src/a.txt"), "alpha").expect("write a.txt");
         std::fs::write(repo_root.join("src/b.txt"), "beta").expect("write b.txt");
 
-        let index = RepoHybridIndex::open(repo_root).await.expect("open index");
+        let index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
         index
             .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
             .await
@@ -2051,7 +2476,9 @@ mod tests {
         let repo_root = temp.path();
         std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
 
-        let index = RepoHybridIndex::open(repo_root).await.expect("open index");
+        let index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
         let mode = resolve_embedding_mode_from_api_key(false, None, OPENAI_API_KEY_ENV_VAR)
             .expect("mode should resolve to skip");
         index
@@ -2085,7 +2512,9 @@ mod tests {
         let repo_root = temp.path();
         std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
 
-        let index = RepoHybridIndex::open(repo_root).await.expect("open index");
+        let index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
         index
             .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
             .await
@@ -2111,7 +2540,9 @@ mod tests {
         let repo_root = temp.path();
         std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
 
-        let index = RepoHybridIndex::open(repo_root).await.expect("open index");
+        let index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
         index
             .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
             .await
@@ -2134,10 +2565,12 @@ mod tests {
         let repo_root = temp.path().to_path_buf();
         std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
 
-        let first = refresh_repo_index(repo_root.clone(), vec![], None, false, false)
-            .await
-            .expect("first warm");
-        let second = refresh_repo_index(repo_root, vec![], None, false, false)
+        let index_config = QueryProjectIndex::default();
+        let first =
+            refresh_repo_index(repo_root.clone(), vec![], None, false, false, &index_config)
+                .await
+                .expect("first warm");
+        let second = refresh_repo_index(repo_root, vec![], None, false, false, &index_config)
             .await
             .expect("second warm");
 
@@ -2158,7 +2591,9 @@ mod tests {
     async fn vector_scores_with_candidates_avoids_full_table_scan() {
         let temp = tempdir().expect("tempdir");
         let repo_root = temp.path();
-        let index = RepoHybridIndex::open(repo_root).await.expect("open index");
+        let index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
         let mut tx = index.pool.begin().await.expect("begin tx");
 
         let good_insert = sqlx::query(

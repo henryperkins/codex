@@ -52,6 +52,7 @@ use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
+use codex_core::config::types::QueryProjectIndexBackend;
 use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::FEATURES;
@@ -4703,6 +4704,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_index_config_output(&mut self) {
+        let backend = self.config.query_project_index.backend;
         let auto_warm = self.config.query_project_index.auto_warm;
         let require_embeddings = self.config.query_project_index.require_embeddings;
         let embedding_model = self
@@ -4712,9 +4714,18 @@ impl ChatWidget {
             .clone()
             .unwrap_or_else(|| "default".to_string());
         let file_globs = self.config.query_project_index.file_globs.clone();
+        let qdrant = self.config.query_project_index.qdrant.clone();
 
         let mut lines = vec![
             Line::from(vec!["• ".into(), "query_project index defaults".into()]),
+            Line::from(vec![
+                "  backend: ".into(),
+                match backend {
+                    QueryProjectIndexBackend::Local => "local",
+                    QueryProjectIndexBackend::Qdrant => "qdrant",
+                }
+                .cyan(),
+            ]),
             Line::from(vec![
                 "  auto-warm: ".into(),
                 if auto_warm { "on" } else { "off" }.to_string().cyan(),
@@ -4727,6 +4738,22 @@ impl ChatWidget {
             ]),
             Line::from(vec!["  embedding-model: ".into(), embedding_model.cyan()]),
         ];
+        if matches!(backend, QueryProjectIndexBackend::Qdrant) {
+            let qdrant_url = qdrant.url.unwrap_or_else(|| "not set".to_string());
+            lines.push(Line::from(vec!["  qdrant-url: ".into(), qdrant_url.cyan()]));
+            lines.push(Line::from(vec![
+                "  qdrant-api-key-env: ".into(),
+                qdrant.api_key_env.cyan(),
+            ]));
+            lines.push(Line::from(vec![
+                "  qdrant-collection-prefix: ".into(),
+                qdrant.collection_prefix.cyan(),
+            ]));
+            lines.push(Line::from(vec![
+                "  qdrant-timeout-ms: ".into(),
+                qdrant.timeout_ms.to_string().cyan(),
+            ]));
+        }
 
         if file_globs.is_empty() {
             lines.push(Line::from(vec![
@@ -4747,7 +4774,8 @@ impl ChatWidget {
         lines.push(Line::from("  /index embedding-model <name|default>".dim()));
         lines.push(Line::from("  /index".dim()));
         lines.push(Line::from(
-            "  Use [query_project_index] in config.toml for file_globs and non-TUI edits.".dim(),
+            "  Use [query_project_index] in config.toml for backend, qdrant, file_globs, and non-TUI edits."
+                .dim(),
         ));
 
         self.add_plain_history_lines(lines);
