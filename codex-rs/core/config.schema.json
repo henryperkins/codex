@@ -1082,6 +1082,15 @@
           "description": "Whether to start a background warm-up after MCP initialization. Defaults to `true`.",
           "type": "boolean"
         },
+        "backend": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/QueryProjectIndexBackend"
+            }
+          ],
+          "default": "local",
+          "description": "Backend to use for vector similarity operations. Defaults to `local`."
+        },
         "embedding_model": {
           "default": null,
           "description": "Optional default embedding model override.",
@@ -1095,10 +1104,60 @@
           },
           "type": "array"
         },
+        "qdrant": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/QueryProjectIndexQdrant"
+            }
+          ],
+          "default": {
+            "api_key_env": "QDRANT_API_KEY",
+            "collection_prefix": "codex_repo_",
+            "timeout_ms": 10000,
+            "url": null
+          },
+          "description": "Backend-specific settings when `backend = \"qdrant\"`."
+        },
         "require_embeddings": {
           "default": false,
           "description": "If `true`, indexing/search requests fail when embeddings are unavailable. Defaults to `false`.",
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "QueryProjectIndexBackend": {
+      "enum": [
+        "local",
+        "qdrant"
+      ],
+      "type": "string"
+    },
+    "QueryProjectIndexQdrant": {
+      "additionalProperties": false,
+      "description": "Qdrant settings for `query_project` vector search.",
+      "properties": {
+        "api_key_env": {
+          "default": "QDRANT_API_KEY",
+          "description": "Environment variable name containing the Qdrant API key.",
+          "type": "string"
+        },
+        "collection_prefix": {
+          "default": "codex_repo_",
+          "description": "Prefix for deterministic per-repo collection names.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 10000,
+          "description": "Request timeout for Qdrant operations, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "url": {
+          "default": null,
+          "description": "Qdrant URL, for example `https://cluster.eu-central.aws.cloud.qdrant.io:6334`.",
+          "type": "string"
         }
       },
       "type": "object"

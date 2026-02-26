@@ -207,17 +207,23 @@ that want strict failure semantics when embeddings are unavailable.
 
 ## Index setup for `query_project`
 
-`query_project` relies on a local hybrid index stored under the repo at `.codex/repo_hybrid_index`.
+`query_project` uses a hybrid index:
+
+- local metadata + lexical index in `.codex/repo_hybrid_index` (SQLite + FTS)
+- vector search backend selected by config (`local` default, or `qdrant`)
 
 Recommended setup flow for MCP clients:
 
 1. (Optional) Set embedding credentials when you want embedding-backed ranking:
    - `OPENAI_API_KEY` for OpenAI-compatible models (default `text-embedding-3-small`).
    - `VOYAGE_API_KEY` for Voyage models (for example `voyage-3-large`).
-2. Complete the MCP handshake (`initialize` + `notifications/initialized`); Codex will start a background auto-warm for the current repo.
-3. Use `query_project` for searches; it performs incremental refresh automatically before each query.
-4. Read `embedding_status` in responses to detect whether embeddings are active (`ready: true`) or lexical-only fallback is in use. The optional `reason` can be `missing_api_key` or `embedding_query_failed`.
-5. Optionally call `repo_index_refresh` when you want an explicit warm-up at a chosen `repo_root` and/or specific `file_globs`.
+2. (Optional, only when `backend = "qdrant"`) configure Qdrant Cloud:
+   - Set `query_project_index.qdrant.url` to your cluster gRPC endpoint (typically port `6334`).
+   - Set the API key env var referenced by `query_project_index.qdrant.api_key_env` (default `QDRANT_API_KEY`).
+3. Complete the MCP handshake (`initialize` + `notifications/initialized`); Codex will start a background auto-warm for the current repo.
+4. Use `query_project` for searches; it performs incremental refresh automatically before each query.
+5. Read `embedding_status` in responses to detect whether embeddings are active (`ready: true`) or lexical-only fallback is in use. The optional `reason` can be `missing_api_key` or `embedding_query_failed`.
+6. Optionally call `repo_index_refresh` when you want an explicit warm-up at a chosen `repo_root` and/or specific `file_globs`.
 
 Warm-up request example:
 
@@ -243,16 +249,25 @@ Codex reads index defaults from `config.toml` under `[query_project_index]`:
 
 ```toml
 [query_project_index]
+backend = "local" # or "qdrant"
 auto_warm = true
 require_embeddings = false
 embedding_model = "text-embedding-3-small"
 file_globs = ["src/**/*.rs", "docs/**"]
+
+[query_project_index.qdrant]
+url = "https://cluster.eu-central.aws.cloud.qdrant.io:6334"
+api_key_env = "QDRANT_API_KEY"
+collection_prefix = "codex_repo_"
+timeout_ms = 10000
 ```
 
+- `backend` selects where vector similarity runs: `local` (default) or `qdrant`.
 - `auto_warm` controls whether MCP `notifications/initialized` triggers background warm-up.
 - `require_embeddings` controls fallback behavior for `query_project` and `repo_index_refresh` when embedding provider credentials are unavailable.
 - `embedding_model` sets the default embedding model when the tool call does not provide one.
 - `file_globs` sets default include filters when the tool call omits `file_globs`.
+- `qdrant.*` configures Qdrant Cloud/Server when `backend = "qdrant"`.
 
 In the TUI, run `/index` to inspect effective index settings and use:
 
@@ -260,7 +275,7 @@ In the TUI, run `/index` to inspect effective index settings and use:
 - `/index require-embeddings on|off`
 - `/index embedding-model <name|default>`
 
-For settings not exposed in the TUI (for example `file_globs`), edit `config.toml` directly.
+For settings not exposed in the TUI (for example `backend`, `qdrant.*`, or `file_globs`), edit `config.toml` directly.
 
 `repo_index_refresh` example:
 
