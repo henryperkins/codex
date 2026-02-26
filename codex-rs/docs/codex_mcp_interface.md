@@ -164,6 +164,7 @@ that want strict failure semantics when embeddings are unavailable.
 - `file_globs` (optional): include filters like `src/**/*.rs`.
 - `alpha` (optional): blend lexical/embedding scores (`0.0` lexical-only, `1.0` embedding-only).
 - `repo_root` and `embedding_model` (optional): override defaults when needed.
+- `repo_root` must resolve under the current working directory (the current directory or one of its subdirectories).
 
 `query_project` example:
 
@@ -233,7 +234,7 @@ Warm-up request example:
 
 Notes:
 
-- Use `require_embeddings: true` only when embeddings are mandatory for your workflow; calls will fail if the selected embedding provider credentials are unavailable.
+- Use `require_embeddings: true` only when embeddings are mandatory for your workflow; calls will fail if embeddings are unavailable (including missing provider credentials, an index that is not embedding-ready, or query-time embedding failures).
 - Use `force_full: true` only when you explicitly want a full rebuild instead of normal incremental refresh.
 
 ## Configuring index defaults
