@@ -196,6 +196,15 @@ impl ThreadManager {
         provider: ModelProviderInfo,
         codex_home: PathBuf,
     ) -> Self {
+        Self::with_models_provider_and_home_and_catalog_for_tests(auth, provider, codex_home, None)
+    }
+
+    pub(crate) fn with_models_provider_and_home_and_catalog_for_tests(
+        auth: CodexAuth,
+        provider: ModelProviderInfo,
+        codex_home: PathBuf,
+        model_catalog: Option<ModelsResponse>,
+    ) -> Self {
         set_thread_manager_test_mode_for_tests(true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
@@ -205,10 +214,11 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: Arc::new(ModelsManager::with_provider_for_tests(
+                models_manager: Arc::new(ModelsManager::with_provider_and_catalog_for_tests(
                     codex_home,
                     auth_manager.clone(),
                     provider,
+                    model_catalog,
                 )),
                 skills_manager,
                 file_watcher,

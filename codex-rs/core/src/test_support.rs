@@ -60,8 +60,14 @@ pub fn thread_manager_with_models_provider_and_home(
     auth: CodexAuth,
     provider: ModelProviderInfo,
     codex_home: PathBuf,
+    model_catalog: Option<ModelsResponse>,
 ) -> ThreadManager {
-    ThreadManager::with_models_provider_and_home_for_tests(auth, provider, codex_home)
+    ThreadManager::with_models_provider_and_home_and_catalog_for_tests(
+        auth,
+        provider,
+        codex_home,
+        model_catalog,
+    )
 }
 
 pub fn models_manager_with_provider(

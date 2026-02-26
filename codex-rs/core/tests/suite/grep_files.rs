@@ -1,14 +1,22 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Result;
+use codex_protocol::openai_models::ConfigShellToolType;
+use codex_protocol::openai_models::InputModality;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::TruncationPolicyConfig;
 use core_test_support::responses::mount_function_call_agent_response;
-use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command as StdCommand;
+use wiremock::MockServer;
 
 const MODEL_WITH_TOOL: &str = "test-gpt-5.1-codex";
 
@@ -34,7 +42,7 @@ async fn grep_files_tool_collects_matches() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_ripgrep_missing!(Ok(()));
 
-    let server = start_mock_server().await;
+    let server = MockServer::start().await;
     let test = build_test_codex(&server).await?;
 
     let search_dir = test.cwd.path().join("src");
@@ -92,7 +100,7 @@ async fn grep_files_tool_reports_empty_results() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_ripgrep_missing!(Ok(()));
 
-    let server = start_mock_server().await;
+    let server = MockServer::start().await;
     let test = build_test_codex(&server).await?;
 
     let search_dir = test.cwd.path().join("logs");
@@ -126,7 +134,43 @@ async fn grep_files_tool_reports_empty_results() -> Result<()> {
 
 #[allow(clippy::expect_used)]
 async fn build_test_codex(server: &wiremock::MockServer) -> Result<TestCodex> {
-    let mut builder = test_codex().with_model(MODEL_WITH_TOOL);
+    let model_with_grep_files = ModelInfo {
+        slug: MODEL_WITH_TOOL.to_string(),
+        display_name: "Grep files test model".to_string(),
+        description: Some("Remote model for grep_files integration tests".to_string()),
+        default_reasoning_level: Some(ReasoningEffort::Medium),
+        supported_reasoning_levels: vec![ReasoningEffortPreset {
+            effort: ReasoningEffort::Medium,
+            description: ReasoningEffort::Medium.to_string(),
+        }],
+        shell_type: ConfigShellToolType::ShellCommand,
+        visibility: ModelVisibility::List,
+        supported_in_api: true,
+        input_modalities: vec![InputModality::Text],
+        prefer_websockets: false,
+        used_fallback_model_metadata: false,
+        priority: 1,
+        upgrade: None,
+        base_instructions: "base instructions".to_string(),
+        model_messages: None,
+        supports_reasoning_summaries: false,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: None,
+        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        supports_parallel_tool_calls: true,
+        context_window: Some(272_000),
+        auto_compact_token_limit: None,
+        effective_context_window_percent: 95,
+        experimental_supported_tools: vec!["grep_files".to_string()],
+    };
+    let mut builder = test_codex()
+        .with_model(MODEL_WITH_TOOL)
+        .with_config(move |config| {
+            config.model_catalog = Some(ModelsResponse {
+                models: vec![model_with_grep_files],
+            });
+        });
     builder.build(server).await
 }
 
