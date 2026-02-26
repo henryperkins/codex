@@ -6744,7 +6744,7 @@ mod tests {
         .expect("memory summary should be written");
 
         turn_context.features.enable(Feature::MemoryTool);
-        let items = session.build_initial_context(&turn_context).await;
+        let items = session.build_initial_context(&turn_context, None).await;
         assert!(
             has_developer_instruction_with_text(&items, "MEMORY_TEST_SUMMARY_ENABLED"),
             "memory prompt should be included when memory_tool is enabled"
@@ -6766,7 +6766,7 @@ mod tests {
         .expect("memory summary should be written");
 
         turn_context.features.disable(Feature::MemoryTool);
-        let items = session.build_initial_context(&turn_context).await;
+        let items = session.build_initial_context(&turn_context, None).await;
         assert!(
             !has_developer_instruction_with_text(&items, "MEMORY_TEST_SUMMARY_DISABLED"),
             "memory prompt should be omitted when memory_tool is disabled"
@@ -7857,7 +7857,7 @@ mod tests {
     #[tokio::test]
     async fn failed_sampling_attempt_restore_drops_partial_reasoning_from_history() {
         let (sess, turn_context) = make_session_and_context().await;
-        let initial_context = sess.build_initial_context(&turn_context).await;
+        let initial_context = sess.build_initial_context(&turn_context, None).await;
         sess.record_into_history(&initial_context, &turn_context)
             .await;
 
