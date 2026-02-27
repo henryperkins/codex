@@ -1,6 +1,7 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Result;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
@@ -154,6 +155,7 @@ async fn build_test_codex(server: &wiremock::MockServer) -> Result<TestCodex> {
         base_instructions: "base instructions".to_string(),
         model_messages: None,
         supports_reasoning_summaries: false,
+        default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
         apply_patch_tool_type: None,

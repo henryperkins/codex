@@ -50,8 +50,6 @@ use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
 use crate::protocol::ReadOnlyAccess;
 use crate::protocol::SandboxPolicy;
-#[cfg(target_os = "macos")]
-use crate::seatbelt_permissions::MacOsSeatbeltProfileExtensions;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
@@ -67,6 +65,7 @@ use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::MacOsSeatbeltProfileExtensions;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
@@ -83,8 +82,6 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(test)]
 use tempfile::tempdir;
-#[cfg(not(target_os = "macos"))]
-type MacOsSeatbeltProfileExtensions = ();
 
 use crate::config::permissions::network_proxy_config_from_permissions;
 use crate::config::profile::ConfigProfile;
@@ -416,9 +413,9 @@ pub struct Config {
     /// global default").
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
 
-    /// If not "none", the value to use for `reasoning.summary` when making a
-    /// request using the Responses API.
-    pub model_reasoning_summary: ReasoningSummary,
+    /// Optional value to use for `reasoning.summary` when making a request
+    /// using the Responses API. When unset, the model catalog default is used.
+    pub model_reasoning_summary: Option<ReasoningSummary>,
 
     /// Optional override to force-enable reasoning summaries for the configured model.
     pub model_supports_reasoning_summaries: Option<bool>,
@@ -432,6 +429,9 @@ pub struct Config {
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: String,
+
+    /// Machine-local realtime audio device preferences used by realtime voice.
+    pub realtime_audio: RealtimeAudioConfig,
 
     /// Experimental / do not use. Overrides only the realtime conversation
     /// websocket transport base URL (the `Op::RealtimeConversation` `/ws`
@@ -1185,6 +1185,10 @@ pub struct ConfigToml {
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: Option<String>,
 
+    /// Machine-local realtime audio device preferences used by realtime voice.
+    #[serde(default)]
+    pub audio: Option<RealtimeAudioToml>,
+
     /// Experimental / do not use. Overrides only the realtime conversation
     /// websocket transport base URL (the `Op::RealtimeConversation` `/ws`
     /// connection) without changing normal provider HTTP requests.
@@ -1314,6 +1318,19 @@ impl ProjectConfig {
     pub fn is_untrusted(&self) -> bool {
         matches!(self.trust_level, Some(TrustLevel::Untrusted))
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealtimeAudioConfig {
+    pub microphone: Option<String>,
+    pub speaker: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RealtimeAudioToml {
+    pub microphone: Option<String>,
+    pub speaker: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
@@ -2202,8 +2219,7 @@ impl Config {
                 .or(cfg.plan_mode_reasoning_effort),
             model_reasoning_summary: config_profile
                 .model_reasoning_summary
-                .or(cfg.model_reasoning_summary)
-                .unwrap_or_default(),
+                .or(cfg.model_reasoning_summary),
             model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_catalog,
             model_verbosity: config_profile.model_verbosity.or(cfg.model_verbosity),
@@ -2211,6 +2227,12 @@ impl Config {
                 .chatgpt_base_url
                 .or(cfg.chatgpt_base_url)
                 .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
+            realtime_audio: cfg
+                .audio
+                .map_or_else(RealtimeAudioConfig::default, |audio| RealtimeAudioConfig {
+                    microphone: audio.microphone,
+                    speaker: audio.speaker,
+                }),
             experimental_realtime_ws_base_url: cfg.experimental_realtime_ws_base_url,
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             forced_chatgpt_workspace_id,
@@ -2529,6 +2551,7 @@ persistence = "none"
         let memories = r#"
 [memories]
 max_raw_memories_for_global = 512
+max_unused_days = 21
 max_rollout_age_days = 42
 max_rollouts_per_startup = 9
 min_rollout_idle_hours = 24
@@ -2540,6 +2563,7 @@ phase_2_model = "gpt-5"
         assert_eq!(
             Some(MemoriesToml {
                 max_raw_memories_for_global: Some(512),
+                max_unused_days: Some(21),
                 max_rollout_age_days: Some(42),
                 max_rollouts_per_startup: Some(9),
                 min_rollout_idle_hours: Some(24),
@@ -2559,6 +2583,7 @@ phase_2_model = "gpt-5"
             config.memories,
             MemoriesConfig {
                 max_raw_memories_for_global: 512,
+                max_unused_days: 21,
                 max_rollout_age_days: 42,
                 max_rollouts_per_startup: 9,
                 min_rollout_idle_hours: 24,
@@ -4823,12 +4848,13 @@ model_verbosity = "high"
                 show_raw_agent_reasoning: false,
                 model_reasoning_effort: Some(ReasoningEffort::High),
                 plan_mode_reasoning_effort: None,
-                model_reasoning_summary: ReasoningSummary::Detailed,
+                model_reasoning_summary: Some(ReasoningSummary::Detailed),
                 model_supports_reasoning_summaries: None,
                 model_catalog: None,
                 model_verbosity: None,
                 personality: Some(Personality::Pragmatic),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+                realtime_audio: RealtimeAudioConfig::default(),
                 experimental_realtime_ws_base_url: None,
                 experimental_realtime_ws_backend_prompt: None,
                 base_instructions: None,
@@ -4950,12 +4976,13 @@ model_verbosity = "high"
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
             plan_mode_reasoning_effort: None,
-            model_reasoning_summary: ReasoningSummary::default(),
+            model_reasoning_summary: None,
             model_supports_reasoning_summaries: None,
             model_catalog: None,
             model_verbosity: None,
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+            realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_ws_base_url: None,
             experimental_realtime_ws_backend_prompt: None,
             base_instructions: None,
@@ -5075,12 +5102,13 @@ model_verbosity = "high"
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
             plan_mode_reasoning_effort: None,
-            model_reasoning_summary: ReasoningSummary::default(),
+            model_reasoning_summary: None,
             model_supports_reasoning_summaries: None,
             model_catalog: None,
             model_verbosity: None,
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+            realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_ws_base_url: None,
             experimental_realtime_ws_backend_prompt: None,
             base_instructions: None,
@@ -5186,12 +5214,13 @@ model_verbosity = "high"
             show_raw_agent_reasoning: false,
             model_reasoning_effort: Some(ReasoningEffort::High),
             plan_mode_reasoning_effort: None,
-            model_reasoning_summary: ReasoningSummary::Detailed,
+            model_reasoning_summary: Some(ReasoningSummary::Detailed),
             model_supports_reasoning_summaries: None,
             model_catalog: None,
             model_verbosity: Some(Verbosity::High),
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+            realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_ws_base_url: None,
             experimental_realtime_ws_backend_prompt: None,
             base_instructions: None,
@@ -6112,6 +6141,39 @@ experimental_realtime_ws_backend_prompt = "prompt from config"
         assert_eq!(
             config.experimental_realtime_ws_backend_prompt.as_deref(),
             Some("prompt from config")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn realtime_audio_loads_from_config_toml() -> std::io::Result<()> {
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[audio]
+microphone = "USB Mic"
+speaker = "Desk Speakers"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let realtime_audio = cfg
+            .audio
+            .as_ref()
+            .expect("realtime audio config should be present");
+        assert_eq!(realtime_audio.microphone.as_deref(), Some("USB Mic"));
+        assert_eq!(realtime_audio.speaker.as_deref(), Some("Desk Speakers"));
+
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.realtime_audio.microphone.as_deref(), Some("USB Mic"));
+        assert_eq!(
+            config.realtime_audio.speaker.as_deref(),
+            Some("Desk Speakers")
         );
         Ok(())
     }
