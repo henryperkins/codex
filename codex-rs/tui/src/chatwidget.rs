@@ -463,6 +463,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) is_first_run: bool,
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) model: Option<String>,
+    pub(crate) startup_tooltip_override: Option<String>,
     // Shared latch so we only warn once about invalid status-line item IDs.
     pub(crate) status_line_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) otel_manager: OtelManager,
@@ -604,6 +605,8 @@ pub(crate) struct ChatWidget {
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
     show_welcome_banner: bool,
+    // One-shot tooltip override for the primary startup session.
+    startup_tooltip_override: Option<String>,
     // When resuming an existing session (selected via resume picker), avoid an
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
@@ -1145,11 +1148,13 @@ impl ChatWidget {
         );
         self.refresh_model_display();
         self.sync_personality_command_enabled();
+        let startup_tooltip_override = self.startup_tooltip_override.take();
         let session_info_cell = history_cell::new_session_info(
             &self.config,
             &model_for_header,
             event,
             self.show_welcome_banner,
+            startup_tooltip_override,
             self.auth_manager
                 .auth_cached()
                 .and_then(|auth| auth.account_plan_type()),
@@ -2756,6 +2761,7 @@ impl ChatWidget {
             is_first_run,
             feedback_audience,
             model,
+            startup_tooltip_override,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -2853,6 +2859,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
+            startup_tooltip_override,
             suppress_session_configured_redraw: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -2934,6 +2941,7 @@ impl ChatWidget {
             is_first_run,
             feedback_audience,
             model,
+            startup_tooltip_override,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3034,6 +3042,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
+            startup_tooltip_override,
             suppress_session_configured_redraw: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -3100,6 +3109,7 @@ impl ChatWidget {
             is_first_run: _,
             feedback_audience,
             model,
+            startup_tooltip_override: _,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3196,6 +3206,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: false,
+            startup_tooltip_override: None,
             suppress_session_configured_redraw: true,
             pending_notification: None,
             quit_shortcut_expires_at: None,
