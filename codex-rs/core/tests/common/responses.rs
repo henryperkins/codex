@@ -310,7 +310,7 @@ pub(crate) fn output_value_to_text(value: &Value) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod invariant_tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use wiremock::http::HeaderMap;
