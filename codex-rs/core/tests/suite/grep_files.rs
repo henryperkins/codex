@@ -151,6 +151,7 @@ async fn build_test_codex(server: &wiremock::MockServer) -> Result<TestCodex> {
         prefer_websockets: false,
         used_fallback_model_metadata: false,
         priority: 1,
+        availability_nux: None,
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
