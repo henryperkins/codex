@@ -402,6 +402,32 @@ fn for_prompt_drops_reasoning_followed_by_user_message() {
 }
 
 #[test]
+fn for_prompt_drops_consecutive_reasoning_followed_by_user_message() {
+    let modalities = default_input_modalities();
+    let history = create_history_with_items(vec![
+        reasoning_msg("thinking one..."),
+        reasoning_msg("thinking two..."),
+        user_msg("u1"),
+    ]);
+    assert_eq!(history.for_prompt(&modalities), vec![user_msg("u1")]);
+}
+
+#[test]
+fn for_prompt_drops_middle_reasoning_chain_if_follower_is_user_message() {
+    let modalities = default_input_modalities();
+    let history = create_history_with_items(vec![
+        user_msg("u1"),
+        reasoning_msg("thinking one..."),
+        reasoning_msg("thinking two..."),
+        user_msg("u2"),
+    ]);
+    assert_eq!(
+        history.for_prompt(&modalities),
+        vec![user_msg("u1"), user_msg("u2")]
+    );
+}
+
+#[test]
 fn for_prompt_preserves_reasoning_with_model_generated_follower() {
     let modalities = default_input_modalities();
     let reasoning = reasoning_msg("thinking...");

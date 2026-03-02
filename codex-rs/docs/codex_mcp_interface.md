@@ -275,7 +275,7 @@ timeout_ms = 10000
 - `file_globs` sets default include filters when the tool call omits `file_globs`.
 - `qdrant.*` configures Qdrant Cloud/Server when `backend = "qdrant"`.
 
-In the TUI, run `/index` to inspect effective index settings and use:
+In the TUI, run `/index` to inspect effective index settings, or `/index edit` to open the settings popup, and use:
 
 - `/index auto-warm on|off`
 - `/index require-embeddings on|off`

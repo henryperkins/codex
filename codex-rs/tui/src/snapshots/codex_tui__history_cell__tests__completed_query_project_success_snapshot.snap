@@ -1,7 +1,11 @@
 ---
 source: tui/src/history_cell.rs
+assertion_line: 3826
 expression: rendered
 ---
 • Searched
   └ codex_apps.query_project({"query":"authentication middleware","limit":5})
-    {"results": [{"path": "src/auth.rs", "score": 0.92}]}
+    view structured • Alt+r toggle • Alt+e top • Alt+w wrap:off • Alt+j/k select
+        • Alt+o open • sel 1/1
+    1 match
+    › 1. src/auth.rs 0.9200

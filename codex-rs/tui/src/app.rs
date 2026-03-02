@@ -19,6 +19,7 @@ use crate::external_editor;
 use crate::file_search::FileSearchManager;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::McpToolCallCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::model_migration::ModelMigrationOutcome;
@@ -83,6 +84,7 @@ use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -93,6 +95,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -119,6 +122,16 @@ const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryProjectKeyAction {
+    ToggleRaw,
+    ToggleExpandAll,
+    ToggleWrapSnippets,
+    SelectPreviousResult,
+    SelectNextResult,
+    OpenSelectedResult,
+}
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -2992,6 +3005,10 @@ impl App {
             AppEvent::OpenReviewCustomPrompt => {
                 self.chat_widget.show_review_custom_prompt();
             }
+            AppEvent::OpenIndexEmbeddingModelPrompt { current_model } => {
+                self.chat_widget
+                    .show_index_embedding_model_prompt(current_model);
+            }
             AppEvent::SubmitUserMessageWithMode {
                 text,
                 collaboration_mode,
@@ -3350,6 +3367,182 @@ impl App {
         }
     }
 
+    pub(crate) fn query_project_action_for_key_event(
+        key_event: &KeyEvent,
+    ) -> Option<QueryProjectKeyAction> {
+        if key_event.kind != KeyEventKind::Press {
+            return None;
+        }
+        let modifiers = key_event.modifiers;
+        if !modifiers.contains(KeyModifiers::ALT) || modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        match key_event.code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => {
+                Some(QueryProjectKeyAction::ToggleRaw)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => {
+                Some(QueryProjectKeyAction::ToggleExpandAll)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => {
+                Some(QueryProjectKeyAction::ToggleWrapSnippets)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => {
+                Some(QueryProjectKeyAction::SelectPreviousResult)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'j') => {
+                Some(QueryProjectKeyAction::SelectNextResult)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'o') => {
+                Some(QueryProjectKeyAction::OpenSelectedResult)
+            }
+            _ => None,
+        }
+    }
+
+    fn latest_query_project_cell(&self) -> Option<&McpToolCallCell> {
+        self.transcript_cells.iter().rev().find_map(|cell| {
+            let tool_call = cell.as_any().downcast_ref::<McpToolCallCell>()?;
+            tool_call.is_query_project_tool_call().then_some(tool_call)
+        })
+    }
+
+    fn resolve_query_project_result_path(&self, raw_path: &str) -> PathBuf {
+        let candidate = PathBuf::from(raw_path);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            self.config.cwd.join(candidate)
+        }
+    }
+
+    pub(crate) async fn handle_query_project_key_action(
+        &mut self,
+        tui: &mut tui::Tui,
+        action: QueryProjectKeyAction,
+    ) -> bool {
+        let handled = match action {
+            QueryProjectKeyAction::ToggleRaw => self
+                .latest_query_project_cell()
+                .and_then(McpToolCallCell::toggle_query_project_raw_mode)
+                .is_some(),
+            QueryProjectKeyAction::ToggleExpandAll => self
+                .latest_query_project_cell()
+                .and_then(McpToolCallCell::toggle_query_project_expand_all)
+                .is_some(),
+            QueryProjectKeyAction::ToggleWrapSnippets => self
+                .latest_query_project_cell()
+                .and_then(McpToolCallCell::toggle_query_project_wrap_snippets)
+                .is_some(),
+            QueryProjectKeyAction::SelectPreviousResult => self
+                .latest_query_project_cell()
+                .and_then(McpToolCallCell::select_previous_query_project_result)
+                .is_some(),
+            QueryProjectKeyAction::SelectNextResult => self
+                .latest_query_project_cell()
+                .and_then(McpToolCallCell::select_next_query_project_result)
+                .is_some(),
+            QueryProjectKeyAction::OpenSelectedResult => {
+                return self.open_selected_query_project_result(tui).await;
+            }
+        };
+
+        if handled {
+            tui.frame_requester().schedule_frame();
+        }
+        handled
+    }
+
+    async fn open_selected_query_project_result(&mut self, tui: &mut tui::Tui) -> bool {
+        let Some(result) = self
+            .latest_query_project_cell()
+            .and_then(McpToolCallCell::selected_query_project_result)
+        else {
+            return false;
+        };
+
+        let path = self.resolve_query_project_result_path(&result.path);
+        if !path.exists() {
+            self.chat_widget.add_error_message(format!(
+                "query_project result path does not exist: {}",
+                path.display()
+            ));
+            tui.frame_requester().schedule_frame();
+            return true;
+        }
+
+        self.launch_query_project_result_in_editor(tui, &path, result.line)
+            .await;
+        true
+    }
+
+    async fn launch_query_project_result_in_editor(
+        &mut self,
+        tui: &mut tui::Tui,
+        path: &Path,
+        line: Option<usize>,
+    ) {
+        let editor_cmd = match external_editor::resolve_editor_command() {
+            Ok(cmd) => cmd,
+            Err(external_editor::EditorError::MissingEditor) => {
+                self.chat_widget
+                    .add_error_message("Cannot open file: set $VISUAL or $EDITOR.".to_string());
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Cannot open file in editor: {err}"));
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+        };
+
+        let target_path = path.to_path_buf();
+        let editor_result = tui
+            .with_restored(tui::RestoreMode::KeepRaw, || async move {
+                let mut cmd = external_editor::build_editor_command(&editor_cmd)?;
+                if let Some(line_number) = line {
+                    match external_editor::line_navigation_style(&editor_cmd) {
+                        external_editor::LineNavigationStyle::PlusPrefix => {
+                            cmd.arg(format!("+{line_number}")).arg(&target_path);
+                        }
+                        external_editor::LineNavigationStyle::GotoFlag => {
+                            cmd.arg("--goto")
+                                .arg(format!("{}:{line_number}", target_path.display()));
+                        }
+                        external_editor::LineNavigationStyle::PathWithLineSuffix => {
+                            cmd.arg(format!("{}:{line_number}", target_path.display()));
+                        }
+                        external_editor::LineNavigationStyle::None => {
+                            cmd.arg(&target_path);
+                        }
+                    }
+                } else {
+                    cmd.arg(&target_path);
+                }
+                let status = cmd
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .await?;
+                if !status.success() {
+                    return Err(color_eyre::eyre::Report::msg(format!(
+                        "editor exited with status {status}",
+                    )));
+                }
+                Ok(())
+            })
+            .await;
+
+        if let Err(err) = editor_result {
+            self.chat_widget
+                .add_error_message(format!("Failed to open query_project result: {err}"));
+        }
+        tui.frame_requester().schedule_frame();
+    }
+
     async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
         let editor_cmd = match external_editor::resolve_editor_command() {
             Ok(cmd) => cmd,
@@ -3414,6 +3607,12 @@ impl App {
     }
 
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
+        if let Some(action) = Self::query_project_action_for_key_event(&key_event)
+            && self.handle_query_project_key_action(tui, action).await
+        {
+            return;
+        }
+
         match key_event {
             KeyEvent {
                 code: KeyCode::Char('t'),
@@ -4584,6 +4783,35 @@ mod tests {
             app.chat_widget.config_ref().tui_theme.as_deref(),
             Some("dracula")
         );
+    }
+
+    #[test]
+    fn query_project_key_actions_are_mapped_for_alt_shortcuts() {
+        let cases = [
+            ('r', QueryProjectKeyAction::ToggleRaw),
+            ('e', QueryProjectKeyAction::ToggleExpandAll),
+            ('w', QueryProjectKeyAction::ToggleWrapSnippets),
+            ('k', QueryProjectKeyAction::SelectPreviousResult),
+            ('j', QueryProjectKeyAction::SelectNextResult),
+            ('o', QueryProjectKeyAction::OpenSelectedResult),
+        ];
+
+        for (ch, expected) in cases {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT);
+            assert_eq!(
+                App::query_project_action_for_key_event(&key),
+                Some(expected)
+            );
+        }
+
+        let non_alt = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(App::query_project_action_for_key_event(&non_alt), None);
+
+        let ctrl_alt = KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(App::query_project_action_for_key_event(&ctrl_alt), None);
     }
 
     #[tokio::test]

@@ -741,6 +741,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_output_item_done_variant_maps_to_other() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "future_item_type",
+                    "foo": "bar"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp-1" }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_matches!(
+            &events[0],
+            ResponseEvent::OutputItemDone(ResponseItem::Other)
+        );
+        assert_matches!(
+            &events[1],
+            ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                can_append
+            } if response_id == "resp-1" && token_usage.is_none() && !can_append
+        );
+    }
+
+    #[tokio::test]
     async fn emits_completed_without_stream_end() {
         let completed = json!({
             "type": "response.completed",

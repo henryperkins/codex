@@ -117,11 +117,13 @@ use toml::Value as TomlValue;
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
     let codex_home = std::env::temp_dir();
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .build()
         .await
-        .expect("config")
+        .expect("config");
+    config.model_provider.base_url = None;
+    config
 }
 
 fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError {
@@ -4684,17 +4686,21 @@ async fn slash_quit_requests_exit() {
 }
 
 #[tokio::test]
-async fn slash_index_shows_current_index_defaults() {
+async fn slash_index_shows_config_output() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
     chat.dispatch_command(SlashCommand::Index);
 
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(
-        cells.len(),
-        1,
-        "expected one index settings history message"
+    // bare /index should NOT open a settings popup; it should add config output to history.
+    let popup = render_bottom_popup(&chat, 90);
+    assert!(
+        !popup.contains("Index settings"),
+        "expected no settings popup, got:\n{popup}"
     );
+
+    // It should have rendered config output into history.
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one index config history message");
     let rendered = lines_to_single_string(&cells[0]);
     assert!(
         rendered.contains("query_project index defaults"),
@@ -4704,6 +4710,43 @@ async fn slash_index_shows_current_index_defaults() {
         rendered.contains("/index auto-warm on|off"),
         "expected /index usage hints, got: {rendered:?}"
     );
+}
+
+#[tokio::test]
+async fn slash_index_shows_qdrant_defaults_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.config.query_project_index.backend =
+        codex_core::config::types::QueryProjectIndexBackend::Qdrant;
+    chat.config.query_project_index.auto_warm = true;
+    chat.config.query_project_index.require_embeddings = true;
+    chat.config.query_project_index.embedding_model = Some("text-embedding-3-small".to_string());
+    chat.config.query_project_index.file_globs = Vec::new();
+    chat.config.query_project_index.qdrant.url = Some(
+        "https://f2e5a36d-0c8b-4f74-a174-e53bc60baab9.eastus-0.azure.cloud.qdrant.io:6334"
+            .to_string(),
+    );
+    chat.config.query_project_index.qdrant.api_key_env = "QDRANT_API_KEY".to_string();
+    chat.config.query_project_index.qdrant.collection_prefix = "codex_repo_".to_string();
+    chat.config.query_project_index.qdrant.timeout_ms = 10_000;
+
+    chat.dispatch_command(SlashCommand::Index);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one index config history message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert_snapshot!("slash_index_qdrant_defaults_output", rendered);
+}
+
+#[tokio::test]
+async fn slash_index_edit_opens_settings_popup() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    // Route through the command argument parser to verify the "edit" branch.
+    chat.apply_index_command_args("edit");
+
+    let popup = render_bottom_popup(&chat, 90);
+    assert_snapshot!("index_settings_popup", popup);
 }
 
 #[tokio::test]
@@ -4783,6 +4826,43 @@ async fn slash_index_with_args_sends_persist_event() {
             auto_warm: Some(false),
             require_embeddings: None,
             embedding_model: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn index_settings_popup_can_open_embedding_model_prompt() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.open_index_settings_popup();
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenIndexEmbeddingModelPrompt {
+            current_model: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn index_embedding_model_prompt_submits_default_clear() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_index_embedding_model_prompt(Some("text-embedding-3-large".to_string()));
+    for ch in "default".chars() {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::PersistQueryProjectIndexConfig {
+            auto_warm: None,
+            require_embeddings: None,
+            embedding_model: Some(None),
         })
     );
 }

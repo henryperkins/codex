@@ -3952,6 +3952,108 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    fn open_index_settings_popup(&mut self) {
+        let auto_warm = self.config.query_project_index.auto_warm;
+        let require_embeddings = self.config.query_project_index.require_embeddings;
+        let current_model = self.config.query_project_index.embedding_model.clone();
+        let current_model_label = current_model
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let auto_warm_label = if auto_warm { "on" } else { "off" };
+        let require_embeddings_label = if require_embeddings { "on" } else { "off" };
+
+        let toggle_auto_warm_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::PersistQueryProjectIndexConfig {
+                auto_warm: Some(!auto_warm),
+                require_embeddings: None,
+                embedding_model: None,
+            });
+        })];
+        let toggle_require_embeddings_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::PersistQueryProjectIndexConfig {
+                auto_warm: None,
+                require_embeddings: Some(!require_embeddings),
+                embedding_model: None,
+            });
+        })];
+        let edit_embedding_model_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::OpenIndexEmbeddingModelPrompt {
+                current_model: current_model.clone(),
+            });
+        })];
+
+        let items = vec![
+            SelectionItem {
+                name: "Auto-warm".to_string(),
+                description: Some(format!(
+                    "Current: {auto_warm_label}. Warm the index automatically after MCP startup."
+                )),
+                selected_description: Some(format!(
+                    "Press Enter to turn auto-warm {}.",
+                    if auto_warm { "off" } else { "on" }
+                )),
+                actions: toggle_auto_warm_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Require embeddings".to_string(),
+                description: Some(format!(
+                    "Current: {require_embeddings_label}. Fail query_project when embeddings are unavailable instead of falling back."
+                )),
+                selected_description: Some(format!(
+                    "Press Enter to turn require-embeddings {}.",
+                    if require_embeddings { "off" } else { "on" }
+                )),
+                actions: toggle_require_embeddings_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Set embedding model".to_string(),
+                description: Some(format!("Current: {current_model_label}")),
+                actions: edit_embedding_model_actions,
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Index Settings".to_string()),
+            subtitle: Some("Configure query_project index defaults.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn show_index_embedding_model_prompt(&mut self, current_model: Option<String>) {
+        let tx = self.app_event_tx.clone();
+        let current_model_label = current_model.unwrap_or_else(|| "default".to_string());
+        let view = CustomPromptView::new(
+            "Set embedding model".to_string(),
+            "Type model name, or default to clear".to_string(),
+            Some(format!("Current: {current_model_label}")),
+            Box::new(move |model: String| {
+                let trimmed = model.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                let embedding_model = if trimmed.eq_ignore_ascii_case("default") {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                tx.send(AppEvent::PersistQueryProjectIndexConfig {
+                    auto_warm: None,
+                    require_embeddings: None,
+                    embedding_model: Some(embedding_model),
+                });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     pub(crate) fn set_query_project_index_auto_warm(&mut self, enabled: bool) {
         self.config.query_project_index.auto_warm = enabled;
     }
@@ -4805,7 +4907,7 @@ impl ChatWidget {
         lines.push(Line::from("  /index auto-warm on|off".dim()));
         lines.push(Line::from("  /index require-embeddings on|off".dim()));
         lines.push(Line::from("  /index embedding-model <name|default>".dim()));
-        lines.push(Line::from("  /index".dim()));
+        lines.push(Line::from("  /index edit".dim()));
         lines.push(Line::from(
             "  Use [query_project_index] in config.toml for backend, qdrant, file_globs, and non-TUI edits."
                 .dim(),
@@ -4870,9 +4972,10 @@ impl ChatWidget {
                     });
             }
             "show" | "help" => self.add_index_config_output(),
+            "edit" => self.open_index_settings_popup(),
             _ => {
                 self.add_error_message(
-                    "Unknown /index option. Try: auto-warm, require-embeddings, embedding-model, or /index".to_string(),
+                    "Unknown /index option. Try: auto-warm, require-embeddings, embedding-model, edit, or /index".to_string(),
                 );
             }
         }

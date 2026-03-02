@@ -991,7 +991,7 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
             ev_completed("resp-5"),
         ]),
     ];
-    mount_sse_sequence(&server, responses).await;
+    let response_mock = mount_sse_sequence(&server, responses).await;
 
     let session_model = session_configured.model.clone();
 
@@ -1051,11 +1051,11 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
         "begin event should include process_id for a live session"
     );
 
-    // We expect three terminal interactions matching the three write_stdin calls.
-    assert_eq!(
-        terminal_events.len(),
-        3,
-        "expected three terminal interactions; got {terminal_events:?}"
+    // A late second poll can capture the final marker and process exit before the
+    // third poll executes, so we accept either two or three terminal interactions.
+    assert!(
+        (2..=3).contains(&terminal_events.len()),
+        "expected two or three terminal interactions; got {terminal_events:?}"
     );
 
     for event in &terminal_events {
@@ -1067,9 +1067,21 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
             .iter()
             .map(|ev| ev.stdin.as_str())
             .collect::<Vec<_>>(),
-        vec!["x", "x", "x"],
-        "terminal interactions should reflect the three stdin polls"
+        vec!["x"; terminal_events.len()],
+        "terminal interactions should reflect the stdin polls"
     );
+    let requests = response_mock.requests();
+    for poll_call_id in [first_poll_call_id, second_poll_call_id, third_poll_call_id] {
+        assert!(
+            requests.iter().any(|request| {
+                request.input().iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                        && item.get("call_id").and_then(Value::as_str) == Some(poll_call_id)
+                })
+            }),
+            "expected function_call_output for poll call id {poll_call_id}"
+        );
+    }
 
     assert!(
         delta_text.contains("MARKER1") && delta_text.contains("MARKER2"),

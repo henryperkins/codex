@@ -69,11 +69,15 @@ use ratatui::style::Styled;
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
+use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
@@ -1306,6 +1310,10 @@ pub(crate) struct McpToolCallCell {
     duration: Option<Duration>,
     result: Option<Result<codex_protocol::mcp::CallToolResult, String>>,
     animations_enabled: bool,
+    query_project_raw_mode: AtomicBool,
+    query_project_expand_all: AtomicBool,
+    query_project_wrap_snippets: AtomicBool,
+    query_project_selected_result: AtomicUsize,
 }
 
 impl McpToolCallCell {
@@ -1321,11 +1329,19 @@ impl McpToolCallCell {
             duration: None,
             result: None,
             animations_enabled,
+            query_project_raw_mode: AtomicBool::new(false),
+            query_project_expand_all: AtomicBool::new(false),
+            query_project_wrap_snippets: AtomicBool::new(false),
+            query_project_selected_result: AtomicUsize::new(0),
         }
     }
 
     fn is_query_project(&self) -> bool {
         self.invocation.tool == "query_project"
+    }
+
+    pub(crate) fn is_query_project_tool_call(&self) -> bool {
+        self.is_query_project()
     }
 
     pub(crate) fn call_id(&self) -> &str {
@@ -1356,6 +1372,113 @@ impl McpToolCallCell {
         let elapsed = self.start_time.elapsed();
         self.duration = Some(elapsed);
         self.result = Some(Err("interrupted".to_string()));
+    }
+
+    fn query_project_payload(&self) -> Option<QueryProjectPayload> {
+        if !self.is_query_project() {
+            return None;
+        }
+        let result = self.result.as_ref()?.as_ref().ok()?;
+        Self::parse_query_project_payload(result)
+    }
+
+    fn query_project_result_count(&self) -> Option<usize> {
+        self.query_project_payload()
+            .map(|payload| payload.results.len())
+    }
+
+    fn query_project_visible_result_count(&self) -> Option<usize> {
+        let count = self.query_project_result_count()?;
+        if self.query_project_expand_all.load(Ordering::Relaxed) {
+            Some(count)
+        } else {
+            Some(count.min(QUERY_PROJECT_MAX_RENDERED_RESULTS))
+        }
+    }
+
+    fn clamp_query_project_selection(&self, visible_count: usize) -> usize {
+        if visible_count == 0 {
+            self.query_project_selected_result
+                .store(0, Ordering::Relaxed);
+            return 0;
+        }
+        let selected = self.query_project_selected_result.load(Ordering::Relaxed);
+        let clamped = selected.min(visible_count.saturating_sub(1));
+        if clamped != selected {
+            self.query_project_selected_result
+                .store(clamped, Ordering::Relaxed);
+        }
+        clamped
+    }
+
+    pub(crate) fn toggle_query_project_raw_mode(&self) -> Option<bool> {
+        if !self.is_query_project() || self.result.is_none() {
+            return None;
+        }
+        let next = !self.query_project_raw_mode.load(Ordering::Relaxed);
+        self.query_project_raw_mode.store(next, Ordering::Relaxed);
+        Some(next)
+    }
+
+    pub(crate) fn toggle_query_project_expand_all(&self) -> Option<bool> {
+        self.query_project_payload()?;
+        let next = !self.query_project_expand_all.load(Ordering::Relaxed);
+        self.query_project_expand_all.store(next, Ordering::Relaxed);
+        let visible_count = self.query_project_visible_result_count().unwrap_or(0);
+        self.clamp_query_project_selection(visible_count);
+        Some(next)
+    }
+
+    pub(crate) fn toggle_query_project_wrap_snippets(&self) -> Option<bool> {
+        self.query_project_payload()?;
+        let next = !self.query_project_wrap_snippets.load(Ordering::Relaxed);
+        self.query_project_wrap_snippets
+            .store(next, Ordering::Relaxed);
+        Some(next)
+    }
+
+    pub(crate) fn select_next_query_project_result(&self) -> Option<(usize, usize)> {
+        let visible_count = self.query_project_visible_result_count()?;
+        if visible_count == 0 {
+            return Some((0, 0));
+        }
+        let selected = self.clamp_query_project_selection(visible_count);
+        let next = selected
+            .saturating_add(1)
+            .min(visible_count.saturating_sub(1));
+        self.query_project_selected_result
+            .store(next, Ordering::Relaxed);
+        Some((next + 1, visible_count))
+    }
+
+    pub(crate) fn select_previous_query_project_result(&self) -> Option<(usize, usize)> {
+        let visible_count = self.query_project_visible_result_count()?;
+        if visible_count == 0 {
+            return Some((0, 0));
+        }
+        let selected = self.clamp_query_project_selection(visible_count);
+        let next = selected.saturating_sub(1);
+        self.query_project_selected_result
+            .store(next, Ordering::Relaxed);
+        Some((next + 1, visible_count))
+    }
+
+    pub(crate) fn selected_query_project_result(&self) -> Option<QueryProjectSelectedResult> {
+        let payload = self.query_project_payload()?;
+        if payload.results.is_empty() {
+            return None;
+        }
+        let visible_count = self.query_project_visible_result_count().unwrap_or(0);
+        let selected = self.clamp_query_project_selection(visible_count.max(1));
+        let entry = payload.results.get(selected)?;
+        if entry.path.trim().is_empty() {
+            return None;
+        }
+        let line = (entry.line_range.start > 0).then_some(entry.line_range.start);
+        Some(QueryProjectSelectedResult {
+            path: entry.path.clone(),
+            line,
+        })
     }
 
     fn render_content_block(block: &serde_json::Value, width: usize) -> String {
@@ -1393,6 +1516,67 @@ const QUERY_PROJECT_SCAN_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
 
 /// Interval in milliseconds per scan frame.
 const QUERY_PROJECT_FRAME_MS: u128 = 150;
+const QUERY_PROJECT_MAX_RENDERED_RESULTS: usize = 3;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct QueryProjectPayload {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    embedding_status: Option<QueryProjectEmbeddingStatus>,
+    #[serde(default)]
+    refresh: Option<QueryProjectRefreshStats>,
+    #[serde(default)]
+    results: Vec<QueryProjectResult>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct QueryProjectEmbeddingStatus {
+    #[serde(default)]
+    mode_used: String,
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct QueryProjectRefreshStats {
+    #[serde(default)]
+    scanned_files: usize,
+    #[serde(default)]
+    updated_files: usize,
+    #[serde(default)]
+    removed_files: usize,
+    #[serde(default)]
+    indexed_chunks: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct QueryProjectResult {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line_range: QueryProjectLineRange,
+    #[serde(default)]
+    snippet: String,
+    score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct QueryProjectLineRange {
+    #[serde(default)]
+    start: usize,
+    #[serde(default)]
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QueryProjectSelectedResult {
+    pub(crate) path: String,
+    pub(crate) line: Option<usize>,
+}
 
 impl HistoryCell for McpToolCallCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -1467,9 +1651,33 @@ impl HistoryCell for McpToolCallCell {
 
         if let Some(result) = &self.result {
             match result {
-                Ok(codex_protocol::mcp::CallToolResult { content, .. }) => {
-                    if !content.is_empty() {
-                        for block in content {
+                Ok(result) => {
+                    let query_project_details = if is_qp {
+                        if self.query_project_raw_mode.load(Ordering::Relaxed) {
+                            Some(Self::render_query_project_raw_details(
+                                result,
+                                detail_wrap_width,
+                                self.query_project_expand_all.load(Ordering::Relaxed),
+                                self.query_project_wrap_snippets.load(Ordering::Relaxed),
+                            ))
+                        } else {
+                            self.render_query_project_details(result, detail_wrap_width)
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(rendered_lines) = query_project_details {
+                        for line in rendered_lines {
+                            let wrapped = adaptive_wrap_line(
+                                &line,
+                                RtOptions::new(detail_wrap_width)
+                                    .initial_indent("".into())
+                                    .subsequent_indent("    ".into()),
+                            );
+                            detail_lines.extend(wrapped.iter().map(line_to_static));
+                        }
+                    } else if !result.content.is_empty() {
+                        for block in &result.content {
                             let text = Self::render_content_block(block, detail_wrap_width);
                             for segment in text.split('\n') {
                                 let line = Line::from(segment.to_string().dim());
@@ -1519,6 +1727,250 @@ impl HistoryCell for McpToolCallCell {
             return None;
         }
         Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+impl McpToolCallCell {
+    fn parse_query_project_payload(
+        result: &codex_protocol::mcp::CallToolResult,
+    ) -> Option<QueryProjectPayload> {
+        if let Some(structured_content) = &result.structured_content
+            && let Ok(payload) =
+                serde_json::from_value::<QueryProjectPayload>(structured_content.clone())
+        {
+            return Some(payload);
+        }
+
+        result
+            .content
+            .iter()
+            .find_map(Self::parse_query_project_content_block)
+    }
+
+    fn parse_query_project_content_block(block: &serde_json::Value) -> Option<QueryProjectPayload> {
+        let content = serde_json::from_value::<rmcp::model::Content>(block.clone()).ok()?;
+        let rmcp::model::RawContent::Text(text) = content.raw else {
+            return None;
+        };
+        serde_json::from_str::<QueryProjectPayload>(&text.text).ok()
+    }
+
+    fn render_query_project_mode_line(
+        raw_mode: bool,
+        expand_all: bool,
+        wrap_snippets: bool,
+        selected_result: usize,
+        total_results: usize,
+    ) -> Line<'static> {
+        let mode = if raw_mode { "raw" } else { "structured" };
+        let expand = if expand_all { "all" } else { "top" };
+        let wrap = if wrap_snippets { "on" } else { "off" };
+        let selected = if total_results == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", selected_result + 1, total_results)
+        };
+        Line::from(
+            format!(
+                "view {mode} • Alt+r toggle • Alt+e {expand} • Alt+w wrap:{wrap} • Alt+j/k select • Alt+o open • sel {selected}",
+            )
+            .dim(),
+        )
+    }
+
+    fn render_query_project_raw_details(
+        result: &codex_protocol::mcp::CallToolResult,
+        detail_wrap_width: usize,
+        expand_all: bool,
+        wrap_snippets: bool,
+    ) -> Vec<Line<'static>> {
+        let mut lines = vec![Self::render_query_project_mode_line(
+            true,
+            expand_all,
+            wrap_snippets,
+            0,
+            0,
+        )];
+
+        if let Some(structured_content) = &result.structured_content {
+            lines.push("raw structured_content".dim().into());
+            let raw_structured = serde_json::to_string_pretty(structured_content)
+                .unwrap_or_else(|_| structured_content.to_string());
+            let formatted = format_and_truncate_tool_result(
+                &raw_structured,
+                TOOL_CALL_MAX_LINES,
+                detail_wrap_width,
+            );
+            for segment in formatted.split('\n') {
+                lines.push(Line::from(segment.to_string().dim()));
+            }
+        }
+
+        if !result.content.is_empty() {
+            lines.push("raw content blocks".dim().into());
+            for block in &result.content {
+                let text = Self::render_content_block(block, detail_wrap_width);
+                for segment in text.split('\n') {
+                    lines.push(Line::from(segment.to_string().dim()));
+                }
+            }
+        }
+
+        if result.content.is_empty() && result.structured_content.is_none() {
+            lines.push("<empty result>".dim().into());
+        }
+
+        lines
+    }
+
+    fn fallback_guidance_text(reason: Option<&str>) -> &'static str {
+        let normalized = reason
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if normalized.contains("missing_api_key") {
+            "guidance missing_api_key: set OPENAI_API_KEY, then run repo_index_refresh."
+        } else if normalized.contains("stale") {
+            "guidance stale index: run repo_index_refresh before retrying query_project."
+        } else if normalized.contains("embedding_unavailable")
+            || normalized.contains("embedding unavailable")
+            || normalized.contains("embedding_query_failed")
+            || normalized.contains("not_ready")
+            || normalized.contains("not ready")
+        {
+            "guidance embedding unavailable: verify embedding config, then run repo_index_refresh."
+        } else {
+            "guidance fallback active: run repo_index_refresh to restore semantic ranking."
+        }
+    }
+
+    fn render_query_project_details(
+        &self,
+        result: &codex_protocol::mcp::CallToolResult,
+        detail_wrap_width: usize,
+    ) -> Option<Vec<Line<'static>>> {
+        let payload = Self::parse_query_project_payload(result)?;
+        let mut lines = Vec::new();
+        let result_count = payload.results.len();
+        let expand_all = self.query_project_expand_all.load(Ordering::Relaxed);
+        let wrap_snippets = self.query_project_wrap_snippets.load(Ordering::Relaxed);
+        let visible_count = if expand_all {
+            result_count
+        } else {
+            result_count.min(QUERY_PROJECT_MAX_RENDERED_RESULTS)
+        };
+        let selected_result = self.clamp_query_project_selection(visible_count.max(1));
+
+        lines.push(Self::render_query_project_mode_line(
+            false,
+            expand_all,
+            wrap_snippets,
+            selected_result,
+            result_count,
+        ));
+
+        let count_label = if result_count == 1 {
+            "match"
+        } else {
+            "matches"
+        };
+        lines.push(Line::from(vec![
+            result_count.to_string().bold(),
+            format!(" {count_label}").dim(),
+        ]));
+
+        if !payload.query.trim().is_empty() {
+            let query = truncate_text(payload.query.trim(), detail_wrap_width.saturating_sub(8));
+            lines.push(Line::from(vec!["query ".dim(), query.dim()]));
+        }
+
+        if let Some(embedding_status) = payload.embedding_status {
+            let mut embedding_spans = vec!["embedding ".dim()];
+            if embedding_status.mode_used.is_empty() {
+                embedding_spans.push("unknown".dim());
+            } else {
+                embedding_spans.push(embedding_status.mode_used.into());
+            }
+            embedding_spans.push(" • ".dim());
+            if embedding_status.ready {
+                embedding_spans.push("ready".green());
+            } else {
+                embedding_spans.push("fallback".red());
+                if let Some(reason) = embedding_status.reason.as_ref()
+                    && !reason.is_empty()
+                {
+                    embedding_spans.push(format!(" ({reason})").dim());
+                }
+            }
+            lines.push(Line::from(embedding_spans));
+
+            if !embedding_status.ready {
+                lines.push(Line::from(
+                    Self::fallback_guidance_text(embedding_status.reason.as_deref()).dim(),
+                ));
+            }
+        }
+
+        if let Some(refresh) = payload.refresh {
+            lines.push(Line::from(
+                format!(
+                    "refresh s:{} u:{} r:{} c:{}",
+                    refresh.scanned_files,
+                    refresh.updated_files,
+                    refresh.removed_files,
+                    refresh.indexed_chunks
+                )
+                .dim(),
+            ));
+        }
+
+        for (idx, entry) in payload.results.iter().take(visible_count).enumerate() {
+            let location = if entry.line_range.start > 0 && entry.line_range.end > 0 {
+                format!(
+                    "{}. {}:{}-{}",
+                    idx + 1,
+                    entry.path,
+                    entry.line_range.start,
+                    entry.line_range.end
+                )
+            } else {
+                format!("{}. {}", idx + 1, entry.path)
+            };
+
+            let marker = if idx == selected_result {
+                "›".cyan().bold()
+            } else {
+                " ".dim()
+            };
+            let mut row = vec![marker, " ".into(), location.into()];
+            if let Some(score) = entry.score {
+                row.push(" ".into());
+                row.push(format!("{score:.4}").green());
+            }
+            lines.push(Line::from(row));
+
+            let preview_source = entry
+                .snippet
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(entry.snippet.as_str())
+                .trim();
+            if !preview_source.is_empty() {
+                let snippet = if wrap_snippets {
+                    preview_source.to_string()
+                } else {
+                    truncate_text(preview_source, detail_wrap_width.saturating_sub(10))
+                };
+                lines.push(Line::from(format!("    {snippet}").dim()));
+            }
+        }
+
+        if !expand_all && result_count > QUERY_PROJECT_MAX_RENDERED_RESULTS {
+            let remaining = result_count - QUERY_PROJECT_MAX_RENDERED_RESULTS;
+            lines.push(Line::from(format!("+{remaining} more matches").dim()));
+        }
+
+        Some(lines)
     }
 }
 
@@ -3372,6 +3824,293 @@ mod tests {
         let rendered = render_lines(&cell.display_lines(80)).join("\n");
 
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn completed_query_project_structured_content_renders_summary_lines() {
+        let invocation = McpInvocation {
+            server: "codex_apps".into(),
+            tool: "query_project".into(),
+            arguments: Some(json!({
+                "query": "authentication middleware",
+                "limit": 5,
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![text_block("ignored because structured_content is present")],
+            is_error: None,
+            structured_content: Some(json!({
+                "query": "authentication middleware",
+                "embedding_status": {
+                    "mode_used": "skip",
+                    "ready": false,
+                    "reason": "missing_api_key"
+                },
+                "refresh": {
+                    "scanned_files": 410,
+                    "updated_files": 3,
+                    "removed_files": 0,
+                    "indexed_chunks": 1294
+                },
+                "results": [
+                    {
+                        "path": "src/auth/middleware.rs",
+                        "line_range": { "start": 12, "end": 40 },
+                        "snippet": "fn auth_middleware() {}",
+                        "score": 0.9123
+                    },
+                    {
+                        "path": "src/auth/session.rs",
+                        "line_range": { "start": 6, "end": 21 },
+                        "snippet": "pub fn read_session() {}",
+                        "score": 0.8745
+                    },
+                    {
+                        "path": "src/auth/token.rs",
+                        "line_range": { "start": 44, "end": 70 },
+                        "snippet": "pub fn decode_token() {}",
+                        "score": 0.821
+                    },
+                    {
+                        "path": "src/auth/claims.rs",
+                        "line_range": { "start": 8, "end": 33 },
+                        "snippet": "pub struct Claims {}",
+                        "score": 0.7991
+                    }
+                ]
+            })),
+            meta: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-qp-structured".into(), invocation, false);
+        assert!(
+            cell.complete(Duration::from_millis(900), Ok(result))
+                .is_none()
+        );
+
+        let rendered = render_lines(&cell.display_lines(120));
+        assert!(
+            rendered.iter().any(|line| line.contains("4 matches")),
+            "expected match count in rendered output: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("embedding skip • fallback (missing_api_key)")),
+            "expected fallback embedding status in rendered output: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("guidance missing_api_key")),
+            "expected fallback guidance in rendered output: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("+1 more matches")),
+            "expected overflow indicator in rendered output: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn completed_query_project_falls_back_to_generic_rendering_when_payload_is_invalid() {
+        let invocation = McpInvocation {
+            server: "codex_apps".into(),
+            tool: "query_project".into(),
+            arguments: Some(json!({
+                "query": "authentication middleware",
+                "limit": 5,
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![text_block("not-json-content")],
+            is_error: None,
+            structured_content: Some(json!({
+                "results": "this should be an array"
+            })),
+            meta: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-qp-fallback".into(), invocation, false);
+        assert!(
+            cell.complete(Duration::from_millis(750), Ok(result))
+                .is_none()
+        );
+
+        let rendered = render_lines(&cell.display_lines(90));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("not-json-content")),
+            "expected fallback text rendering, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn completed_query_project_supports_view_toggles_and_selection() {
+        let invocation = McpInvocation {
+            server: "codex_apps".into(),
+            tool: "query_project".into(),
+            arguments: Some(json!({
+                "query": "authentication middleware",
+                "limit": 5,
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![text_block("ignored because structured_content is present")],
+            is_error: None,
+            structured_content: Some(json!({
+                "query": "authentication middleware",
+                "results": [
+                    {
+                        "path": "src/auth/middleware.rs",
+                        "line_range": { "start": 12, "end": 40 },
+                        "snippet": "fn auth_middleware() {}",
+                        "score": 0.9123
+                    },
+                    {
+                        "path": "src/auth/session.rs",
+                        "line_range": { "start": 6, "end": 21 },
+                        "snippet": "pub fn read_session() {}",
+                        "score": 0.8745
+                    },
+                    {
+                        "path": "src/auth/token.rs",
+                        "line_range": { "start": 44, "end": 70 },
+                        "snippet": "pub fn decode_token() {}",
+                        "score": 0.821
+                    },
+                    {
+                        "path": "src/auth/claims.rs",
+                        "line_range": { "start": 8, "end": 33 },
+                        "snippet": "pub struct Claims {}",
+                        "score": 0.7991
+                    }
+                ]
+            })),
+            meta: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-qp-toggle".into(), invocation, false);
+        assert!(
+            cell.complete(Duration::from_millis(900), Ok(result))
+                .is_none()
+        );
+
+        assert_eq!(cell.toggle_query_project_expand_all(), Some(true));
+        assert_eq!(cell.select_next_query_project_result(), Some((2, 4)));
+        assert_eq!(cell.toggle_query_project_wrap_snippets(), Some(true));
+
+        let selected = cell
+            .selected_query_project_result()
+            .expect("selected query_project result");
+        assert_eq!(selected.path, "src/auth/session.rs");
+        assert_eq!(selected.line, Some(6));
+
+        let rendered = render_lines(&cell.display_lines(120));
+        assert!(
+            rendered.iter().any(|line| line.contains("sel 2/4")),
+            "expected selected-result indicator in rendered output: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("› 2. src/auth/session.rs:6-21")),
+            "expected selected row marker in rendered output: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn completed_query_project_raw_mode_renders_raw_payload_sections() {
+        let invocation = McpInvocation {
+            server: "codex_apps".into(),
+            tool: "query_project".into(),
+            arguments: Some(json!({
+                "query": "authentication middleware",
+                "limit": 5,
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![text_block(
+                r#"{"results":[{"path":"src/auth.rs","score":0.92}]}"#,
+            )],
+            is_error: None,
+            structured_content: Some(json!({
+                "results": [
+                    { "path": "src/auth.rs", "score": 0.92 }
+                ]
+            })),
+            meta: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-qp-raw".into(), invocation, false);
+        assert!(
+            cell.complete(Duration::from_millis(500), Ok(result))
+                .is_none()
+        );
+        assert_eq!(cell.toggle_query_project_raw_mode(), Some(true));
+
+        let rendered = render_lines(&cell.display_lines(90));
+        assert!(
+            rendered.iter().any(|line| line.contains("view raw")),
+            "expected raw-mode indicator in rendered output: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("raw structured_content")),
+            "expected structured-content section in rendered output: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("raw content blocks")),
+            "expected content-block section in rendered output: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn completed_query_project_renders_guidance_for_stale_index_reason() {
+        let invocation = McpInvocation {
+            server: "codex_apps".into(),
+            tool: "query_project".into(),
+            arguments: Some(json!({
+                "query": "authentication middleware",
+                "limit": 5,
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![text_block("ignored because structured_content is present")],
+            is_error: None,
+            structured_content: Some(json!({
+                "query": "authentication middleware",
+                "embedding_status": {
+                    "mode_used": "skip",
+                    "ready": false,
+                    "reason": "stale_index"
+                },
+                "results": []
+            })),
+            meta: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-qp-stale".into(), invocation, false);
+        assert!(
+            cell.complete(Duration::from_millis(650), Ok(result))
+                .is_none()
+        );
+
+        let rendered = render_lines(&cell.display_lines(100));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("guidance stale index")),
+            "expected stale-index guidance in rendered output: {rendered:?}"
+        );
     }
 
     #[test]

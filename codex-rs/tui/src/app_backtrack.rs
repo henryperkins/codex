@@ -110,6 +110,14 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if !self.backtrack.overlay_preview_active
+            && let TuiEvent::Key(key_event) = &event
+            && let Some(action) = Self::query_project_action_for_key_event(key_event)
+            && self.handle_query_project_key_action(tui, action).await
+        {
+            return Ok(true);
+        }
+
         if self.backtrack.overlay_preview_active {
             match event {
                 TuiEvent::Key(KeyEvent {

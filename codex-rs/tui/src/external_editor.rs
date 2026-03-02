@@ -8,6 +8,14 @@ use tempfile::Builder;
 use thiserror::Error;
 use tokio::process::Command;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LineNavigationStyle {
+    None,
+    PlusPrefix,
+    GotoFlag,
+    PathWithLineSuffix,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum EditorError {
     #[error("neither VISUAL nor EDITOR is set")]
@@ -50,16 +58,39 @@ pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, Edito
     Ok(parts)
 }
 
-/// Write `seed` to a temp file, launch the editor command, and return the updated content.
-pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<String> {
+pub(crate) fn line_navigation_style(editor_cmd: &[String]) -> LineNavigationStyle {
+    let Some(program) = editor_cmd.first() else {
+        return LineNavigationStyle::None;
+    };
+
+    let Some(name) = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_ascii_lowercase())
+    else {
+        return LineNavigationStyle::None;
+    };
+
+    match name.as_str() {
+        "vim" | "nvim" | "vi" | "view" | "vimdiff" | "emacs" | "emacsclient" => {
+            LineNavigationStyle::PlusPrefix
+        }
+        "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => {
+            LineNavigationStyle::GotoFlag
+        }
+        "subl" | "sublime_text" | "zed" | "hx" | "helix" => LineNavigationStyle::PathWithLineSuffix,
+        _ => LineNavigationStyle::None,
+    }
+}
+
+/// Build a [`Command`] from an editor command, resolving `.cmd`/`.bat` shims on
+/// Windows.  The returned command already includes any extra arguments from
+/// `editor_cmd[1..]` but the caller is responsible for appending the target file
+/// (and any flags like `+line`).
+pub(crate) fn build_editor_command(editor_cmd: &[String]) -> Result<Command> {
     if editor_cmd.is_empty() {
         return Err(Report::msg("editor command is empty"));
     }
-
-    // Convert to TempPath immediately so no file handle stays open on Windows.
-    let temp_path = Builder::new().suffix(".md").tempfile()?.into_temp_path();
-    fs::write(&temp_path, seed)?;
-
     let mut cmd = {
         #[cfg(windows)]
         {
@@ -74,7 +105,16 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
     if editor_cmd.len() > 1 {
         cmd.args(&editor_cmd[1..]);
     }
-    let status = cmd
+    Ok(cmd)
+}
+
+/// Write `seed` to a temp file, launch the editor command, and return the updated content.
+pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<String> {
+    // Convert to TempPath immediately so no file handle stays open on Windows.
+    let temp_path = Builder::new().suffix(".md").tempfile()?.into_temp_path();
+    fs::write(&temp_path, seed)?;
+
+    let status = build_editor_command(editor_cmd)?
         .arg(&temp_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -167,5 +207,25 @@ mod tests {
         let cmd = vec![script_path.to_string_lossy().to_string()];
         let result = run_editor("seed", &cmd).await.unwrap();
         assert_eq!(result, "edited".to_string());
+    }
+
+    #[test]
+    fn line_navigation_style_detects_common_editors() {
+        assert_eq!(
+            line_navigation_style(&["vim".to_string()]),
+            LineNavigationStyle::PlusPrefix
+        );
+        assert_eq!(
+            line_navigation_style(&["code".to_string()]),
+            LineNavigationStyle::GotoFlag
+        );
+        assert_eq!(
+            line_navigation_style(&["helix".to_string()]),
+            LineNavigationStyle::PathWithLineSuffix
+        );
+        assert_eq!(
+            line_navigation_style(&["unknown-editor".to_string()]),
+            LineNavigationStyle::None
+        );
     }
 }

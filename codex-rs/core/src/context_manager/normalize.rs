@@ -171,6 +171,7 @@ pub(crate) fn remove_orphan_reasoning(items: &mut Vec<ResponseItem>) {
 
         if should_drop {
             items.remove(index);
+            index = index.saturating_sub(1);
         } else {
             index += 1;
         }

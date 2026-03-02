@@ -405,6 +405,11 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
+    /// Open a custom prompt to set the query_project embedding model.
+    OpenIndexEmbeddingModelPrompt {
+        current_model: Option<String>,
+    },
+
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,

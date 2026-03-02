@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Index Settings
+  Configure query_project index defaults.
+
+› 1. Auto-warm            Press Enter to turn auto-warm off.
+  2. Require embeddings   Current: off. Fail query_project when embeddings are
+                          unavailable instead of falling back.
+  3. Set embedding model  Current: default
+
+  Press enter to confirm or esc to go back

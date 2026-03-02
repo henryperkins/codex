@@ -17,6 +17,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
+use tracing::warn;
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
@@ -86,6 +87,9 @@ impl ContextManager {
         for item in items {
             let item_ref = item.deref();
             let is_ghost_snapshot = matches!(item_ref, ResponseItem::GhostSnapshot { .. });
+            if matches!(item_ref, ResponseItem::Other) {
+                warn!("dropping unknown response output item from prompt replay for compatibility");
+            }
             if !is_api_message(item_ref) && !is_ghost_snapshot {
                 continue;
             }
@@ -410,6 +414,8 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::GhostSnapshot { .. } => false,
+        // Unknown output item kinds are intentionally not replayed because we
+        // cannot safely reconstruct their wire shape from `ResponseItem::Other`.
         ResponseItem::Other => false,
     }
 }

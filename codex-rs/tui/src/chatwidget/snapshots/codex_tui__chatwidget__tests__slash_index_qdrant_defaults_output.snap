@@ -1,0 +1,21 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: rendered
+---
+• query_project index defaults
+  backend: qdrant
+  auto-warm: on
+  require-embeddings: on
+  embedding-model: text-embedding-3-small
+  qdrant-url: https://f2e5a36d-0c8b-4f74-a174-e53bc60baab9.eastus-0.azure.cloud.qdrant.io:6334
+  qdrant-api-key-env: QDRANT_API_KEY
+  qdrant-collection-prefix: codex_repo_
+  qdrant-timeout-ms: 10000
+  file-globs: all indexable files
+
+  TUI shortcuts:
+  /index auto-warm on|off
+  /index require-embeddings on|off
+  /index embedding-model <name|default>
+  /index edit
+  Use [query_project_index] in config.toml for backend, qdrant, file_globs, and non-TUI edits.
