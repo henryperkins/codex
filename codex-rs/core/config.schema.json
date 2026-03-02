@@ -370,6 +370,9 @@
             "personality": {
               "type": "boolean"
             },
+            "plugins": {
+              "type": "boolean"
+            },
             "powershell_utf8": {
               "type": "boolean"
             },
@@ -1084,6 +1087,22 @@
         "pragmatic"
       ],
       "type": "string"
+    },
+    "PluginConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
     },
     "ProjectConfig": {
       "additionalProperties": false,
@@ -1807,6 +1826,9 @@
         "personality": {
           "type": "boolean"
         },
+        "plugins": {
+          "type": "boolean"
+        },
         "powershell_utf8": {
           "type": "boolean"
         },
@@ -2103,6 +2125,14 @@
     },
     "plan_mode_reasoning_effort": {
       "$ref": "#/definitions/ReasoningEffort"
+    },
+    "plugins": {
+      "additionalProperties": {
+        "$ref": "#/definitions/PluginConfig"
+      },
+      "default": {},
+      "description": "User-level plugin config entries keyed by plugin name.",
+      "type": "object"
     },
     "profile": {
       "description": "Profile to use from the `profiles` map.",

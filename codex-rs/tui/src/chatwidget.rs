@@ -64,7 +64,9 @@ use codex_core::find_thread_name_by_id;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::local_git_branches;
+use codex_core::mcp::McpManager;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::plugins::PluginsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::terminal::TerminalName;
@@ -2583,6 +2585,8 @@ impl ChatWidget {
 
         let available_decisions = ev.effective_available_decisions();
         let request = ApprovalRequest::Exec {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             id: ev.effective_approval_id(),
             command: ev.command,
             reason: ev.reason,
@@ -2599,6 +2603,8 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
 
         let request = ApprovalRequest::ApplyPatch {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             id: ev.call_id,
             reason: ev.reason,
             changes: ev.changes.clone(),
@@ -2621,10 +2627,18 @@ impl ChatWidget {
         });
 
         let request = ApprovalRequest::McpElicitation {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             server_name: ev.server_name,
             request_id: ev.id,
             message: ev.message,
         };
+        self.bottom_pane
+            .push_approval_request(request, &self.config.features);
+        self.request_redraw();
+    }
+
+    pub(crate) fn push_approval_request(&mut self, request: ApprovalRequest) {
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
         self.request_redraw();
@@ -7441,7 +7455,10 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_mcp_output(&mut self) {
-        if self.config.mcp_servers.is_empty() {
+        let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+            self.config.codex_home.clone(),
+        )));
+        if mcp_manager.effective_servers(&self.config, None).is_empty() {
             self.add_to_history(history_cell::empty_mcp_output());
         } else {
             self.submit_op(Op::ListMcpTools);
@@ -7811,6 +7828,11 @@ impl ChatWidget {
     #[cfg(test)]
     pub(crate) fn pending_thread_approvals(&self) -> &[String] {
         self.bottom_pane.pending_thread_approvals()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_view(&self) -> bool {
+        self.bottom_pane.has_active_view()
     }
 
     pub(crate) fn show_esc_backtrack_hint(&mut self) {
