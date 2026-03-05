@@ -1052,6 +1052,7 @@ pub(crate) fn new_session_info(
     is_first_event: bool,
     tooltip_override: Option<String>,
     auth_plan: Option<PlanType>,
+    show_fast_status: bool,
 ) -> SessionInfoCell {
     let SessionConfiguredEvent {
         model,
@@ -1062,6 +1063,7 @@ pub(crate) fn new_session_info(
     let header = SessionHeaderHistoryCell::new(
         model.clone(),
         reasoning_effort,
+        show_fast_status,
         config.cwd.clone(),
         CODEX_CLI_VERSION,
     );
@@ -1148,6 +1150,7 @@ pub(crate) struct SessionHeaderHistoryCell {
     model: String,
     model_style: Style,
     reasoning_effort: Option<ReasoningEffortConfig>,
+    show_fast_status: bool,
     directory: PathBuf,
 }
 
@@ -1155,6 +1158,7 @@ impl SessionHeaderHistoryCell {
     pub(crate) fn new(
         model: String,
         reasoning_effort: Option<ReasoningEffortConfig>,
+        show_fast_status: bool,
         directory: PathBuf,
         version: &'static str,
     ) -> Self {
@@ -1162,6 +1166,7 @@ impl SessionHeaderHistoryCell {
             model,
             Style::default(),
             reasoning_effort,
+            show_fast_status,
             directory,
             version,
         )
@@ -1171,6 +1176,7 @@ impl SessionHeaderHistoryCell {
         model: String,
         model_style: Style,
         reasoning_effort: Option<ReasoningEffortConfig>,
+        show_fast_status: bool,
         directory: PathBuf,
         version: &'static str,
     ) -> Self {
@@ -1179,6 +1185,7 @@ impl SessionHeaderHistoryCell {
             model,
             model_style,
             reasoning_effort,
+            show_fast_status,
             directory,
         }
     }
@@ -1257,6 +1264,10 @@ impl HistoryCell for SessionHeaderHistoryCell {
             if let Some(reasoning) = reasoning_label {
                 spans.push(Span::from(" "));
                 spans.push(Span::from(reasoning));
+            }
+            if self.show_fast_status {
+                spans.push("   ".into());
+                spans.push(Span::styled("fast", self.model_style.magenta()));
             }
             spans.push("   ".dim());
             spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
@@ -3104,6 +3115,7 @@ mod tests {
             false,
             Some("Model just became available".to_string()),
             Some(PlanType::Free),
+            false,
         );
 
         let rendered = render_transcript(&cell).join("\n");
@@ -3121,6 +3133,7 @@ mod tests {
             false,
             Some("Model just became available".to_string()),
             Some(PlanType::Free),
+            false,
         );
 
         let rendered = render_transcript(&cell).join("\n");
@@ -3137,6 +3150,7 @@ mod tests {
             true,
             Some("Model just became available".to_string()),
             Some(PlanType::Free),
+            false,
         );
 
         let rendered = render_transcript(&cell).join("\n");
@@ -3155,6 +3169,7 @@ mod tests {
             false,
             Some("Model just became available".to_string()),
             Some(PlanType::Free),
+            false,
         );
 
         let rendered = render_transcript(&cell).join("\n");
@@ -4145,18 +4160,39 @@ mod tests {
         let cell = SessionHeaderHistoryCell::new(
             "gpt-4o".to_string(),
             Some(ReasoningEffortConfig::High),
+            true,
             std::env::temp_dir(),
             "test",
         );
 
         let lines = render_lines(&cell.display_lines(80));
         let model_line = lines
-            .into_iter()
+            .iter()
+            .find(|line| line.contains("model:"))
+            .expect("model line");
+
+        assert!(model_line.contains("gpt-4o high   fast"));
+        assert!(model_line.contains("/model to change"));
+    }
+
+    #[test]
+    fn session_header_hides_fast_status_when_disabled() {
+        let cell = SessionHeaderHistoryCell::new(
+            "gpt-4o".to_string(),
+            Some(ReasoningEffortConfig::High),
+            false,
+            std::env::temp_dir(),
+            "test",
+        );
+
+        let lines = render_lines(&cell.display_lines(80));
+        let model_line = lines
+            .iter()
             .find(|line| line.contains("model:"))
             .expect("model line");
 
         assert!(model_line.contains("gpt-4o high"));
-        assert!(model_line.contains("/model to change"));
+        assert!(!model_line.contains("fast"));
     }
 
     #[test]
