@@ -45,6 +45,7 @@ use codex_core::plugins::PluginsManager;
 use codex_core::web_search::web_search_detail;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::account::PlanType;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
 use codex_protocol::models::WebSearchAction;
@@ -1104,7 +1105,12 @@ pub(crate) fn new_session_info(
     } else {
         if config.show_tooltips
             && let Some(tooltips) = tooltip_override
-                .or_else(|| tooltips::get_tooltip(auth_plan))
+                .or_else(|| {
+                    tooltips::get_tooltip(
+                        auth_plan,
+                        matches!(config.service_tier, Some(ServiceTier::Fast)),
+                    )
+                })
                 .map(TooltipHistoryCell::new)
         {
             parts.push(Box::new(tooltips));
@@ -2688,6 +2694,21 @@ pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistor
     PlainHistoryCell { lines }
 }
 
+pub(crate) fn new_image_generation_call(
+    call_id: String,
+    status: String,
+    revised_prompt: Option<String>,
+) -> PlainHistoryCell {
+    let detail = revised_prompt.unwrap_or_else(|| call_id.clone());
+
+    let lines: Vec<Line<'static>> = vec![
+        vec!["• ".dim(), "Generated Image".bold()].into(),
+        vec!["  └ ".dim(), format!("{status}: {detail}").dim()].into(),
+    ];
+
+    PlainHistoryCell { lines }
+}
+
 pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
     let full_reasoning_buffer = full_reasoning_buffer.trim();
     if let Some(open) = full_reasoning_buffer.find("**") {
@@ -2976,6 +2997,7 @@ mod tests {
             thread_name: None,
             model: model.to_string(),
             model_provider_id: "test-provider".to_string(),
+            service_tier: None,
             approval_policy: AskForApproval::Never,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: PathBuf::from("/tmp/project"),

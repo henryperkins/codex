@@ -66,7 +66,7 @@ pub(crate) fn line_navigation_style(editor_cmd: &[String]) -> LineNavigationStyl
     let Some(name) = std::path::Path::new(program)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .map(|stem| stem.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
     else {
         return LineNavigationStyle::None;
     };
