@@ -250,6 +250,7 @@ mod tests {
         let req = ResponsesApiRequest {
             model: "gpt-5.1".to_string(),
             instructions: "i".to_string(),
+            previous_response_id: None,
             input,
             tools,
             tool_choice: "auto".to_string(),
@@ -292,6 +293,7 @@ mod tests {
         let req = ResponsesApiRequest {
             model: "gpt-5.1".to_string(),
             instructions: "i".to_string(),
+            previous_response_id: None,
             input,
             tools,
             tool_choice: "auto".to_string(),
@@ -329,6 +331,7 @@ mod tests {
         let req = ResponsesApiRequest {
             model: "gpt-5.1".to_string(),
             instructions: "i".to_string(),
+            previous_response_id: None,
             input,
             tools,
             tool_choice: "auto".to_string(),
@@ -351,6 +354,7 @@ mod tests {
         let req = ResponsesApiRequest {
             model: "gpt-5.1".to_string(),
             instructions: "i".to_string(),
+            previous_response_id: None,
             input: vec![],
             tools: vec![],
             tool_choice: "auto".to_string(),

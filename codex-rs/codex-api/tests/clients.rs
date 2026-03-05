@@ -257,6 +257,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
         instructions: "Say hi".into(),
+        previous_response_id: None,
         input: Vec::new(),
         tools: Vec::new(),
         tool_choice: "auto".into(),
@@ -293,6 +294,7 @@ async fn azure_default_store_attaches_ids_and_headers() -> Result<()> {
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
         instructions: "Say hi".into(),
+        previous_response_id: None,
         input: vec![ResponseItem::Message {
             id: Some("msg_1".into()),
             role: "user".into(),
