@@ -1,7 +1,7 @@
 //! Tracing log export into the state SQLite database.
 //!
 //! This module provides a `tracing_subscriber::Layer` that captures events and
-//! inserts them into the `logs` table in `state.sqlite`. The writer runs in a
+//! inserts them into the dedicated `logs` SQLite database. The writer runs in a
 //! background task and batches inserts to keep logging overhead low.
 //!
 //! ## Usage
@@ -41,10 +41,9 @@ use crate::LogEntry;
 use crate::StateRuntime;
 
 const LOG_QUEUE_CAPACITY: usize = 512;
-const LOG_BATCH_SIZE: usize = 64;
-const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
-const LOG_RETENTION_DAYS: i64 = 90;
-const LOG_RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const LOG_BATCH_SIZE: usize = 128;
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+const LOG_RETENTION_DAYS: i64 = 10;
 
 pub struct LogDbLayer {
     sender: mpsc::Sender<LogDbCommand>,
@@ -280,21 +279,6 @@ async fn flush(state_db: &std::sync::Arc<StateRuntime>, buffer: &mut Vec<LogEntr
 }
 
 async fn run_retention_cleanup(state_db: std::sync::Arc<StateRuntime>) {
-    run_retention_cleanup_with_interval(state_db, LOG_RETENTION_CLEANUP_INTERVAL).await;
-}
-
-async fn run_retention_cleanup_with_interval(
-    state_db: std::sync::Arc<StateRuntime>,
-    interval: Duration,
-) {
-    run_retention_cleanup_once(&state_db).await;
-    loop {
-        tokio::time::sleep(interval).await;
-        run_retention_cleanup_once(&state_db).await;
-    }
-}
-
-async fn run_retention_cleanup_once(state_db: &StateRuntime) {
     let Some(cutoff) = Utc::now().checked_sub_signed(ChronoDuration::days(LOG_RETENTION_DAYS))
     else {
         return;
@@ -408,7 +392,7 @@ mod tests {
     async fn sqlite_feedback_logs_match_feedback_formatter_shape() {
         let codex_home =
             std::env::temp_dir().join(format!("codex-state-log-db-{}", Uuid::new_v4()));
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
             .await
             .expect("initialize runtime");
         let writer = SharedWriter::default();
@@ -479,7 +463,7 @@ mod tests {
     async fn flush_persists_logs_for_query() {
         let codex_home =
             std::env::temp_dir().join(format!("codex-state-log-db-{}", Uuid::new_v4()));
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
             .await
             .expect("initialize runtime");
         let layer = start(runtime.clone());
