@@ -97,8 +97,8 @@ pub(crate) struct RepoHybridSearchParams {
     /// When omitted, all indexable files are considered.
     #[serde(default)]
     pub file_globs: Option<Vec<String>>,
-    /// Blend weight between lexical and embedding scores.
-    /// `0.0` = lexical-only, `1.0` = embedding-only.
+    /// Search mode selector.
+    /// `0.0` = lexical-only, `1.0` = vector-only, values in between = hybrid.
     #[serde(default = "default_alpha")]
     pub alpha: f32,
     /// Optional embedding model override. Defaults to `text-embedding-3-small`.
@@ -160,12 +160,6 @@ pub(crate) enum EmbeddingMode {
     Skip,
 }
 
-impl EmbeddingMode {
-    fn ready(self) -> bool {
-        matches!(self, Self::Required)
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct RepoEmbeddingStatus {
@@ -183,11 +177,46 @@ struct SelectedEmbeddingMode {
 }
 
 impl SelectedEmbeddingMode {
-    fn status(&self) -> RepoEmbeddingStatus {
+    fn status(&self, ready: bool) -> RepoEmbeddingStatus {
         RepoEmbeddingStatus {
             mode_used: self.mode,
-            ready: self.mode.ready(),
+            ready,
             reason: self.reason.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SearchBlendMode {
+    LexicalOnly,
+    Hybrid(f32),
+    VectorOnly,
+}
+
+impl SearchBlendMode {
+    fn from_alpha(alpha: f32) -> Self {
+        if alpha <= f32::EPSILON {
+            Self::LexicalOnly
+        } else if (1.0 - alpha).abs() <= f32::EPSILON {
+            Self::VectorOnly
+        } else {
+            Self::Hybrid(alpha)
+        }
+    }
+
+    fn uses_embeddings(self) -> bool {
+        !matches!(self, Self::LexicalOnly)
+    }
+
+    fn uses_lexical(self) -> bool {
+        !matches!(self, Self::VectorOnly)
+    }
+
+    fn score(self, vector_score: f32, lexical_score: f32) -> f32 {
+        match self {
+            Self::LexicalOnly => lexical_score,
+            Self::Hybrid(alpha) => alpha * vector_score + (1.0 - alpha) * lexical_score,
+            Self::VectorOnly => vector_score,
         }
     }
 }
@@ -217,11 +246,16 @@ impl EmbeddingProvider {
         }
     }
 
-    fn embeddings_url(self) -> String {
+    fn embeddings_url(self, openai_base_url_override: Option<&str>) -> String {
         match self {
             Self::OpenAiCompatible => {
-                let base_url = std::env::var(OPENAI_BASE_URL_ENV_VAR)
-                    .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
+                let base_url = openai_base_url_override.map_or_else(
+                    || {
+                        std::env::var(OPENAI_BASE_URL_ENV_VAR)
+                            .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string())
+                    },
+                    str::to_owned,
+                );
                 format!("{}/embeddings", base_url.trim_end_matches('/'))
             }
             Self::Voyage => DEFAULT_VOYAGE_EMBEDDINGS_URL.to_string(),
@@ -249,6 +283,12 @@ struct ChunkRecord {
 struct SearchOutcome {
     results: Vec<RepoHybridSearchResultItem>,
     embedding_fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshIndexOutcome {
+    stats: RepoIndexRefreshStats,
+    ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -397,7 +437,7 @@ async fn refresh_repo_index(
         .with_context(|| format!("failed to initialize index at `{}`", repo_root.display()))?;
     let embedding_model = embedding_model_or_default(embedding_model);
     let mut embedding_mode = resolve_embedding_mode(require_embeddings, &embedding_model)?;
-    let stats = refresh_index(
+    let refresh_outcome = refresh_index(
         &index,
         &file_globs,
         force_full,
@@ -408,8 +448,8 @@ async fn refresh_repo_index(
 
     Ok(RepoIndexWarmOutcome {
         repo_root,
-        stats,
-        embedding_status: embedding_mode.status(),
+        stats: refresh_outcome.stats,
+        embedding_status: embedding_mode.status(refresh_outcome.ready),
     })
 }
 
@@ -484,12 +524,14 @@ pub(crate) async fn handle_query_project(
     let file_globs = params
         .file_globs
         .unwrap_or_else(|| config.query_project_index.file_globs.clone());
+    let blend_mode = SearchBlendMode::from_alpha(params.alpha);
     let embedding_model = embedding_model_or_default(
         params
             .embedding_model
             .or_else(|| config.query_project_index.embedding_model.clone()),
     );
-    let embedding_mode = match resolve_embedding_mode(
+    let embedding_mode = match resolve_query_project_embedding_mode(
+        blend_mode,
         config.query_project_index.require_embeddings,
         &embedding_model,
     ) {
@@ -520,7 +562,7 @@ pub(crate) async fn handle_query_project(
     };
     let mut embedding_mode = embedding_mode;
 
-    let refresh_stats = match refresh_index(
+    let refresh_outcome = match refresh_index(
         &index,
         &file_globs,
         false,
@@ -529,7 +571,7 @@ pub(crate) async fn handle_query_project(
     )
     .await
     {
-        Ok(stats) => stats,
+        Ok(outcome) => outcome,
         Err(err) => {
             return query_project_failure(
                 &call_start,
@@ -544,7 +586,7 @@ pub(crate) async fn handle_query_project(
         .search(
             query,
             limit,
-            params.alpha,
+            blend_mode,
             &file_globs,
             embedding_model.clone(),
             config.query_project_index.require_embeddings,
@@ -568,7 +610,7 @@ pub(crate) async fn handle_query_project(
             reason: Some(reason.to_string()),
         }
     } else {
-        embedding_mode.status()
+        embedding_mode.status(refresh_outcome.ready)
     };
 
     let result_count = search_outcome.results.len();
@@ -588,7 +630,7 @@ pub(crate) async fn handle_query_project(
         "alpha": params.alpha,
         "embedding_model": embedding_model,
         "embedding_status": embedding_status,
-        "refresh": refresh_stats,
+        "refresh": refresh_outcome.stats,
         "results": search_outcome.results,
     });
     call_tool_success(payload)
@@ -672,6 +714,21 @@ fn resolve_embedding_mode_from_api_key(
     })
 }
 
+fn resolve_query_project_embedding_mode(
+    blend_mode: SearchBlendMode,
+    require_embeddings: bool,
+    model: &str,
+) -> anyhow::Result<SelectedEmbeddingMode> {
+    if !blend_mode.uses_embeddings() {
+        return Ok(SelectedEmbeddingMode {
+            mode: EmbeddingMode::Skip,
+            reason: None,
+            require_embeddings: false,
+        });
+    }
+    resolve_embedding_mode(require_embeddings, model)
+}
+
 fn should_force_full_refresh(
     force_full: bool,
     embedding_mode: EmbeddingMode,
@@ -697,13 +754,59 @@ fn should_force_full_refresh(
     require_embeddings && !stored_ready
 }
 
+fn should_backfill_embeddings(embedding_mode: EmbeddingMode, stored_ready: bool) -> bool {
+    matches!(embedding_mode, EmbeddingMode::Required) && !stored_ready
+}
+
+fn vector_prefilter_candidate_ids(
+    blend_mode: SearchBlendMode,
+    lexical_candidate_ids: &[i64],
+) -> Option<&[i64]> {
+    match blend_mode {
+        SearchBlendMode::Hybrid(_) if !lexical_candidate_ids.is_empty() => {
+            Some(lexical_candidate_ids)
+        }
+        SearchBlendMode::Hybrid(_) | SearchBlendMode::LexicalOnly | SearchBlendMode::VectorOnly => {
+            None
+        }
+    }
+}
+
+fn refresh_preserves_unscanned_existing_files(
+    existing_files: &HashMap<String, ExistingFile>,
+    scanned_paths: &HashSet<&str>,
+    glob_set: Option<&GlobSet>,
+) -> bool {
+    let Some(glob_set) = glob_set else {
+        return false;
+    };
+    existing_files
+        .keys()
+        .any(|path| !scanned_paths.contains(path.as_str()) && !glob_set.is_match(path.as_str()))
+}
+
+fn next_embedding_ready(
+    embedding_mode: EmbeddingMode,
+    stored_ready: bool,
+    backfill_embeddings: bool,
+    preserves_unscanned_existing: bool,
+) -> bool {
+    if !matches!(embedding_mode, EmbeddingMode::Required) {
+        return false;
+    }
+    if !backfill_embeddings {
+        return true;
+    }
+    stored_ready || !preserves_unscanned_existing
+}
+
 async fn refresh_index(
     index: &RepoHybridIndex,
     file_globs: &[String],
     force_full: bool,
     embedding_model: &str,
     embedding_mode: &mut SelectedEmbeddingMode,
-) -> anyhow::Result<RepoIndexRefreshStats> {
+) -> anyhow::Result<RefreshIndexOutcome> {
     match index
         .refresh(
             file_globs,
@@ -714,13 +817,13 @@ async fn refresh_index(
         )
         .await
     {
-        Ok(stats) => Ok(stats),
+        Ok(outcome) => Ok(outcome),
         Err(err)
             if matches!(embedding_mode.mode, EmbeddingMode::Required)
                 && !embedding_mode.require_embeddings =>
         {
             tracing::warn!(error = %err, "embedding refresh failed; retrying without embeddings");
-            let stats = index
+            let outcome = index
                 .refresh(
                     file_globs,
                     force_full,
@@ -731,7 +834,7 @@ async fn refresh_index(
                 .await?;
             embedding_mode.mode = EmbeddingMode::Skip;
             embedding_mode.reason = Some(EMBEDDING_REASON_QUERY_FAILED);
-            Ok(stats)
+            Ok(outcome)
         }
         Err(err) => Err(err),
     }
@@ -836,6 +939,8 @@ struct RepoHybridIndex {
     pool: SqlitePool,
     refresh_lock: Arc<AsyncMutex<()>>,
     embeddings_client: reqwest::Client,
+    embeddings_base_url_override: Option<String>,
+    embedding_api_key_override: Option<String>,
     vector_backend: VectorBackend,
 }
 
@@ -1102,6 +1207,8 @@ impl RepoHybridIndex {
             pool,
             refresh_lock,
             embeddings_client,
+            embeddings_base_url_override: None,
+            embedding_api_key_override: None,
             vector_backend: VectorBackend::from_config(repo_root, index_config)?,
         };
         index.ensure_schema().await?;
@@ -1216,7 +1323,7 @@ impl RepoHybridIndex {
         embedding_model: String,
         embedding_mode: EmbeddingMode,
         require_embeddings: bool,
-    ) -> anyhow::Result<RepoIndexRefreshStats> {
+    ) -> anyhow::Result<RefreshIndexOutcome> {
         let _refresh_guard = self.refresh_lock.lock().await;
         let glob_set = build_glob_set(file_globs)?;
         let stored_model = self.load_metadata(METADATA_EMBEDDING_MODEL).await?;
@@ -1233,6 +1340,8 @@ impl RepoHybridIndex {
             stored_backend.as_deref(),
             current_backend,
         );
+        let backfill_embeddings =
+            !force_full && should_backfill_embeddings(embedding_mode, stored_ready);
         let vector_store = if matches!(embedding_mode, EmbeddingMode::Required) {
             self.vector_backend.qdrant_store()
         } else {
@@ -1264,6 +1373,11 @@ impl RepoHybridIndex {
         let mut qdrant_collection_initialized = false;
 
         let scanned_paths: HashSet<&str> = scanned_files.keys().map(String::as_str).collect();
+        let preserves_unscanned_existing = refresh_preserves_unscanned_existing_files(
+            &existing_files,
+            &scanned_paths,
+            glob_set.as_ref(),
+        );
         for (path, _existing) in existing_files
             .iter()
             .filter(|(path, _)| !scanned_paths.contains(path.as_str()))
@@ -1288,7 +1402,7 @@ impl RepoHybridIndex {
                     && existing.modified_nsec == scanned.modified_nsec
                     && existing.size_bytes == scanned.size_bytes
             });
-            if unchanged {
+            if unchanged && !backfill_embeddings {
                 continue;
             }
 
@@ -1331,7 +1445,7 @@ impl RepoHybridIndex {
                     .iter()
                     .map(|chunk| chunk.content.clone())
                     .collect::<Vec<_>>();
-                embed_texts(&self.embeddings_client, &embedding_model, &inputs).await?
+                self.embed_texts(&embedding_model, &inputs).await?
             } else {
                 vec![Vec::new(); chunks.len()]
             };
@@ -1402,13 +1516,18 @@ impl RepoHybridIndex {
             .await?;
         self.set_metadata(METADATA_VECTOR_BACKEND, current_backend)
             .await?;
-        let ready = embedding_mode.ready();
+        let ready = next_embedding_ready(
+            embedding_mode,
+            stored_ready,
+            backfill_embeddings,
+            preserves_unscanned_existing,
+        );
         self.set_metadata(
             METADATA_EMBEDDING_READY,
             if ready { "true" } else { "false" },
         )
         .await?;
-        Ok(stats)
+        Ok(RefreshIndexOutcome { stats, ready })
     }
 
     async fn clear_all(&self) -> anyhow::Result<()> {
@@ -1459,81 +1578,80 @@ impl RepoHybridIndex {
         &self,
         query: &str,
         limit: usize,
-        alpha: f32,
+        blend_mode: SearchBlendMode,
         file_globs: &[String],
         embedding_model: String,
         require_embeddings: bool,
     ) -> anyhow::Result<SearchOutcome> {
         let glob_set = build_glob_set(file_globs)?;
-        let lexical_scores = self
-            .lexical_scores(
+        let lexical_scores = if blend_mode.uses_lexical() {
+            self.lexical_scores(
                 query,
                 limit.saturating_mul(LEXICAL_CANDIDATE_MULTIPLIER),
                 glob_set.as_ref(),
             )
-            .await?;
+            .await?
+        } else {
+            HashMap::new()
+        };
         let lexical_candidate_ids = lexical_scores.keys().copied().collect::<Vec<_>>();
 
         let mut vector_scores = Vec::new();
-        let mut effective_alpha = 0.0;
         let mut embedding_fallback_reason = None;
-        let embedding_ready = self.embedding_ready().await?;
-        if require_embeddings && !embedding_ready {
-            anyhow::bail!("embeddings are required but the index is not embedding-ready");
-        }
-        if embedding_ready {
-            match embed_texts(
-                &self.embeddings_client,
-                &embedding_model,
-                &[query.to_string()],
-            )
-            .await
-            {
-                Ok(embeddings) => {
-                    let (query_embedding, fallback_reason) =
-                        query_embedding_or_fallback_reason(embeddings);
-                    if let Some(query_embedding) = query_embedding {
-                        let vector_prefilter = if lexical_candidate_ids.is_empty() {
-                            None
-                        } else {
-                            Some(lexical_candidate_ids.as_slice())
-                        };
-                        match self
-                            .vector_scores(
-                                &query_embedding,
-                                limit,
-                                glob_set.as_ref(),
-                                vector_prefilter,
-                            )
-                            .await
-                        {
-                            Ok(scores) => {
-                                effective_alpha = if scores.is_empty() { 0.0 } else { alpha };
-                                vector_scores = scores;
-                            }
-                            Err(err) => {
-                                if require_embeddings {
-                                    return Err(err)
-                                        .context("failed to query vector backend in strict mode");
+        if blend_mode.uses_embeddings() {
+            let embedding_ready = self.embedding_ready().await?;
+            if require_embeddings && !embedding_ready {
+                anyhow::bail!("embeddings are required but the index is not embedding-ready");
+            }
+            if embedding_ready {
+                match self
+                    .embed_texts(&embedding_model, &[query.to_string()])
+                    .await
+                {
+                    Ok(embeddings) => {
+                        let (query_embedding, fallback_reason) =
+                            query_embedding_or_fallback_reason(embeddings);
+                        if let Some(query_embedding) = query_embedding {
+                            let vector_prefilter = vector_prefilter_candidate_ids(
+                                blend_mode,
+                                lexical_candidate_ids.as_slice(),
+                            );
+                            match self
+                                .vector_scores(
+                                    &query_embedding,
+                                    limit,
+                                    glob_set.as_ref(),
+                                    vector_prefilter,
+                                )
+                                .await
+                            {
+                                Ok(scores) => {
+                                    vector_scores = scores;
                                 }
-                                effective_alpha = 0.0;
-                                embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
+                                Err(err) => {
+                                    if require_embeddings {
+                                        return Err(err).context(
+                                            "failed to query vector backend in strict mode",
+                                        );
+                                    }
+                                    embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
+                                }
                             }
+                        } else {
+                            if require_embeddings {
+                                anyhow::bail!(
+                                    "embeddings are required but query embedding was empty"
+                                );
+                            }
+                            embedding_fallback_reason = fallback_reason;
                         }
-                    } else {
+                    }
+                    Err(err) => {
                         if require_embeddings {
-                            anyhow::bail!("embeddings are required but query embedding was empty");
+                            return Err(err).context("failed to embed query in strict mode");
                         }
-                        effective_alpha = 0.0;
-                        embedding_fallback_reason = fallback_reason;
+                        embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
                     }
-                }
-                Err(err) => {
-                    if require_embeddings {
-                        return Err(err).context("failed to embed query in strict mode");
-                    }
-                    effective_alpha = 0.0;
-                    embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
                 }
             }
         }
@@ -1550,8 +1668,18 @@ impl RepoHybridIndex {
         let normalized_lexical = normalize_scores(&lexical_score_pairs);
 
         let mut candidate_ids = HashSet::new();
-        candidate_ids.extend(normalized_vector.keys().copied());
-        candidate_ids.extend(normalized_lexical.keys().copied());
+        match blend_mode {
+            SearchBlendMode::LexicalOnly => {
+                candidate_ids.extend(normalized_lexical.keys().copied());
+            }
+            SearchBlendMode::Hybrid(_) => {
+                candidate_ids.extend(normalized_vector.keys().copied());
+                candidate_ids.extend(normalized_lexical.keys().copied());
+            }
+            SearchBlendMode::VectorOnly => {
+                candidate_ids.extend(normalized_vector.keys().copied());
+            }
+        }
         let candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
         let chunks = self.load_chunks_by_ids(&candidate_ids).await?;
 
@@ -1567,8 +1695,7 @@ impl RepoHybridIndex {
                     .get(&chunk_id)
                     .copied()
                     .unwrap_or_default();
-                let score =
-                    effective_alpha * vector_score + (1.0 - effective_alpha) * lexical_score;
+                let score = blend_mode.score(vector_score, lexical_score);
                 (chunk_id, score)
             })
             .collect::<Vec<_>>();
@@ -1599,6 +1726,53 @@ impl RepoHybridIndex {
             results,
             embedding_fallback_reason,
         })
+    }
+
+    async fn embed_texts(&self, model: &str, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider = EmbeddingProvider::from_model(model);
+        let api_key_env_var = provider.api_key_env_var();
+        let api_key = self
+            .embedding_api_key_override
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var(api_key_env_var)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .with_context(|| {
+                format!("{api_key_env_var} is required for query_project embeddings")
+            })?;
+        let embeddings_url = provider.embeddings_url(self.embeddings_base_url_override.as_deref());
+
+        let mut all_embeddings = Vec::<Vec<f32>>::with_capacity(inputs.len());
+        for batch in inputs.chunks(EMBED_BATCH_SIZE) {
+            let request_body = EmbeddingsRequestBody {
+                model: model.to_string(),
+                input: batch.to_vec(),
+            };
+            let response = self
+                .embeddings_client
+                .post(&embeddings_url)
+                .bearer_auth(&api_key)
+                .json(&request_body)
+                .send()
+                .await?;
+            if response.status() != StatusCode::OK {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("embedding request failed with status {status}: {body}");
+            }
+
+            let mut parsed = response.json::<EmbeddingsResponseBody>().await?;
+            parsed.data.sort_by_key(|item| item.index);
+            all_embeddings.extend(parsed.data.into_iter().map(|item| item.embedding));
+        }
+        Ok(all_embeddings)
     }
 
     async fn vector_scores(
@@ -2112,50 +2286,61 @@ struct EmbeddingItem {
     index: usize,
 }
 
-async fn embed_texts(
-    client: &reqwest::Client,
-    model: &str,
-    inputs: &[String],
-) -> anyhow::Result<Vec<Vec<f32>>> {
-    if inputs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let provider = EmbeddingProvider::from_model(model);
-    let api_key_env_var = provider.api_key_env_var();
-    let api_key = std::env::var(api_key_env_var)
-        .with_context(|| format!("{api_key_env_var} is required for query_project embeddings"))?;
-    let embeddings_url = provider.embeddings_url();
-
-    let mut all_embeddings = Vec::<Vec<f32>>::with_capacity(inputs.len());
-    for batch in inputs.chunks(EMBED_BATCH_SIZE) {
-        let request_body = EmbeddingsRequestBody {
-            model: model.to_string(),
-            input: batch.to_vec(),
-        };
-        let response = client
-            .post(&embeddings_url)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send()
-            .await?;
-        if response.status() != StatusCode::OK {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("embedding request failed with status {status}: {body}");
-        }
-
-        let mut parsed = response.json::<EmbeddingsResponseBody>().await?;
-        parsed.data.sort_by_key(|item| item.index);
-        all_embeddings.extend(parsed.data.into_iter().map(|item| item.embedding));
-    }
-    Ok(all_embeddings)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtomicOrdering;
     use tempfile::tempdir;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::Respond;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    struct EmbeddingsSeqResponder {
+        responses: Vec<Vec<Vec<f32>>>,
+        next_response: AtomicUsize,
+    }
+
+    impl Respond for EmbeddingsSeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let index = self.next_response.fetch_add(1, AtomicOrdering::SeqCst);
+            let embeddings = self
+                .responses
+                .get(index)
+                .unwrap_or_else(|| panic!("missing embedding response for request {index}"));
+            let body = json!({
+                "data": embeddings
+                    .iter()
+                    .enumerate()
+                    .map(|(embedding_index, embedding)| {
+                        json!({
+                            "embedding": embedding,
+                            "index": embedding_index,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
+
+    async fn mount_openai_embeddings(server: &MockServer, responses: Vec<Vec<Vec<f32>>>) {
+        let responder = EmbeddingsSeqResponder {
+            next_response: AtomicUsize::new(0),
+            responses,
+        };
+        let expected_calls = responder.responses.len() as u64;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(responder)
+            .expect(expected_calls)
+            .mount(server)
+            .await;
+    }
 
     #[test]
     fn chunk_text_splits_with_overlap() {
@@ -2282,7 +2467,7 @@ mod tests {
         assert_eq!(mode.mode, EmbeddingMode::Required);
         assert_eq!(mode.reason, None);
         assert!(!mode.require_embeddings);
-        assert_eq!(mode.status().ready, true);
+        assert_eq!(mode.status(true).ready, true);
     }
 
     #[test]
@@ -2292,7 +2477,7 @@ mod tests {
         assert_eq!(mode.mode, EmbeddingMode::Skip);
         assert_eq!(mode.reason, Some(EMBEDDING_REASON_MISSING_API_KEY));
         assert!(!mode.require_embeddings);
-        assert_eq!(mode.status().ready, false);
+        assert_eq!(mode.status(false).ready, false);
     }
 
     #[test]
@@ -2303,7 +2488,20 @@ mod tests {
         assert_eq!(mode.mode, EmbeddingMode::Required);
         assert_eq!(mode.reason, None);
         assert!(mode.require_embeddings);
-        assert_eq!(mode.status().ready, true);
+        assert_eq!(mode.status(true).ready, true);
+    }
+
+    #[test]
+    fn lexical_only_queries_bypass_embedding_mode_resolution() {
+        let mode = resolve_query_project_embedding_mode(
+            SearchBlendMode::LexicalOnly,
+            true,
+            DEFAULT_EMBEDDING_MODEL,
+        )
+        .expect("lexical-only mode should bypass embedding resolution");
+        assert_eq!(mode.mode, EmbeddingMode::Skip);
+        assert_eq!(mode.reason, None);
+        assert!(!mode.require_embeddings);
     }
 
     #[test]
@@ -2407,6 +2605,39 @@ mod tests {
     }
 
     #[test]
+    fn backfill_embeddings_when_required_mode_is_not_ready() {
+        assert!(should_backfill_embeddings(EmbeddingMode::Required, false));
+    }
+
+    #[test]
+    fn skip_mode_does_not_backfill_embeddings() {
+        assert!(!should_backfill_embeddings(EmbeddingMode::Skip, false));
+    }
+
+    #[test]
+    fn required_mode_does_not_backfill_when_already_ready() {
+        assert!(!should_backfill_embeddings(EmbeddingMode::Required, true));
+    }
+
+    #[test]
+    fn vector_prefilter_disabled_for_embedding_only_alpha() {
+        let candidates = vec![1_i64, 2_i64];
+        assert_eq!(
+            vector_prefilter_candidate_ids(SearchBlendMode::VectorOnly, candidates.as_slice()),
+            None
+        );
+    }
+
+    #[test]
+    fn vector_prefilter_enabled_for_mixed_alpha_with_lexical_candidates() {
+        let candidates = vec![1_i64, 2_i64];
+        assert_eq!(
+            vector_prefilter_candidate_ids(SearchBlendMode::Hybrid(0.6), candidates.as_slice()),
+            Some(candidates.as_slice())
+        );
+    }
+
+    #[test]
     fn resolve_embedding_mode_requires_api_key_in_strict_mode() {
         let err = resolve_embedding_mode_from_api_key(true, None, OPENAI_API_KEY_ENV_VAR)
             .expect_err("strict mode should fail without api key");
@@ -2453,7 +2684,7 @@ mod tests {
             .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
             .await
             .expect("initial refresh");
-        let stats = index
+        let outcome = index
             .refresh(
                 &["src/a.txt".to_string()],
                 false,
@@ -2465,7 +2696,8 @@ mod tests {
             .expect("glob refresh");
         let files = index.load_existing_files().await.expect("load files");
 
-        assert_eq!(stats.removed_files, 0);
+        assert_eq!(outcome.stats.removed_files, 0);
+        assert!(!outcome.ready);
         assert!(files.contains_key("src/a.txt"));
         assert!(files.contains_key("src/b.txt"));
     }
@@ -2502,8 +2734,209 @@ mod tests {
             .await
             .expect("second refresh");
 
-        assert_eq!(second.updated_files, 0);
-        assert_eq!(second.removed_files, 0);
+        assert_eq!(second.stats.updated_files, 0);
+        assert_eq!(second.stats.removed_files, 0);
+        assert!(!second.ready);
+    }
+
+    #[tokio::test]
+    async fn scoped_required_refresh_keeps_index_not_ready_until_full_backfill() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::create_dir_all(repo_root.join("src")).expect("create src dir");
+        std::fs::write(repo_root.join("src/a.txt"), "alpha").expect("write a.txt");
+        std::fs::write(repo_root.join("src/b.txt"), "beta").expect("write b.txt");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(
+            &server,
+            vec![
+                vec![vec![1.0_f32, 0.0_f32]],
+                vec![vec![1.0_f32, 0.0_f32]],
+                vec![vec![1.0_f32, 0.0_f32]],
+            ],
+        )
+        .await;
+
+        let mut index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        index
+            .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
+            .await
+            .expect("initial skip refresh");
+        assert!(
+            !index
+                .embedding_ready()
+                .await
+                .expect("embedding ready after skip")
+        );
+
+        let partial = index
+            .refresh(
+                &["src/a.txt".to_string()],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("partial required refresh");
+        assert_eq!(partial.stats.updated_files, 1);
+        assert!(!partial.ready);
+        assert!(
+            !index
+                .embedding_ready()
+                .await
+                .expect("embedding ready after partial")
+        );
+
+        let full = index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("full required refresh");
+        assert_eq!(full.stats.updated_files, 2);
+        assert!(full.ready);
+        assert!(
+            index
+                .embedding_ready()
+                .await
+                .expect("embedding ready after full")
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_only_search_skips_embedding_checks_and_requests() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(&server, Vec::new()).await;
+
+        let mut index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+        index
+            .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
+            .await
+            .expect("refresh");
+
+        let outcome = index
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::LexicalOnly,
+                &[],
+                "model".to_string(),
+                true,
+            )
+            .await
+            .expect("lexical-only search");
+
+        assert_eq!(outcome.embedding_fallback_reason, None);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].path, "README.md");
+    }
+
+    #[tokio::test]
+    async fn vector_only_search_can_return_non_lexical_vector_hits() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        let server = MockServer::start().await;
+        mount_openai_embeddings(&server, vec![vec![vec![1.0_f32, 0.0_f32]]]).await;
+
+        let mut index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        let mut tx = index.pool.begin().await.expect("begin tx");
+        let lexical_insert = sqlx::query(
+            "INSERT INTO chunks(path, start_line, end_line, snippet, content, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("lexical.rs")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind("needle lexical")
+        .bind("needle lexical")
+        .bind("[0.0, 1.0]")
+        .execute(&mut *tx)
+        .await
+        .expect("insert lexical chunk");
+        let lexical_id = lexical_insert.last_insert_rowid();
+        sqlx::query("INSERT INTO chunks_fts(rowid, content, path, chunk_id) VALUES (?, ?, ?, ?)")
+            .bind(lexical_id)
+            .bind("needle lexical")
+            .bind("lexical.rs")
+            .bind(lexical_id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert lexical fts row");
+
+        let vector_insert = sqlx::query(
+            "INSERT INTO chunks(path, start_line, end_line, snippet, content, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("vector.rs")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind("vector hit")
+        .bind("something unrelated")
+        .bind("[1.0, 0.0]")
+        .execute(&mut *tx)
+        .await
+        .expect("insert vector chunk");
+        let vector_id = vector_insert.last_insert_rowid();
+        sqlx::query("INSERT INTO chunks_fts(rowid, content, path, chunk_id) VALUES (?, ?, ?, ?)")
+            .bind(vector_id)
+            .bind("something unrelated")
+            .bind("vector.rs")
+            .bind(vector_id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert vector fts row");
+        tx.commit().await.expect("commit");
+
+        index
+            .set_metadata(METADATA_EMBEDDING_READY, "true")
+            .await
+            .expect("set embedding ready");
+        index
+            .set_metadata(METADATA_EMBEDDING_MODEL, "model")
+            .await
+            .expect("set embedding model");
+        index
+            .set_metadata(METADATA_VECTOR_BACKEND, "local")
+            .await
+            .expect("set vector backend");
+
+        let outcome = index
+            .search(
+                "needle",
+                1,
+                SearchBlendMode::VectorOnly,
+                &[],
+                "model".to_string(),
+                false,
+            )
+            .await
+            .expect("vector-only search");
+
+        assert_eq!(outcome.embedding_fallback_reason, None);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].path, "vector.rs");
     }
 
     #[tokio::test]
@@ -2520,7 +2953,14 @@ mod tests {
             .await
             .expect("refresh");
         let outcome = index
-            .search("needle", 5, 1.0, &[], "model".to_string(), false)
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::Hybrid(0.6),
+                &[],
+                "model".to_string(),
+                false,
+            )
             .await
             .expect("search");
 
@@ -2549,7 +2989,14 @@ mod tests {
             .expect("refresh");
 
         let err = index
-            .search("needle", 5, 0.5, &[], "model".to_string(), true)
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::Hybrid(0.5),
+                &[],
+                "model".to_string(),
+                true,
+            )
             .await
             .expect_err("strict mode should fail when embeddings are unavailable");
         assert!(
@@ -2577,14 +3024,8 @@ mod tests {
         assert_eq!(first.stats.updated_files, 1);
         assert_eq!(second.stats.updated_files, 0);
         assert_eq!(second.stats.removed_files, 0);
-        assert_eq!(
-            first.embedding_status.ready,
-            first.embedding_status.mode_used.ready()
-        );
-        assert_eq!(
-            second.embedding_status.ready,
-            second.embedding_status.mode_used.ready()
-        );
+        assert!(!first.embedding_status.ready);
+        assert!(!second.embedding_status.ready);
     }
 
     #[tokio::test]
