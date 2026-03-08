@@ -17,6 +17,8 @@ use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
 use crate::config::types::PluginConfig;
+use crate::config::types::QueryProjectIndex;
+use crate::config::types::QueryProjectIndexQdrant;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -319,6 +321,9 @@ pub struct Config {
 
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
+
+    /// Configuration for the local `query_project` index used by MCP clients.
+    pub query_project_index: QueryProjectIndex,
 
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
@@ -1190,6 +1195,9 @@ pub struct ConfigToml {
 
     /// Collection of settings that are specific to the TUI.
     pub tui: Option<Tui>,
+
+    /// Configuration for the local `query_project` index used by MCP clients.
+    pub query_project_index: Option<QueryProjectIndex>,
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
@@ -2254,6 +2262,63 @@ impl Config {
         let review_model = override_review_model.or(cfg.review_model);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
+
+        let query_project_index = {
+            let raw = cfg.query_project_index.unwrap_or_default();
+            QueryProjectIndex {
+                backend: raw.backend,
+                auto_warm: raw.auto_warm,
+                require_embeddings: raw.require_embeddings,
+                embedding_model: raw.embedding_model.and_then(|model| {
+                    let trimmed = model.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }),
+                file_globs: raw
+                    .file_globs
+                    .into_iter()
+                    .filter_map(|glob| {
+                        let trimmed = glob.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                    .collect(),
+                qdrant: QueryProjectIndexQdrant {
+                    url: raw.qdrant.url.and_then(|url| {
+                        let trimmed = url.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }),
+                    api_key_env: {
+                        let trimmed = raw.qdrant.api_key_env.trim();
+                        if trimmed.is_empty() {
+                            "QDRANT_API_KEY".to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    },
+                    collection_prefix: {
+                        let trimmed = raw.qdrant.collection_prefix.trim();
+                        if trimmed.is_empty() {
+                            "codex_repo_".to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    },
+                    timeout_ms: raw.qdrant.timeout_ms.max(1),
+                },
+            }
+        };
+
         let model_catalog = load_model_catalog(
             config_profile
                 .model_catalog_json
@@ -2494,6 +2559,7 @@ impl Config {
                 .unwrap_or_default(),
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            query_project_index,
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);
