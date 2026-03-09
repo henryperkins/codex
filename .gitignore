@@ -31,6 +31,7 @@ result
 # cli tools
 CLAUDE.md
 .claude/
+.codex/repo_hybrid_index/
 AGENTS.override.md
 
 # caches
