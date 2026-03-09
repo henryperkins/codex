@@ -80,6 +80,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
@@ -104,6 +105,7 @@ pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+const AZURE_MISSING_TOOL_OUTPUT_ERROR_SNIPPET: &str = "No tool output found for function call";
 
 pub fn ws_version_from_features(config: &Config) -> bool {
     config
@@ -112,6 +114,25 @@ pub fn ws_version_from_features(config: &Config) -> bool {
         || config
             .features
             .enabled(crate::features::Feature::ResponsesWebsocketsV2)
+}
+
+fn azure_missing_tool_output_error_message(err: &ApiError) -> Option<&str> {
+    match err {
+        ApiError::InvalidRequest { message }
+            if message.contains(AZURE_MISSING_TOOL_OUTPUT_ERROR_SNIPPET) =>
+        {
+            Some(message.as_str())
+        }
+        ApiError::Transport(TransportError::Http { status, body, .. })
+            if *status == StatusCode::BAD_REQUEST
+                && body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(AZURE_MISSING_TOOL_OUTPUT_ERROR_SNIPPET)) =>
+        {
+            body.as_deref()
+        }
+        _ => None,
+    }
 }
 
 /// Session-scoped state shared by all [`ModelClient`] clones.
@@ -183,6 +204,9 @@ pub struct ModelClientSession {
     /// the same `previous_response_id` and incremental input.
     http_last_completed_response: Option<LastResponse>,
     http_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    /// When Azure rejects a chained request despite complete local tool outputs,
+    /// retry statelessly and keep chaining disabled for the rest of the turn.
+    azure_http_chaining_disabled: bool,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -259,6 +283,7 @@ impl ModelClient {
             http_last_request: None,
             http_last_completed_response: None,
             http_last_response_rx: None,
+            azure_http_chaining_disabled: false,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -692,6 +717,20 @@ impl ModelClientSession {
             false,
         );
         if let Some(append_items) = incremental_items {
+            info!(
+                previous_response_id = %last_response.response_id,
+                delta_len = append_items.len(),
+                items_added_len = last_response.items_added.len(),
+                previous_input_len = previous_request.input.len(),
+                full_input_len = request.input.len(),
+                delta_types = %append_items.iter().map(|item| format!("{:?}", std::mem::discriminant(item))).collect::<Vec<_>>().join(", "),
+                delta_call_ids = %append_items.iter().filter_map(|item| match item {
+                    ResponseItem::FunctionCallOutput { call_id, .. }
+                    | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join(", "),
+                "Azure incremental request: sending delta with previous_response_id"
+            );
             request.previous_response_id = Some(last_response.response_id.clone());
             request.input = append_items;
         }
@@ -860,11 +899,14 @@ impl ModelClientSession {
                 summary,
                 service_tier,
             )?;
-            let request = if is_azure_responses_endpoint {
+            let request = if is_azure_responses_endpoint && !self.azure_http_chaining_disabled {
                 self.prepare_azure_http_request(request_for_state.clone())
             } else {
                 request_for_state.clone()
             };
+            let previous_response_id = request.previous_response_id.clone();
+            let chained_azure_request =
+                is_azure_responses_endpoint && previous_response_id.is_some();
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -877,10 +919,14 @@ impl ModelClientSession {
                 Ok(stream) => {
                     let (stream, last_response_rx) =
                         map_response_stream(stream, session_telemetry.clone());
-                    if is_azure_responses_endpoint {
+                    if is_azure_responses_endpoint && !self.azure_http_chaining_disabled {
                         self.http_last_request = Some(request_for_state);
                         self.http_last_completed_response = None;
                         self.http_last_response_rx = Some(last_response_rx);
+                    } else if is_azure_responses_endpoint {
+                        self.http_last_request = None;
+                        self.http_last_completed_response = None;
+                        self.http_last_response_rx = None;
                     }
                     return Ok(stream);
                 }
@@ -890,7 +936,23 @@ impl ModelClientSession {
                     handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => {
+                    if chained_azure_request
+                        && let Some(error_message) = azure_missing_tool_output_error_message(&err)
+                    {
+                        warn!(
+                            previous_response_id,
+                            error_message,
+                            "Azure rejected chained tool outputs; retrying statelessly and disabling Azure HTTP chaining for the rest of the turn"
+                        );
+                        self.azure_http_chaining_disabled = true;
+                        self.http_last_request = None;
+                        self.http_last_completed_response = None;
+                        self.http_last_response_rx = None;
+                        continue;
+                    }
+                    return Err(map_api_error(err));
+                }
             }
         }
     }
@@ -1345,7 +1407,10 @@ impl WebsocketTelemetry for ApiTelemetry {
 mod tests {
     use super::LastResponse;
     use super::ModelClient;
+    use super::azure_missing_tool_output_error_message;
     use codex_api::ResponsesApiRequest;
+    use codex_api::TransportError;
+    use codex_api::error::ApiError;
     use codex_otel::SessionTelemetry;
     use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
@@ -1354,6 +1419,7 @@ mod tests {
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use pretty_assertions::assert_eq;
+    use reqwest::StatusCode;
     use serde_json::json;
     use tokio::sync::oneshot;
 
@@ -1461,6 +1527,35 @@ mod tests {
             prompt_cache_key: None,
             text: None,
         }
+    }
+
+    #[test]
+    fn azure_missing_tool_output_error_message_matches_invalid_request() {
+        let err = ApiError::InvalidRequest {
+            message: "No tool output found for function call call-1.".to_string(),
+        };
+
+        assert_eq!(
+            azure_missing_tool_output_error_message(&err),
+            Some("No tool output found for function call call-1.")
+        );
+    }
+
+    #[test]
+    fn azure_missing_tool_output_error_message_matches_bad_request_body() {
+        let body =
+            r#"{"error":{"message":"No tool output found for function call call-2."}}"#.to_string();
+        let err = ApiError::Transport(TransportError::Http {
+            status: StatusCode::BAD_REQUEST,
+            url: Some("https://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body.clone()),
+        });
+
+        assert_eq!(
+            azure_missing_tool_output_error_message(&err),
+            Some(body.as_str())
+        );
     }
 
     #[test]

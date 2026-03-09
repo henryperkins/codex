@@ -2100,6 +2100,144 @@ async fn azure_responses_request_chaining_survives_unauthorized_retry_within_tur
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_chained_tool_output_fallback_retries_statelessly_for_rest_of_turn() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    sse(vec![
+                        ev_response_created("resp-1"),
+                        ev_shell_command_call("shell-call-1", "echo chained"),
+                        ev_completed("resp-1"),
+                    ]),
+                    "text/event-stream",
+                ),
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "message": "No tool output found for function call shell-call-1."
+                    }
+                })),
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    sse(vec![
+                        ev_response_created("resp-2"),
+                        ev_shell_command_call("shell-call-2", "echo fallback-disabled"),
+                        ev_completed("resp-2"),
+                    ]),
+                    "text/event-stream",
+                ),
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+                    "text/event-stream",
+                ),
+        ],
+    )
+    .await;
+
+    let provider = ModelProviderInfo {
+        name: "azure".into(),
+        base_url: Some(format!("{}/openai", server.uri())),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(move |config| {
+            config.model_provider = provider;
+        });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "run shell command".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 4);
+
+    let first = requests[0].body_json();
+    let second = requests[1].body_json();
+    let third = requests[2].body_json();
+    let fourth = requests[3].body_json();
+
+    assert_eq!(first.get("previous_response_id"), None);
+    assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
+    assert_eq!(third.get("previous_response_id"), None);
+    assert_eq!(fourth.get("previous_response_id"), None);
+
+    let second_input = requests[1].input();
+    assert_eq!(second_input.len(), 1);
+    assert_eq!(
+        second_input[0].get("type").and_then(|value| value.as_str()),
+        Some("function_call_output")
+    );
+    assert_eq!(
+        second_input[0]
+            .get("call_id")
+            .and_then(|value| value.as_str()),
+        Some("shell-call-1")
+    );
+
+    assert!(requests[2].has_function_call("shell-call-1"));
+    assert_eq!(
+        requests[2]
+            .function_call_output("shell-call-1")
+            .get("call_id")
+            .and_then(|value| value.as_str()),
+        Some("shell-call-1")
+    );
+
+    assert!(requests[3].has_function_call("shell-call-1"));
+    assert!(requests[3].has_function_call("shell-call-2"));
+    assert_eq!(
+        requests[3]
+            .function_call_output("shell-call-1")
+            .get("call_id")
+            .and_then(|value| value.as_str()),
+        Some("shell-call-1")
+    );
+    assert_eq!(
+        requests[3]
+            .function_call_output("shell-call-2")
+            .get("call_id")
+            .and_then(|value| value.as_str()),
+        Some("shell-call-2")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_count_includes_rate_limits_snapshot() {
     skip_if_no_network!();
     let server = MockServer::start().await;

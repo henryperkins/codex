@@ -138,7 +138,7 @@ that want strict failure semantics when embeddings are unavailable.
 - `query` (required): plain-language description of what to find.
 - `limit` (optional): max results, default `8`, capped at `200`.
 - `file_globs` (optional): include filters like `src/**/*.rs`.
-- `alpha` (optional): search mode selector (`0.0` lexical-only with no embedding requests, `1.0` vector-only with no lexical fallback, values in between blend lexical and embedding scores).
+- `alpha` (optional): search mode selector (`0.0` lexical-only with no embedding requests, `1.0` vector-only with no lexical fallback, values in between blend lexical and embedding scores; with the `qdrant` backend, hybrid search also preserves semantic-only candidates that do not have lexical matches).
 - `repo_root` and `embedding_model` (optional): override defaults when needed.
 - `repo_root` must resolve under the current working directory (the current directory or one of its subdirectories).
 
@@ -198,7 +198,7 @@ Recommended setup flow for MCP clients:
    - Set the API key env var referenced by `query_project_index.qdrant.api_key_env` (default `QDRANT_API_KEY`).
 3. Complete the MCP handshake (`initialize` + `notifications/initialized`); Codex will start a background auto-warm for the current repo.
 4. Use `query_project` for searches; it performs incremental refresh automatically before each query.
-5. Read `embedding_status` in responses to detect whether embeddings were usable for the current call (`ready: true`) or whether the call ran without embeddings (`ready: false`). The optional `reason` can be `missing_api_key` or `embedding_query_failed`.
+5. Read `embedding_status` in responses to detect whether embeddings were usable for the current call (`ready: true`) or whether the call ran without embeddings (`ready: false`). The optional `reason` can be `missing_api_key`, `embedding_query_failed`, or `embedding_unavailable` when the configured vector backend is not currently usable.
 6. Optionally call `repo_index_refresh` when you want an explicit warm-up at a chosen `repo_root` and/or specific `file_globs`.
 
 Warm-up request example:
@@ -216,9 +216,11 @@ Warm-up request example:
 
 Notes:
 
-- Use `require_embeddings: true` only when embeddings are mandatory for your workflow; calls will fail if embeddings are unavailable (including missing provider credentials, an index that is not embedding-ready, or query-time embedding failures).
-- Use `force_full: true` only when you explicitly want a full rebuild instead of normal incremental refresh.
-- When embeddings were previously unavailable and later become available, Codex reports `embedding_status.ready = true` only after a required refresh has covered the full currently indexed corpus. Scoped refreshes can backfill matching files without marking the whole index embedding-ready.
+- Use `require_embeddings: true` only when embeddings are mandatory for your workflow; calls will fail if embeddings are unavailable (including missing provider credentials, an index that is not embedding-ready, an unavailable vector backend, or query-time embedding failures).
+- Use `force_full: true` only when you explicitly want a full rebuild instead of normal incremental refresh; it cannot be combined with `file_globs`.
+- When embeddings were previously unavailable and later become available, Codex reports `embedding_status.ready = true` only after a required refresh has covered the full currently indexed corpus and the configured vector backend is currently usable. Scoped refreshes can backfill matching files without marking the whole index embedding-ready.
+- If a scoped refresh detects that a full-corpus repair is still required (for example, a missing `qdrant` collection or an old vector layout), Codex preserves the existing index data and leaves `embedding_status.ready = false` until an unscoped refresh completes. With `require_embeddings: true`, that scoped call fails instead of silently degrading.
+- Older `qdrant` indexes may do a one-time full rebuild on the first embedding-enabled refresh after upgrade so stale remote points are reconciled with the local SQLite index.
 
 ## Configuring index defaults
 
