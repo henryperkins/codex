@@ -32,9 +32,20 @@ use crate::plugins::PluginsManager;
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 pub(crate) const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
+pub(crate) const CODEX_REPO_TOOLS_MCP_SERVER_NAME: &str = "codex-repo-tools";
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
+const CODEX_CLI_BINARY_NAME: &str = "codex";
+const CODEX_MCP_SERVER_BINARY_NAME: &str = "codex-mcp-server";
+const CODEX_MCP_SERVER_SUBCOMMAND: &str = "mcp-server";
 const OPENAI_CONNECTORS_MCP_BASE_URL: &str = "https://api.openai.com";
 const OPENAI_CONNECTORS_MCP_PATH: &str = "/v1/connectors/gateways/flat/mcp";
+const REPO_TOOLS_MCP_ENABLED_TOOLS: [&str; 2] = ["query_project", "repo_index_refresh"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalRepoToolsMcpLauncher {
+    command: String,
+    args: Vec<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolPluginProvenance {
@@ -202,6 +213,99 @@ fn codex_apps_mcp_server_config(config: &Config, auth: Option<&CodexAuth>) -> Mc
         scopes: None,
         oauth_resource: None,
     }
+}
+
+fn cargo_bin_env_keys(name: &str) -> Vec<String> {
+    let mut keys = vec![format!("CARGO_BIN_EXE_{name}")];
+    let underscore_name = name.replace('-', "_");
+    if underscore_name != name {
+        keys.push(format!("CARGO_BIN_EXE_{underscore_name}"));
+    }
+    keys
+}
+
+fn cargo_bin_env_path(name: &str) -> Option<PathBuf> {
+    cargo_bin_env_keys(name).into_iter().find_map(|key| {
+        env::var_os(&key)
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+    })
+}
+
+fn which_binary(name: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        let _ = name;
+        None
+    }
+
+    #[cfg(not(test))]
+    {
+        which::which(name).ok()
+    }
+}
+
+fn resolve_local_repo_tools_mcp_launcher(
+    repo_tools_exe: Option<PathBuf>,
+    current_exe: Option<PathBuf>,
+    codex_exe: Option<PathBuf>,
+) -> Option<LocalRepoToolsMcpLauncher> {
+    if let Some(path) = repo_tools_exe {
+        return Some(LocalRepoToolsMcpLauncher {
+            command: path.to_string_lossy().to_string(),
+            args: Vec::new(),
+        });
+    }
+
+    if let Some(path) = current_exe
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(CODEX_CLI_BINARY_NAME))
+    {
+        return Some(LocalRepoToolsMcpLauncher {
+            command: path.to_string_lossy().to_string(),
+            args: vec![CODEX_MCP_SERVER_SUBCOMMAND.to_string()],
+        });
+    }
+
+    codex_exe.map(|path| LocalRepoToolsMcpLauncher {
+        command: path.to_string_lossy().to_string(),
+        args: vec![CODEX_MCP_SERVER_SUBCOMMAND.to_string()],
+    })
+}
+
+pub(crate) fn repo_tools_mcp_server_config() -> Option<McpServerConfig> {
+    let repo_tools_exe = cargo_bin_env_path(CODEX_MCP_SERVER_BINARY_NAME)
+        .or_else(|| which_binary(CODEX_MCP_SERVER_BINARY_NAME));
+    let codex_exe =
+        cargo_bin_env_path(CODEX_CLI_BINARY_NAME).or_else(|| which_binary(CODEX_CLI_BINARY_NAME));
+    let launcher =
+        resolve_local_repo_tools_mcp_launcher(repo_tools_exe, env::current_exe().ok(), codex_exe)?;
+
+    Some(McpServerConfig {
+        transport: McpServerTransportConfig::Stdio {
+            command: launcher.command,
+            args: launcher.args,
+            env: None,
+            env_vars: Vec::new(),
+            cwd: None,
+        },
+        enabled: true,
+        required: false,
+        disabled_reason: None,
+        startup_timeout_sec: Some(Duration::from_secs(30)),
+        tool_timeout_sec: None,
+        enabled_tools: Some(
+            REPO_TOOLS_MCP_ENABLED_TOOLS
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        ),
+        disabled_tools: None,
+        scopes: None,
+        oauth_resource: None,
+    })
 }
 
 pub(crate) fn with_codex_apps_mcp(
@@ -725,6 +829,60 @@ mod tests {
 
         let expected_url = format!("{OPENAI_CONNECTORS_MCP_BASE_URL}{OPENAI_CONNECTORS_MCP_PATH}");
         assert_eq!(url, &expected_url);
+    }
+
+    #[test]
+    fn resolve_local_repo_tools_launcher_prefers_dedicated_mcp_server_binary() {
+        let launcher = resolve_local_repo_tools_mcp_launcher(
+            Some(PathBuf::from("/tmp/codex-mcp-server")),
+            Some(PathBuf::from("/tmp/codex")),
+            Some(PathBuf::from("/usr/bin/codex")),
+        )
+        .expect("launcher should resolve");
+
+        assert_eq!(
+            launcher,
+            LocalRepoToolsMcpLauncher {
+                command: "/tmp/codex-mcp-server".to_string(),
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_local_repo_tools_launcher_falls_back_to_current_codex_exe() {
+        let launcher = resolve_local_repo_tools_mcp_launcher(
+            None,
+            Some(PathBuf::from("/tmp/codex")),
+            Some(PathBuf::from("/usr/bin/codex")),
+        )
+        .expect("launcher should resolve");
+
+        assert_eq!(
+            launcher,
+            LocalRepoToolsMcpLauncher {
+                command: "/tmp/codex".to_string(),
+                args: vec!["mcp-server".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_local_repo_tools_launcher_falls_back_to_codex_on_path() {
+        let launcher = resolve_local_repo_tools_mcp_launcher(
+            None,
+            Some(PathBuf::from("/tmp/not-codex")),
+            Some(PathBuf::from("/usr/bin/codex")),
+        )
+        .expect("launcher should resolve");
+
+        assert_eq!(
+            launcher,
+            LocalRepoToolsMcpLauncher {
+                command: "/usr/bin/codex".to_string(),
+                args: vec!["mcp-server".to_string()],
+            }
+        );
     }
 
     #[tokio::test]

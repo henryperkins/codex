@@ -10,6 +10,7 @@ use crate::config_loader::Sourced;
 use crate::exec::ExecToolCallOutput;
 use crate::function_tool::FunctionCallError;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
+use crate::mcp::CODEX_REPO_TOOLS_MCP_SERVER_NAME;
 use crate::mcp_connection_manager::ToolInfo;
 use crate::models_manager::model_info;
 use crate::shell::default_user_shell;
@@ -3599,7 +3600,7 @@ async fn repo_index_refresh_emits_turn_and_mcp_lifecycle() {
                 lifecycle.push("turn_started");
             }
             EventMsg::McpToolCallBegin(event) => {
-                assert_eq!(event.invocation.server, CODEX_APPS_MCP_SERVER_NAME);
+                assert_eq!(event.invocation.server, CODEX_REPO_TOOLS_MCP_SERVER_NAME);
                 assert_eq!(event.invocation.tool, "repo_index_refresh");
                 let arguments = event
                     .invocation
@@ -3614,8 +3615,14 @@ async fn repo_index_refresh_emits_turn_and_mcp_lifecycle() {
                 lifecycle.push("mcp_begin");
             }
             EventMsg::McpToolCallEnd(event) => {
-                assert_eq!(event.invocation.server, CODEX_APPS_MCP_SERVER_NAME);
+                assert_eq!(event.invocation.server, CODEX_REPO_TOOLS_MCP_SERVER_NAME);
                 assert_eq!(event.invocation.tool, "repo_index_refresh");
+                if let Err(err) = event.result {
+                    assert!(
+                        !err.contains("Unknown tool"),
+                        "repo index refresh should not route through codex_apps: {err}"
+                    );
+                }
                 lifecycle.push("mcp_end");
             }
             EventMsg::TurnComplete(TurnCompleteEvent {
