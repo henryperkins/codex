@@ -1495,9 +1495,12 @@ impl McpToolCallCell {
             return None;
         }
         let line = (entry.line_range.start > 0).then_some(entry.line_range.start);
+        let repo_root =
+            (!payload.repo_root.trim().is_empty()).then(|| payload.repo_root.trim().to_string());
         Some(QueryProjectSelectedResult {
             path: entry.path.clone(),
             line,
+            repo_root,
         })
     }
 
@@ -1542,6 +1545,8 @@ const QUERY_PROJECT_MAX_RENDERED_RESULTS: usize = 3;
 struct QueryProjectPayload {
     #[serde(default)]
     query: String,
+    #[serde(default)]
+    repo_root: String,
     #[serde(default)]
     embedding_status: Option<QueryProjectEmbeddingStatus>,
     #[serde(default)]
@@ -1592,10 +1597,11 @@ struct QueryProjectLineRange {
     end: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueryProjectSelectedResult {
     pub(crate) path: String,
     pub(crate) line: Option<usize>,
+    pub(crate) repo_root: Option<String>,
 }
 
 impl HistoryCell for McpToolCallCell {
@@ -1902,6 +1908,14 @@ impl McpToolCallCell {
         if !payload.query.trim().is_empty() {
             let query = truncate_text(payload.query.trim(), detail_wrap_width.saturating_sub(8));
             lines.push(Line::from(vec!["query ".dim(), query.dim()]));
+        }
+
+        if !payload.repo_root.trim().is_empty() {
+            let repo_root = truncate_text(
+                payload.repo_root.trim(),
+                detail_wrap_width.saturating_sub(7),
+            );
+            lines.push(Line::from(vec!["repo ".dim(), repo_root.dim()]));
         }
 
         if let Some(embedding_status) = payload.embedding_status {
@@ -3889,6 +3903,7 @@ mod tests {
             is_error: None,
             structured_content: Some(json!({
                 "query": "authentication middleware",
+                "repo_root": "/workspace/project",
                 "embedding_status": {
                     "mode_used": "skip",
                     "ready": false,
@@ -3941,6 +3956,16 @@ mod tests {
             rendered.iter().any(|line| line.contains("4 matches")),
             "expected match count in rendered output: {rendered:?}"
         );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("repo /workspace/project")),
+            "expected repo root in rendered output: {rendered:?}"
+        );
+        let selected = cell
+            .selected_query_project_result()
+            .expect("selected query_project result");
+        assert_eq!(selected.repo_root.as_deref(), Some("/workspace/project"));
         assert!(
             rendered
                 .iter()
@@ -4053,8 +4078,14 @@ mod tests {
         let selected = cell
             .selected_query_project_result()
             .expect("selected query_project result");
-        assert_eq!(selected.path, "src/auth/session.rs");
-        assert_eq!(selected.line, Some(6));
+        assert_eq!(
+            selected,
+            QueryProjectSelectedResult {
+                path: "src/auth/session.rs".to_string(),
+                line: Some(6),
+                repo_root: None,
+            }
+        );
 
         let rendered = render_lines(&cell.display_lines(120));
         assert!(

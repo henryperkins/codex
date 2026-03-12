@@ -5777,6 +5777,7 @@ async fn slash_index_shows_qdrant_defaults_output() {
 
     chat.config.query_project_index.backend =
         codex_core::config::types::QueryProjectIndexBackend::Qdrant;
+    chat.current_cwd = Some(std::path::PathBuf::from("/workspace/alpha"));
     chat.config.query_project_index.auto_warm = true;
     chat.config.query_project_index.require_embeddings = true;
     chat.config.query_project_index.embedding_model = Some("text-embedding-3-small".to_string());
@@ -5795,6 +5796,48 @@ async fn slash_index_shows_qdrant_defaults_output() {
     assert_eq!(cells.len(), 1, "expected one index config history message");
     let rendered = lines_to_single_string(&cells[0]);
     assert_snapshot!("slash_index_qdrant_defaults_output", rendered);
+}
+
+#[tokio::test]
+async fn slash_index_shows_qdrant_collection_root_for_noncanonical_cwd() -> color_eyre::Result<()> {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let temp = tempdir()?;
+    let repo_root = temp.path().join("repo-root");
+    let nested = repo_root.join("nested");
+    std::fs::create_dir_all(&nested)?;
+
+    chat.config.query_project_index.backend =
+        codex_core::config::types::QueryProjectIndexBackend::Qdrant;
+    chat.current_cwd = Some(nested.join(".."));
+    chat.config.query_project_index.qdrant.collection_prefix = "codex_repo_".to_string();
+
+    chat.dispatch_command(SlashCommand::Index);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one index config history message");
+    let rendered = lines_to_single_string(&cells[0]);
+
+    assert!(
+        rendered.contains(&format!(
+            "default-repo-root: {}",
+            nested.join("..").display()
+        )),
+        "expected raw default repo root in rendered output: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "qdrant-collection-root: {}",
+            repo_root.canonicalize()?.display()
+        )),
+        "expected canonical qdrant collection root in rendered output: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(
+            "qdrant collection names hash the canonical root above plus the shared prefix."
+        ),
+        "expected canonical-root guidance in rendered output: {rendered:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

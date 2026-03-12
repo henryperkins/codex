@@ -5428,6 +5428,12 @@ impl ChatWidget {
             .embedding_model
             .clone()
             .unwrap_or_else(|| "default".to_string());
+        let default_repo_root = self.status_line_cwd().display().to_string();
+        let qdrant_collection_root = self
+            .status_line_cwd()
+            .canonicalize()
+            .ok()
+            .map(|path| path.display().to_string());
         let file_globs = self.config.query_project_index.file_globs.clone();
         let qdrant = self.config.query_project_index.qdrant.clone();
 
@@ -5452,6 +5458,10 @@ impl ChatWidget {
                     .cyan(),
             ]),
             Line::from(vec!["  embedding-model: ".into(), embedding_model.cyan()]),
+            Line::from(vec![
+                "  default-repo-root: ".into(),
+                default_repo_root.cyan(),
+            ]),
         ];
         if matches!(backend, QueryProjectIndexBackend::Qdrant) {
             let qdrant_url = qdrant.url.unwrap_or_else(|| "not set".to_string());
@@ -5464,6 +5474,21 @@ impl ChatWidget {
                 "  qdrant-collection-prefix: ".into(),
                 qdrant.collection_prefix.cyan(),
             ]));
+            if let Some(qdrant_collection_root) = qdrant_collection_root {
+                lines.push(Line::from(vec![
+                    "  qdrant-collection-root: ".into(),
+                    qdrant_collection_root.cyan(),
+                ]));
+                lines.push(Line::from(
+                    "  qdrant collection names hash the canonical root above plus the shared prefix."
+                        .dim(),
+                ));
+            } else {
+                lines.push(Line::from(
+                    "  qdrant collection names hash a canonicalized default-repo-root at runtime; the prefix above is shared."
+                        .dim(),
+                ));
+            }
             lines.push(Line::from(vec![
                 "  qdrant-timeout-ms: ".into(),
                 qdrant.timeout_ms.to_string().cyan(),

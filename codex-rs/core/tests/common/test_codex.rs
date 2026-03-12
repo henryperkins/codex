@@ -12,7 +12,6 @@ use codex_core::ThreadManager;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
 use codex_core::features::Feature;
-use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
@@ -20,7 +19,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -179,20 +177,13 @@ impl TestCodexBuilder {
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
         let auth = self.auth.clone();
-        let thread_manager = if config.model_catalog.is_some() {
-            ThreadManager::new(
-                &config,
-                codex_core::test_support::auth_manager_from_auth(auth.clone()),
-                SessionSource::Exec,
-                CollaborationModesConfig::default(),
-            )
-        } else {
-            codex_core::test_support::thread_manager_with_models_provider_and_home(
+        let thread_manager =
+            codex_core::test_support::thread_manager_with_models_provider_and_home_and_catalog(
                 auth.clone(),
                 config.model_provider.clone(),
                 config.codex_home.clone(),
-            )
-        };
+                config.model_catalog.clone(),
+            );
         let thread_manager = Arc::new(thread_manager);
 
         let new_conversation = match resume_from {

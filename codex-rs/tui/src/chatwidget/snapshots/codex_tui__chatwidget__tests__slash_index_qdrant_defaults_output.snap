@@ -7,9 +7,11 @@ expression: rendered
   auto-warm: on
   require-embeddings: on
   embedding-model: text-embedding-3-small
+  default-repo-root: /workspace/alpha
   qdrant-url: https://f2e5a36d-0c8b-4f74-a174-e53bc60baab9.eastus-0.azure.cloud.qdrant.io:6334
   qdrant-api-key-env: QDRANT_API_KEY
   qdrant-collection-prefix: codex_repo_
+  qdrant collection names hash a canonicalized default-repo-root at runtime; the prefix above is shared.
   qdrant-timeout-ms: 10000
   file-globs: all indexable files
 

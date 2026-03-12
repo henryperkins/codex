@@ -79,6 +79,13 @@ pub(crate) async fn handle_mcp_tool_call(
         }
     };
 
+    let arguments_value = maybe_inject_query_project_repo_root(
+        &server,
+        &tool_name,
+        arguments_value,
+        &turn_context.cwd,
+    );
+
     let invocation = McpInvocation {
         server: server.clone(),
         tool: tool_name.clone(),
@@ -259,6 +266,39 @@ pub(crate) async fn handle_mcp_tool_call(
         .counter("codex.mcp.call", 1, &[("status", status)]);
 
     ResponseInputItem::McpToolCallOutput { call_id, result }
+}
+
+fn maybe_inject_query_project_repo_root(
+    server: &str,
+    tool_name: &str,
+    arguments: Option<serde_json::Value>,
+    cwd: &Path,
+) -> Option<serde_json::Value> {
+    if server != CODEX_APPS_MCP_SERVER_NAME
+        || !matches!(tool_name, "query_project" | "repo_index_refresh")
+    {
+        return arguments;
+    }
+
+    let repo_root = cwd.display().to_string();
+    match arguments {
+        Some(serde_json::Value::Object(mut object)) => {
+            let should_inject = object.get("repo_root").is_none_or(|value| match value {
+                serde_json::Value::Null => true,
+                serde_json::Value::String(value) => value.trim().is_empty(),
+                _ => false,
+            });
+            if should_inject {
+                object.insert(
+                    "repo_root".to_string(),
+                    serde_json::Value::String(repo_root),
+                );
+            }
+            Some(serde_json::Value::Object(object))
+        }
+        None => Some(serde_json::json!({ "repo_root": repo_root })),
+        other => other,
+    }
 }
 
 async fn maybe_mark_thread_memory_mode_polluted(sess: &Session, turn_context: &TurnContext) {
@@ -1172,6 +1212,71 @@ mod tests {
     fn approval_required_when_read_only_false_and_destructive() {
         let annotations = annotations(Some(false), Some(true), None);
         assert_eq!(requires_mcp_tool_approval(&annotations), true);
+    }
+
+    #[test]
+    fn query_project_repo_root_defaults_to_session_cwd() {
+        let cwd = Path::new("/workspace/project");
+        let arguments = maybe_inject_query_project_repo_root(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "query_project",
+            Some(serde_json::json!({
+                "query": "auth middleware",
+                "limit": 5,
+            })),
+            cwd,
+        );
+
+        assert_eq!(
+            arguments,
+            Some(serde_json::json!({
+                "query": "auth middleware",
+                "limit": 5,
+                "repo_root": "/workspace/project",
+            }))
+        );
+    }
+
+    #[test]
+    fn repo_index_refresh_preserves_explicit_repo_root() {
+        let cwd = Path::new("/workspace/project");
+        let arguments = maybe_inject_query_project_repo_root(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "repo_index_refresh",
+            Some(serde_json::json!({
+                "repo_root": "/workspace/other",
+                "force_full": true,
+            })),
+            cwd,
+        );
+
+        assert_eq!(
+            arguments,
+            Some(serde_json::json!({
+                "repo_root": "/workspace/other",
+                "force_full": true,
+            }))
+        );
+    }
+
+    #[test]
+    fn non_query_project_tools_do_not_gain_repo_root() {
+        let cwd = Path::new("/workspace/project");
+        let arguments = maybe_inject_query_project_repo_root(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "browser_navigate",
+            Some(serde_json::json!({
+                "url": "https://example.com",
+            })),
+            cwd,
+        );
+
+        assert_eq!(
+            arguments,
+            Some(serde_json::json!({
+                "url": "https://example.com",
+            }))
+        );
     }
 
     #[test]

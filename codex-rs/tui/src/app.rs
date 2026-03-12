@@ -22,6 +22,7 @@ use crate::file_search::FileSearchManager;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
+use crate::history_cell::QueryProjectSelectedResult;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::model_migration::ModelMigrationOutcome;
@@ -3719,12 +3720,44 @@ impl App {
         })
     }
 
-    fn resolve_query_project_result_path(&self, raw_path: &str) -> PathBuf {
-        let candidate = PathBuf::from(raw_path);
+    fn resolve_query_project_result_path(
+        &self,
+        result: &QueryProjectSelectedResult,
+    ) -> (PathBuf, Option<PathBuf>) {
+        let candidate = PathBuf::from(&result.path);
         if candidate.is_absolute() {
-            candidate
+            return (candidate, None);
+        }
+
+        let base_root = result
+            .repo_root
+            .as_deref()
+            .filter(|repo_root| !repo_root.trim().is_empty())
+            .map(PathBuf::from)
+            .map(|repo_root| {
+                if repo_root.is_absolute() {
+                    repo_root
+                } else {
+                    self.chat_widget.config_ref().cwd.join(repo_root)
+                }
+            })
+            .unwrap_or_else(|| self.chat_widget.config_ref().cwd.clone());
+
+        (base_root.join(candidate), Some(base_root))
+    }
+
+    fn query_project_path_error_message(&self, path: &Path, base_root: Option<&Path>) -> String {
+        if let Some(base_root) = base_root {
+            format!(
+                "query_project result path does not exist: {} (resolved from root {})",
+                path.display(),
+                base_root.display(),
+            )
         } else {
-            self.config.cwd.join(candidate)
+            format!(
+                "query_project result path does not exist: {}",
+                path.display()
+            )
         }
     }
 
@@ -3773,12 +3806,11 @@ impl App {
             return false;
         };
 
-        let path = self.resolve_query_project_result_path(&result.path);
+        let (path, base_root) = self.resolve_query_project_result_path(&result);
         if !path.exists() {
-            self.chat_widget.add_error_message(format!(
-                "query_project result path does not exist: {}",
-                path.display()
-            ));
+            self.chat_widget.add_error_message(
+                self.query_project_path_error_message(&path, base_root.as_deref()),
+            );
             tui.frame_requester().schedule_frame();
             return true;
         }
@@ -6366,6 +6398,90 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_project_result_paths_prefer_payload_repo_root_over_stale_app_cwd() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        let stale_cwd = tempdir()?;
+        let live_cwd = tempdir()?;
+        let payload_repo_root = tempdir()?;
+
+        app.config.cwd = stale_cwd.path().to_path_buf();
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: live_cwd.path().to_path_buf(),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        let result = QueryProjectSelectedResult {
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            repo_root: Some(payload_repo_root.path().display().to_string()),
+        };
+
+        let (resolved_path, base_root) = app.resolve_query_project_result_path(&result);
+
+        assert_eq!(resolved_path, payload_repo_root.path().join("src/lib.rs"));
+        assert_eq!(base_root, Some(payload_repo_root.path().to_path_buf()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_project_result_paths_fallback_to_live_chat_widget_cwd() -> Result<()> {
+        let mut app = make_test_app().await;
+        let stale_cwd = tempdir()?;
+        let live_cwd = tempdir()?;
+
+        app.config.cwd = stale_cwd.path().to_path_buf();
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: live_cwd.path().to_path_buf(),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        let result = QueryProjectSelectedResult {
+            path: "src/lib.rs".to_string(),
+            line: Some(7),
+            repo_root: None,
+        };
+
+        let (resolved_path, base_root) = app.resolve_query_project_result_path(&result);
+
+        assert_eq!(resolved_path, live_cwd.path().join("src/lib.rs"));
+        assert_eq!(base_root, Some(live_cwd.path().to_path_buf()));
         Ok(())
     }
 
