@@ -1866,18 +1866,18 @@ impl McpToolCallCell {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if normalized.contains("missing_api_key") {
-            "guidance missing_api_key: set OPENAI_API_KEY, then run repo_index_refresh."
+            "guidance missing_api_key: set OPENAI_API_KEY, then run /repo-index-refresh."
         } else if normalized.contains("stale") {
-            "guidance stale index: run repo_index_refresh before retrying query_project."
+            "guidance stale index: run /repo-index-refresh before retrying query_project."
         } else if normalized.contains("embedding_unavailable")
             || normalized.contains("embedding unavailable")
             || normalized.contains("embedding_query_failed")
             || normalized.contains("not_ready")
             || normalized.contains("not ready")
         {
-            "guidance embedding unavailable: verify embedding config, then run repo_index_refresh."
+            "guidance embedding unavailable: verify embedding config, then run /repo-index-refresh."
         } else {
-            "guidance fallback active: run repo_index_refresh to restore semantic ranking."
+            "guidance fallback active: run /repo-index-refresh to restore semantic ranking."
         }
     }
 

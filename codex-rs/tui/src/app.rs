@@ -2947,20 +2947,31 @@ impl App {
 
                 match builder.apply().await {
                     Ok(()) => {
-                        if let Some(enabled) = auto_warm {
-                            self.config.query_project_index.auto_warm = enabled;
-                            self.chat_widget.set_query_project_index_auto_warm(enabled);
+                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to refresh config after query_project index update"
+                            );
+                            if let Some(enabled) = auto_warm {
+                                self.config.query_project_index.auto_warm = enabled;
+                            }
+                            if let Some(required) = require_embeddings {
+                                self.config.query_project_index.require_embeddings = required;
+                            }
+                            if let Some(model) = embedding_model.clone() {
+                                self.config.query_project_index.embedding_model = model;
+                            }
                         }
-                        if let Some(required) = require_embeddings {
-                            self.config.query_project_index.require_embeddings = required;
-                            self.chat_widget
-                                .set_query_project_index_require_embeddings(required);
-                        }
-                        if let Some(model) = embedding_model {
-                            self.config.query_project_index.embedding_model = model.clone();
-                            self.chat_widget
-                                .set_query_project_index_embedding_model(model);
-                        }
+                        self.chat_widget.set_query_project_index_auto_warm(
+                            self.config.query_project_index.auto_warm,
+                        );
+                        self.chat_widget.set_query_project_index_require_embeddings(
+                            self.config.query_project_index.require_embeddings,
+                        );
+                        self.chat_widget.set_query_project_index_embedding_model(
+                            self.config.query_project_index.embedding_model.clone(),
+                        );
+                        self.chat_widget.submit_op(Op::ReloadUserConfig);
                         self.chat_widget.add_info_message(
                             format!("Saved index settings: {}", updates.join(", ")),
                             None,

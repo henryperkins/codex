@@ -1,6 +1,7 @@
 mod compact;
 mod ghost_snapshot;
 mod regular;
+mod repo_index_refresh;
 mod review;
 mod undo;
 mod user_shell;
@@ -49,6 +50,7 @@ use crate::features::Feature;
 pub(crate) use compact::CompactTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;
+pub(crate) use repo_index_refresh::RepoIndexRefreshTask;
 pub(crate) use review::ReviewTask;
 pub(crate) use undo::UndoTask;
 pub(crate) use user_shell::UserShellCommandMode;

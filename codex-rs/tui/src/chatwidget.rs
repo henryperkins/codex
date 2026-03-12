@@ -4204,6 +4204,9 @@ impl ChatWidget {
             SlashCommand::Index => {
                 self.add_index_config_output();
             }
+            SlashCommand::RepoIndexRefresh => {
+                self.submit_repo_index_refresh(false);
+            }
             SlashCommand::DebugConfig => {
                 self.add_debug_config_output();
             }
@@ -4292,10 +4295,10 @@ impl ChatWidget {
             self.dispatch_command(cmd);
             return;
         }
-        if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
+        if !cmd.available_during_task_with_args(&args) && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
-                cmd.command()
+                cmd.task_running_label(&args)
             );
             self.add_to_history(history_cell::new_error_event(message));
             self.request_redraw();
@@ -4398,6 +4401,14 @@ impl ChatWidget {
                     return;
                 };
                 self.apply_index_command_args(&prepared_args);
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::RepoIndexRefresh => {
+                let Some(force_full) = parse_repo_index_refresh_mode(trimmed) else {
+                    self.add_error_message("Usage: /repo-index-refresh [full]".to_string());
+                    return;
+                };
+                self.submit_repo_index_refresh(force_full);
                 self.bottom_pane.drain_pending_submission_state();
             }
             SlashCommand::SandboxReadRoot if !trimmed.is_empty() => {
@@ -5568,7 +5579,9 @@ impl ChatWidget {
         lines.push(Line::from("  /index auto-warm on|off".dim()));
         lines.push(Line::from("  /index require-embeddings on|off".dim()));
         lines.push(Line::from("  /index embedding-model <name|default>".dim()));
+        lines.push(Line::from("  /index refresh [full]".dim()));
         lines.push(Line::from("  /index edit".dim()));
+        lines.push(Line::from("  /repo-index-refresh [full]".dim()));
         lines.push(Line::from(
             "  Use [query_project_index] in config.toml for backend, qdrant, file_globs, and non-TUI edits."
                 .dim(),
@@ -5632,14 +5645,25 @@ impl ChatWidget {
                         embedding_model: Some(model),
                     });
             }
+            "refresh" => {
+                let Some(force_full) = parse_repo_index_refresh_mode(value) else {
+                    self.add_error_message("Usage: /index refresh [full]".to_string());
+                    return;
+                };
+                self.submit_repo_index_refresh(force_full);
+            }
             "show" | "help" => self.add_index_config_output(),
             "edit" => self.open_index_settings_popup(),
             _ => {
                 self.add_error_message(
-                    "Unknown /index option. Try: auto-warm, require-embeddings, embedding-model, edit, or /index".to_string(),
+                    "Unknown /index option. Try: auto-warm, require-embeddings, embedding-model, refresh, edit, or /index".to_string(),
                 );
             }
         }
+    }
+
+    fn submit_repo_index_refresh(&mut self, force_full: bool) {
+        self.submit_op(Op::RepoIndexRefresh { force_full });
     }
 
     pub(crate) fn add_debug_config_output(&mut self) {
@@ -8645,7 +8669,9 @@ impl ChatWidget {
     pub(crate) fn submit_op(&mut self, op: Op) -> bool {
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
-        if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
+        if matches!(&op, Op::Review { .. } | Op::RepoIndexRefresh { .. })
+            && !self.bottom_pane.is_task_running()
+        {
             self.bottom_pane.set_task_running(true);
         }
         if let Err(e) = self.codex_op_tx.send(op) {
@@ -9256,6 +9282,17 @@ fn parse_index_toggle(value: &str) -> Option<bool> {
     }
     if ["off", "false", "no", "0"].contains(&normalized.as_str()) {
         return Some(false);
+    }
+    None
+}
+
+fn parse_repo_index_refresh_mode(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "incremental" {
+        return Some(false);
+    }
+    if ["full", "force-full"].contains(&normalized.as_str()) {
+        return Some(true);
     }
     None
 }

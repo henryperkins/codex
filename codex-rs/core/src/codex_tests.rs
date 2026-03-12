@@ -9,6 +9,7 @@ use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
 use crate::exec::ExecToolCallOutput;
 use crate::function_tool::FunctionCallError;
+use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp_connection_manager::ToolInfo;
 use crate::models_manager::model_info;
 use crate::shell::default_user_shell;
@@ -3574,6 +3575,65 @@ async fn run_user_shell_command_does_not_set_reference_context_item() {
     assert!(
         session.reference_context_item().await.is_none(),
         "standalone shell tasks should not mutate previous context"
+    );
+}
+
+#[tokio::test]
+async fn repo_index_refresh_emits_turn_and_mcp_lifecycle() {
+    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+
+    handlers::repo_index_refresh(&session, "repo-refresh-sub".to_string(), true).await;
+
+    let deadline = StdDuration::from_secs(2);
+    let start = std::time::Instant::now();
+    let mut lifecycle = Vec::new();
+    loop {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        let evt = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event");
+        match evt.msg {
+            EventMsg::TurnStarted(event) => {
+                assert_eq!(event.turn_id, "repo-refresh-sub");
+                lifecycle.push("turn_started");
+            }
+            EventMsg::McpToolCallBegin(event) => {
+                assert_eq!(event.invocation.server, CODEX_APPS_MCP_SERVER_NAME);
+                assert_eq!(event.invocation.tool, "repo_index_refresh");
+                let arguments = event
+                    .invocation
+                    .arguments
+                    .expect("repo refresh should include invocation arguments");
+                assert_eq!(arguments["force_full"], true);
+                assert!(
+                    arguments["repo_root"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                );
+                lifecycle.push("mcp_begin");
+            }
+            EventMsg::McpToolCallEnd(event) => {
+                assert_eq!(event.invocation.server, CODEX_APPS_MCP_SERVER_NAME);
+                assert_eq!(event.invocation.tool, "repo_index_refresh");
+                lifecycle.push("mcp_end");
+            }
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id,
+                last_agent_message,
+            }) => {
+                assert_eq!(turn_id, "repo-refresh-sub");
+                assert_eq!(last_agent_message, None);
+                lifecycle.push("turn_complete");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        lifecycle,
+        vec!["turn_started", "mcp_begin", "mcp_end", "turn_complete"]
     );
 }
 

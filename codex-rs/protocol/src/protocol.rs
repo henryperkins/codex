@@ -474,6 +474,12 @@ pub enum Op {
         command: String,
     },
 
+    /// Run the `repo_index_refresh` MCP tool for the current working directory.
+    RepoIndexRefresh {
+        /// When true, force a full rebuild instead of an incremental refresh.
+        force_full: bool,
+    },
+
     /// Request the list of available models.
     ListModels,
 }

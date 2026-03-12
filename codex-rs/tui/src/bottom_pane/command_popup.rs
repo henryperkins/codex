@@ -17,7 +17,12 @@ use std::collections::HashSet;
 // Hide alias commands in the default popup list so each unique action appears once.
 // `quit` is an alias of `exit`, so we skip `quit` here.
 // `approvals` is an alias of `permissions`.
-const ALIAS_COMMANDS: &[SlashCommand] = &[SlashCommand::Quit, SlashCommand::Approvals];
+// `repo-index-refresh` is an alias of `/index refresh`.
+const ALIAS_COMMANDS: &[SlashCommand] = &[
+    SlashCommand::Quit,
+    SlashCommand::Approvals,
+    SlashCommand::RepoIndexRefresh,
+];
 
 /// A selectable item in the popup: either a built-in command or a user prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -475,6 +480,18 @@ mod tests {
         popup.on_composer_text_change("/qu".to_string());
         let items = popup.filtered_items();
         assert!(items.contains(&CommandItem::Builtin(SlashCommand::Quit)));
+    }
+
+    #[test]
+    fn repo_index_refresh_hidden_in_empty_filter_but_shown_for_prefix() {
+        let mut popup = CommandPopup::new(Vec::new(), CommandPopupFlags::default());
+        popup.on_composer_text_change("/".to_string());
+        let items = popup.filtered_items();
+        assert!(!items.contains(&CommandItem::Builtin(SlashCommand::RepoIndexRefresh)));
+
+        popup.on_composer_text_change("/repo".to_string());
+        let items = popup.filtered_items();
+        assert!(items.contains(&CommandItem::Builtin(SlashCommand::RepoIndexRefresh)));
     }
 
     #[test]

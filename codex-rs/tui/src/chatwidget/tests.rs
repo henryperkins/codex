@@ -5817,6 +5817,14 @@ async fn slash_index_shows_config_output() {
         rendered.contains("/index auto-warm on|off"),
         "expected /index usage hints, got: {rendered:?}"
     );
+    assert!(
+        rendered.contains("/index refresh [full]"),
+        "expected /index refresh hint, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("/repo-index-refresh [full]"),
+        "expected /repo-index-refresh hint, got: {rendered:?}"
+    );
 }
 
 #[tokio::test]
@@ -5844,6 +5852,18 @@ async fn slash_index_shows_qdrant_defaults_output() {
     assert_eq!(cells.len(), 1, "expected one index config history message");
     let rendered = lines_to_single_string(&cells[0]);
     assert_snapshot!("slash_index_qdrant_defaults_output", rendered);
+}
+
+#[tokio::test]
+async fn slash_repo_index_refresh_submits_incremental_refresh_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::RepoIndexRefresh);
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RepoIndexRefresh { force_full: false })
+    );
 }
 
 #[tokio::test]
@@ -5897,6 +5917,23 @@ async fn slash_index_edit_opens_settings_popup() {
 
     let popup = render_bottom_popup(&chat, 90);
     assert_snapshot!("index_settings_popup", popup);
+}
+
+#[tokio::test]
+async fn slash_repo_index_refresh_with_args_sends_full_refresh_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.bottom_pane.set_composer_text(
+        "/repo-index-refresh full".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RepoIndexRefresh { force_full: true })
+    );
 }
 
 #[tokio::test]
@@ -5978,6 +6015,59 @@ async fn slash_index_with_args_sends_persist_event() {
             embedding_model: None,
         })
     );
+}
+
+#[tokio::test]
+async fn slash_index_refresh_alias_sends_repo_index_refresh_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.bottom_pane
+        .set_composer_text("/index refresh full".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RepoIndexRefresh { force_full: true })
+    );
+}
+
+#[tokio::test]
+async fn slash_repo_index_refresh_marks_task_running_immediately() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::RepoIndexRefresh);
+
+    assert!(chat.bottom_pane.is_task_running());
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RepoIndexRefresh { force_full: false })
+    );
+}
+
+#[tokio::test]
+async fn slash_index_refresh_is_disabled_while_task_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(true);
+    chat.bottom_pane
+        .set_composer_text("/index refresh full".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert!(
+        op_rx.try_recv().is_err(),
+        "expected no repo index refresh op"
+    );
+    let event = rx.try_recv().expect("expected disabled command error");
+    match event {
+        AppEvent::InsertHistoryCell(cell) => {
+            let rendered = lines_to_single_string(&cell.display_lines(80));
+            assert!(
+                rendered.contains("'/index refresh' is disabled while a task is in progress."),
+                "expected /index refresh task-running error, got {rendered:?}"
+            );
+        }
+        other => panic!("expected InsertHistoryCell error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

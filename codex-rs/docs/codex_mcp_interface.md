@@ -253,6 +253,8 @@ In the TUI, run `/index` to inspect effective index settings, or `/index edit` t
 - `/index auto-warm on|off`
 - `/index require-embeddings on|off`
 - `/index embedding-model <name|default>`
+- `/index refresh [full]`
+- `/repo-index-refresh [full]`
 
 For settings not exposed in the TUI (for example `backend`, `qdrant.*`, or `file_globs`), edit `config.toml` directly.
 

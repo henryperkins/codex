@@ -1,0 +1,10 @@
+---
+source: tui/src/bottom_pane/chat_composer.rs
+expression: terminal.backend()
+---
+"                                                                        "
+"› /repo                                                                 "
+"                                                                        "
+"                                                                        "
+"  /repo-index-refresh  refresh the query_project repository index for   "
+"                       the current working directory                    "

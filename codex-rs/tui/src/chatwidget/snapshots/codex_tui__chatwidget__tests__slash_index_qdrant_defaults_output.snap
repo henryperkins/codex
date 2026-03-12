@@ -19,5 +19,7 @@ expression: rendered
   /index auto-warm on|off
   /index require-embeddings on|off
   /index embedding-model <name|default>
+  /index refresh [full]
   /index edit
+  /repo-index-refresh [full]
   Use [query_project_index] in config.toml for backend, qdrant, file_globs, and non-TUI edits.

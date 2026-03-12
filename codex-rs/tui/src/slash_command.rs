@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use strum::IntoEnumIterator;
 use strum_macros::AsRefStr;
 use strum_macros::EnumIter;
@@ -38,6 +40,8 @@ pub enum SlashCommand {
     Mention,
     Status,
     Index,
+    #[strum(serialize = "repo-index-refresh")]
+    RepoIndexRefresh,
     DebugConfig,
     Statusline,
     Theme,
@@ -84,6 +88,9 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Index => "inspect effective query_project index settings",
+            SlashCommand::RepoIndexRefresh => {
+                "refresh the query_project repository index for the current working directory"
+            }
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
@@ -128,6 +135,7 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Index
+                | SlashCommand::RepoIndexRefresh
                 | SlashCommand::Fast
                 | SlashCommand::SandboxReadRoot
         )
@@ -150,6 +158,7 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
+            | SlashCommand::RepoIndexRefresh
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Clear
@@ -182,6 +191,24 @@ impl SlashCommand {
         }
     }
 
+    pub fn available_during_task_with_args(self, args: &str) -> bool {
+        if !self.available_during_task() {
+            return false;
+        }
+
+        match self {
+            SlashCommand::Index => !index_refresh_requested(args),
+            _ => true,
+        }
+    }
+
+    pub fn task_running_label(self, args: &str) -> Cow<'static, str> {
+        match self {
+            SlashCommand::Index if index_refresh_requested(args) => Cow::Borrowed("index refresh"),
+            _ => Cow::Borrowed(self.command()),
+        }
+    }
+
     fn is_visible(self) -> bool {
         match self {
             SlashCommand::SandboxReadRoot => cfg!(target_os = "windows"),
@@ -198,4 +225,12 @@ pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
         .filter(|command| command.is_visible())
         .map(|c| (c.command(), c))
         .collect()
+}
+
+fn index_refresh_requested(args: &str) -> bool {
+    let mut parts = args.trim().splitn(2, char::is_whitespace);
+    matches!(
+        parts.next().map(str::to_ascii_lowercase),
+        Some(command) if command == "refresh"
+    )
 }

@@ -4223,6 +4223,10 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     handlers::run_user_shell_command(&sess, sub.id.clone(), command).await;
                     false
                 }
+                Op::RepoIndexRefresh { force_full } => {
+                    handlers::repo_index_refresh(&sess, sub.id.clone(), force_full).await;
+                    false
+                }
                 Op::ResolveElicitation {
                     server_name,
                     request_id,
@@ -4291,6 +4295,7 @@ mod handlers {
     use crate::rollout::RolloutRecorder;
     use crate::rollout::session_index;
     use crate::tasks::CompactTask;
+    use crate::tasks::RepoIndexRefreshTask;
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandMode;
     use crate::tasks::UserShellCommandTask;
@@ -4455,6 +4460,16 @@ mod handlers {
             Arc::clone(&turn_context),
             Vec::new(),
             UserShellCommandTask::new(command),
+        )
+        .await;
+    }
+
+    pub async fn repo_index_refresh(sess: &Arc<Session>, sub_id: String, force_full: bool) {
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        sess.spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            RepoIndexRefreshTask::new(force_full),
         )
         .await;
     }
