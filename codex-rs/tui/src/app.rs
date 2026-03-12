@@ -28,10 +28,10 @@ use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
-use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
-use crate::multi_agents::sort_agent_picker_threads;
+use crate::multi_agents::next_agent_shortcut_matches;
+use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -115,8 +115,11 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
 
+mod agent_navigation;
 mod pending_interactive_replay;
 
+use self::agent_navigation::AgentNavigationDirection;
+use self::agent_navigation::AgentNavigationState;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
@@ -711,7 +714,7 @@ pub(crate) struct App {
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
-    agent_picker_threads: HashMap<ThreadId, AgentPickerThreadEntry>,
+    agent_navigation: AgentNavigationState,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<Event>>,
     primary_thread_id: Option<ThreadId>,
@@ -1111,7 +1114,7 @@ impl App {
             let short_id: String = thread_id.chars().take(8).collect();
             format!("Agent ({short_id})")
         };
-        if let Some(entry) = self.agent_picker_threads.get(&thread_id) {
+        if let Some(entry) = self.agent_navigation.get(&thread_id) {
             let label = format_agent_picker_item_name(
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
@@ -1127,6 +1130,29 @@ impl App {
         } else {
             fallback_label
         }
+    }
+
+    /// Returns the thread whose transcript is currently on screen.
+    ///
+    /// `active_thread_id` is the source of truth during steady state, but the widget can briefly
+    /// lag behind thread bookkeeping during transitions. The footer label and adjacent-thread
+    /// navigation both follow what the user is actually looking at, not whichever thread most
+    /// recently began switching.
+    fn current_displayed_thread_id(&self) -> Option<ThreadId> {
+        self.active_thread_id.or(self.chat_widget.thread_id())
+    }
+
+    /// Mirrors the visible thread into the contextual footer row.
+    ///
+    /// The footer sometimes shows ambient context instead of an instructional hint. In multi-agent
+    /// sessions, that contextual row includes the currently viewed agent label. The label is
+    /// intentionally hidden until there is more than one known thread so single-thread sessions do
+    /// not spend footer space restating that the user is already on the main conversation.
+    fn sync_active_agent_label(&mut self) {
+        let label = self
+            .agent_navigation
+            .active_agent_label(self.current_displayed_thread_id(), self.primary_thread_id);
+        self.chat_widget.set_active_agent_label(label);
     }
 
     async fn thread_cwd(&self, thread_id: ThreadId) -> Option<PathBuf> {
@@ -1336,6 +1362,7 @@ impl App {
             let thread_id = session.session_id;
             self.primary_thread_id = Some(thread_id);
             self.primary_session_configured = Some(session.clone());
+            self.upsert_agent_picker_thread(thread_id, None, None, false);
             self.ensure_thread_channel(thread_id);
             self.activate_thread_channel(thread_id).await;
             self.enqueue_thread_event(thread_id, event).await?;
@@ -1350,6 +1377,12 @@ impl App {
         Ok(())
     }
 
+    /// Opens the `/agent` picker after refreshing cached labels for known threads.
+    ///
+    /// The picker state is derived from long-lived thread channels plus best-effort metadata
+    /// refreshes from the backend. Refresh failures are treated as "thread is only inspectable by
+    /// historical id now" and converted into closed picker entries instead of deleting them, so
+    /// the stable traversal order remains intact for review and keyboard navigation.
     async fn open_agent_picker(&mut self) {
         let thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
         for thread_id in thread_ids {
@@ -1370,29 +1403,23 @@ impl App {
         }
 
         let has_non_primary_agent_thread = self
-            .agent_picker_threads
-            .keys()
-            .any(|thread_id| Some(*thread_id) != self.primary_thread_id);
+            .agent_navigation
+            .has_non_primary_thread(self.primary_thread_id);
         if !self.config.features.enabled(Feature::Collab) && !has_non_primary_agent_thread {
             self.chat_widget.open_multi_agent_enable_prompt();
             return;
         }
 
-        if self.agent_picker_threads.is_empty() {
+        if self.agent_navigation.is_empty() {
             self.chat_widget
                 .add_info_message("No agents available yet.".to_string(), None);
             return;
         }
 
-        let mut agent_threads: Vec<(ThreadId, AgentPickerThreadEntry)> = self
-            .agent_picker_threads
-            .iter()
-            .map(|(thread_id, entry)| (*thread_id, entry.clone()))
-            .collect();
-        sort_agent_picker_threads(&mut agent_threads);
-
         let mut initial_selected_idx = None;
-        let items: Vec<SelectionItem> = agent_threads
+        let items: Vec<SelectionItem> = self
+            .agent_navigation
+            .ordered_threads()
             .iter()
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
@@ -1424,7 +1451,7 @@ impl App {
 
         self.chat_widget.show_selection_view(SelectionViewParams {
             title: Some("Multi-agents".to_string()),
-            subtitle: Some("Select an agent to watch".to_string()),
+            subtitle: Some(AgentNavigationState::picker_subtitle()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             initial_selected_idx,
@@ -1432,6 +1459,10 @@ impl App {
         });
     }
 
+    /// Updates cached picker metadata and then mirrors any visible-label change into the footer.
+    ///
+    /// These two writes stay paired so the picker rows and contextual footer continue to describe
+    /// the same displayed thread after nickname or role updates.
     fn upsert_agent_picker_thread(
         &mut self,
         thread_id: ThreadId,
@@ -1439,22 +1470,18 @@ impl App {
         agent_role: Option<String>,
         is_closed: bool,
     ) {
-        self.agent_picker_threads.insert(
-            thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname,
-                agent_role,
-                is_closed,
-            },
-        );
+        self.agent_navigation
+            .upsert(thread_id, agent_nickname, agent_role, is_closed);
+        self.sync_active_agent_label();
     }
 
+    /// Marks a cached picker thread closed and recomputes the contextual footer label.
+    ///
+    /// Closing a thread is not the same as removing it: users can still inspect finished agent
+    /// transcripts, and the stable next/previous traversal order should not collapse around them.
     fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) {
-        if let Some(entry) = self.agent_picker_threads.get_mut(&thread_id) {
-            entry.is_closed = true;
-        } else {
-            self.upsert_agent_picker_thread(thread_id, None, None, true);
-        }
+        self.agent_navigation.mark_closed(thread_id);
+        self.sync_active_agent_label();
     }
 
     async fn select_agent_thread(&mut self, tui: &mut tui::Tui, thread_id: ThreadId) -> Result<()> {
@@ -1501,6 +1528,7 @@ impl App {
             tx
         };
         self.chat_widget = ChatWidget::new_with_op_sender(init, codex_op_tx);
+        self.sync_active_agent_label();
 
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot, !is_replay_only);
@@ -1531,12 +1559,13 @@ impl App {
     fn reset_thread_event_state(&mut self) {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
-        self.agent_picker_threads.clear();
+        self.agent_navigation.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
         self.chat_widget.set_pending_thread_approvals(Vec::new());
+        self.sync_active_agent_label();
     }
 
     async fn start_fresh_session_with_summary_hint(&mut self, tui: &mut tui::Tui) {
@@ -1552,8 +1581,16 @@ impl App {
             self.chat_widget.thread_name(),
         );
         self.shutdown_current_thread().await;
-        if let Err(err) = self.server.remove_and_close_all_threads().await {
-            tracing::warn!(error = %err, "failed to close all threads");
+        let report = self
+            .server
+            .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .await;
+        if !report.submit_failed.is_empty() || !report.timed_out.is_empty() {
+            tracing::warn!(
+                submit_failed = report.submit_failed.len(),
+                timed_out = report.timed_out.len(),
+                "failed to close all threads"
+            );
         }
         let init = crate::chatwidget::ChatWidgetInit {
             config,
@@ -1819,6 +1856,7 @@ impl App {
                         config.clone(),
                         target_session.path.clone(),
                         auth_manager.clone(),
+                        None,
                     )
                     .await
                     .wrap_err_with(|| {
@@ -1856,6 +1894,7 @@ impl App {
                         config.clone(),
                         target_session.path.clone(),
                         false,
+                        None,
                     )
                     .await
                     .wrap_err_with(|| {
@@ -1924,7 +1963,7 @@ impl App {
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
-            agent_picker_threads: HashMap::new(),
+            agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -2167,6 +2206,7 @@ impl App {
                                 resume_config.clone(),
                                 target_session.path.clone(),
                                 self.auth_manager.clone(),
+                                None,
                             )
                             .await
                         {
@@ -2235,7 +2275,7 @@ impl App {
                     if path.exists() {
                         match self
                             .server
-                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
+                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false, None)
                             .await
                         {
                             Ok(forked) => {
@@ -3957,6 +3997,44 @@ impl App {
             return;
         }
 
+        // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
+        // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
+        // agent-switch shortcuts when the composer is empty so we never steal the expected
+        // editing behavior for moving across words inside a draft.
+        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
+            && self.chat_widget.composer_text_with_pending().is_empty();
+        if self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            // Alt+Left/Right are also natural word-motion keys in the composer. Keep agent
+            // fast-switch available only once the draft is empty so editing behavior wins whenever
+            // there is text on screen.
+            && self.chat_widget.composer_text_with_pending().is_empty()
+            && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
+        {
+            if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
+                self.current_displayed_thread_id(),
+                AgentNavigationDirection::Previous,
+            ) {
+                let _ = self.select_agent_thread(tui, thread_id).await;
+            }
+            return;
+        }
+        if self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            // Mirror the previous-agent rule above: empty drafts may use these keys for thread
+            // switching, but non-empty drafts keep them for expected word-wise cursor motion.
+            && self.chat_widget.composer_text_with_pending().is_empty()
+            && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
+        {
+            if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
+                self.current_displayed_thread_id(),
+                AgentNavigationDirection::Next,
+            ) {
+                let _ = self.select_agent_thread(tui, thread_id).await;
+            }
+            return;
+        }
+
         match key_event {
             KeyEvent {
                 code: KeyCode::Char('t'),
@@ -4097,6 +4175,7 @@ mod tests {
     use crate::history_cell::HistoryCell;
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
+    use crate::multi_agents::AgentPickerThreadEntry;
     use assert_matches::assert_matches;
     use codex_core::CodexAuth;
     use codex_core::config::ConfigBuilder;
@@ -5216,13 +5295,14 @@ mod tests {
 
         assert_eq!(app.thread_event_channels.contains_key(&thread_id), true);
         assert_eq!(
-            app.agent_picker_threads.get(&thread_id),
+            app.agent_navigation.get(&thread_id),
             Some(&AgentPickerThreadEntry {
                 agent_nickname: None,
                 agent_role: None,
                 is_closed: true,
             })
         );
+        assert_eq!(app.agent_navigation.ordered_thread_ids(), vec![thread_id]);
         Ok(())
     }
 
@@ -5232,20 +5312,18 @@ mod tests {
         let thread_id = ThreadId::new();
         app.thread_event_channels
             .insert(thread_id, ThreadEventChannel::new(1));
-        app.agent_picker_threads.insert(
+        app.agent_navigation.upsert(
             thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
         );
 
         app.open_agent_picker().await;
 
         assert_eq!(app.thread_event_channels.contains_key(&thread_id), true);
         assert_eq!(
-            app.agent_picker_threads.get(&thread_id),
+            app.agent_navigation.get(&thread_id),
             Some(&AgentPickerThreadEntry {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
@@ -5427,13 +5505,11 @@ mod tests {
         }
         app.thread_event_channels
             .insert(agent_thread_id, agent_channel);
-        app.agent_picker_threads.insert(
+        app.agent_navigation.upsert(
             agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
         );
 
         app.refresh_pending_thread_approvals().await;
@@ -5485,13 +5561,11 @@ mod tests {
                 },
             ),
         );
-        app.agent_picker_threads.insert(
+        app.agent_navigation.upsert(
             agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
         );
 
         app.enqueue_thread_event(
@@ -5837,7 +5911,7 @@ mod tests {
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
-            agent_picker_threads: HashMap::new(),
+            agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -5897,7 +5971,7 @@ mod tests {
                 windows_sandbox: WindowsSandboxState::default(),
                 thread_event_channels: HashMap::new(),
                 thread_event_listener_tasks: HashMap::new(),
-                agent_picker_threads: HashMap::new(),
+                agent_navigation: AgentNavigationState::default(),
                 active_thread_id: None,
                 active_thread_rx: None,
                 primary_thread_id: None,

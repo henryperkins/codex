@@ -32,6 +32,7 @@ use crate::features::maybe_push_unstable_features_warning;
 #[cfg(test)]
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
+use crate::models_manager::manager::RefreshStrategy;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
@@ -103,6 +104,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
@@ -117,6 +119,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
 use codex_utils_stream_parser::strip_citations;
 use futures::future::BoxFuture;
+use futures::future::Shared;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use rmcp::model::ListResourceTemplatesResult;
@@ -206,8 +209,6 @@ use crate::mcp::maybe_prompt_and_install_mcp_dependencies;
 use crate::mcp::with_codex_apps_mcp;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::mcp_connection_manager::codex_apps_tools_cache_key;
-use crate::mcp_connection_manager::filter_codex_apps_mcp_tools_only;
-use crate::mcp_connection_manager::filter_mcp_tools_by_name;
 use crate::mcp_connection_manager::filter_non_codex_apps_mcp_tools_only;
 use crate::memories;
 use crate::mentions::build_connector_slug_counts;
@@ -286,7 +287,6 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
 use crate::tools::js_repl::resolve_compatible_node;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -332,7 +332,12 @@ pub struct Codex {
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
     pub(crate) session: Arc<Session>,
+    // Shared future for the background submission loop completion so multiple
+    // callers can wait for shutdown.
+    pub(crate) session_loop_termination: SessionLoopTermination,
 }
+
+pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`],
 /// the submission id for the initial `ConfigureSession` request and the
@@ -344,6 +349,24 @@ pub struct CodexSpawnOk {
     pub conversation_id: ThreadId,
 }
 
+pub(crate) struct CodexSpawnArgs {
+    pub(crate) config: Config,
+    pub(crate) auth_manager: Arc<AuthManager>,
+    pub(crate) models_manager: Arc<ModelsManager>,
+    pub(crate) skills_manager: Arc<SkillsManager>,
+    pub(crate) plugins_manager: Arc<PluginsManager>,
+    pub(crate) mcp_manager: Arc<McpManager>,
+    pub(crate) file_watcher: Arc<FileWatcher>,
+    pub(crate) conversation_history: InitialHistory,
+    pub(crate) session_source: SessionSource,
+    pub(crate) agent_control: AgentControl,
+    pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(crate) persist_extended_history: bool,
+    pub(crate) metrics_service_name: Option<String>,
+    pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+    pub(crate) parent_trace: Option<W3cTraceContext>,
+}
+
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
@@ -351,23 +374,48 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn spawn(
-        mut config: Config,
-        auth_manager: Arc<AuthManager>,
-        models_manager: Arc<ModelsManager>,
-        skills_manager: Arc<SkillsManager>,
-        plugins_manager: Arc<PluginsManager>,
-        mcp_manager: Arc<McpManager>,
-        file_watcher: Arc<FileWatcher>,
-        conversation_history: InitialHistory,
-        session_source: SessionSource,
-        agent_control: AgentControl,
-        dynamic_tools: Vec<DynamicToolSpec>,
-        persist_extended_history: bool,
-        metrics_service_name: Option<String>,
-        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
-    ) -> CodexResult<CodexSpawnOk> {
+    pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
+        let parent_trace = match args.parent_trace {
+            Some(trace) => {
+                if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
+                    Some(trace)
+                } else {
+                    warn!("ignoring invalid thread spawn trace carrier");
+                    None
+                }
+            }
+            None => None,
+        };
+        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
+        if let Some(trace) = parent_trace.as_ref() {
+            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
+        }
+        Self::spawn_internal(CodexSpawnArgs {
+            parent_trace,
+            ..args
+        })
+        .instrument(thread_spawn_span)
+        .await
+    }
+
+    async fn spawn_internal(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
+        let CodexSpawnArgs {
+            mut config,
+            auth_manager,
+            models_manager,
+            skills_manager,
+            plugins_manager,
+            mcp_manager,
+            file_watcher,
+            conversation_history,
+            session_source,
+            agent_control,
+            dynamic_tools,
+            persist_extended_history,
+            metrics_service_name,
+            inherited_shell_snapshot,
+            parent_trace: _,
+        } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -385,6 +433,7 @@ impl Codex {
         if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = session_source
             && depth >= config.agent_max_depth
         {
+            let _ = config.features.disable(Feature::SpawnCsv);
             let _ = config.features.disable(Feature::Collab);
         }
 
@@ -409,7 +458,7 @@ impl Codex {
             && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
         {
             let message = format!(
-                "Disabled `code_mode` for this session because the configured Node runtime is unavailable or incompatible. {err}"
+                "Disabled `exec` for this session because the configured Node runtime is unavailable or incompatible. {err}"
             );
             warn!("{message}");
             let _ = config.features.disable(Feature::CodeMode);
@@ -558,15 +607,18 @@ impl Codex {
         let thread_id = session.conversation_id;
 
         // This task will run until Op::Shutdown is received.
-        let session_loop_span = info_span!("session_loop", thread_id = %thread_id);
-        tokio::spawn(
-            submission_loop(Arc::clone(&session), config, rx_sub).instrument(session_loop_span),
-        );
+        let session_for_loop = Arc::clone(&session);
+        let session_loop_handle = tokio::spawn(async move {
+            submission_loop(session_for_loop, config, rx_sub)
+                .instrument(info_span!("session_loop", thread_id = %thread_id))
+                .await;
+        });
         let codex = Codex {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
             session,
+            session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
         };
 
         #[allow(deprecated)]
@@ -579,11 +631,19 @@ impl Codex {
 
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
+        self.submit_with_trace(op, None).await
+    }
+
+    pub async fn submit_with_trace(
+        &self,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+    ) -> CodexResult<String> {
         let id = Uuid::now_v7().to_string();
         let sub = Submission {
             id: id.clone(),
             op,
-            trace: None,
+            trace,
         };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -599,6 +659,17 @@ impl Codex {
             .send(sub)
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(())
+    }
+
+    pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        let session_loop_termination = self.session_loop_termination.clone();
+        match self.submit(Op::Shutdown).await {
+            Ok(_) => {}
+            Err(CodexErr::InternalAgentDied) => {}
+            Err(err) => return Err(err),
+        }
+        session_loop_termination.await;
         Ok(())
     }
 
@@ -647,6 +718,21 @@ impl Codex {
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
+    futures::future::ready(()).boxed().shared()
+}
+
+pub(crate) fn session_loop_termination_from_handle(
+    handle: JoinHandle<()>,
+) -> SessionLoopTermination {
+    async move {
+        let _ = handle.await;
+    }
+    .boxed()
+    .shared()
 }
 
 /// Context for an initialized model agent
@@ -775,6 +861,9 @@ impl TurnContext {
         let features = self.features.clone();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &models_manager
+                .list_models(RefreshStrategy::OnlineIfUncached)
+                .await,
             features: &features,
             web_search_mode: self.tools_config.web_search_mode,
             session_source: self.session_source.clone(),
@@ -1162,6 +1251,7 @@ impl Session {
         session_configuration: &SessionConfiguration,
         per_turn_config: Config,
         model_info: ModelInfo,
+        models_manager: &ModelsManager,
         network: Option<NetworkProxy>,
         sub_id: String,
         js_repl: Arc<JsReplHandle>,
@@ -1183,6 +1273,7 @@ impl Session {
 
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &models_manager.try_list_models().unwrap_or_default(),
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
             session_source: session_source.clone(),
@@ -1644,6 +1735,7 @@ impl Session {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
             ),
+            code_mode_store: Default::default(),
         };
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
@@ -1872,26 +1964,6 @@ impl Session {
         }
     }
 
-    pub(crate) async fn merge_mcp_tool_selection(&self, tool_names: Vec<String>) -> Vec<String> {
-        let mut state = self.state.lock().await;
-        state.merge_mcp_tool_selection(tool_names)
-    }
-
-    pub(crate) async fn set_mcp_tool_selection(&self, tool_names: Vec<String>) {
-        let mut state = self.state.lock().await;
-        state.set_mcp_tool_selection(tool_names);
-    }
-
-    pub(crate) async fn get_mcp_tool_selection(&self) -> Option<Vec<String>> {
-        let state = self.state.lock().await;
-        state.get_mcp_tool_selection()
-    }
-
-    pub(crate) async fn clear_mcp_tool_selection(&self) {
-        let mut state = self.state.lock().await;
-        state.clear_mcp_tool_selection();
-    }
-
     // Merges connector IDs into the session-level explicit connector selection.
     pub(crate) async fn merge_connector_selection(
         &self,
@@ -1915,7 +1987,6 @@ impl Session {
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
-        self.clear_mcp_tool_selection().await;
         let is_subagent = {
             let state = self.state.lock().await;
             matches!(
@@ -1925,26 +1996,12 @@ impl Session {
         };
         match conversation_history {
             InitialHistory::New => {
-                // Build and record initial items (user instructions + environment context)
-                // TODO(ccunningham): Defer initial context insertion until the first real turn
-                // starts so it reflects the actual first-turn settings (permissions, etc.) and
-                // we do not emit model-visible "diff" updates before the first user message.
-                let items = self.build_initial_context(&turn_context).await;
-                self.record_conversation_items(&turn_context, &items).await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
-                }
+                // Defer initial context insertion until the first real turn starts so
+                // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(None).await;
-                // Ensure initial items are visible to immediate readers (e.g., tests, forks).
-                if !is_subagent {
-                    self.flush_rollout().await;
-                }
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
-                let restored_tool_selection =
-                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
 
                 let reconstructed_rollout = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
@@ -1990,9 +2047,6 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
-                if let Some(selected_tools) = restored_tool_selection {
-                    self.set_mcp_tool_selection(selected_tools).await;
-                }
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
@@ -2001,9 +2055,6 @@ impl Session {
                 }
             }
             InitialHistory::Forked(rollout_items) => {
-                let restored_tool_selection =
-                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
-
                 let reconstructed_rollout = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
@@ -2030,9 +2081,6 @@ impl Session {
                 if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
-                }
-                if let Some(selected_tools) = restored_tool_selection {
-                    self.set_mcp_tool_selection(selected_tools).await;
                 }
 
                 // If persisting, persist all rollout items as-is (recorder filters)
@@ -2065,54 +2113,6 @@ impl Session {
             RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
             _ => None,
         })
-    }
-
-    fn extract_mcp_tool_selection_from_rollout(
-        rollout_items: &[RolloutItem],
-    ) -> Option<Vec<String>> {
-        let mut search_call_ids = HashSet::new();
-        let mut active_selected_tools: Option<Vec<String>> = None;
-
-        for item in rollout_items {
-            let RolloutItem::ResponseItem(response_item) = item else {
-                continue;
-            };
-            match response_item {
-                ResponseItem::FunctionCall { name, call_id, .. } => {
-                    if name == SEARCH_TOOL_BM25_TOOL_NAME {
-                        search_call_ids.insert(call_id.clone());
-                    }
-                }
-                ResponseItem::FunctionCallOutput { call_id, output } => {
-                    if !search_call_ids.contains(call_id) {
-                        continue;
-                    }
-                    let Some(content) = output.body.to_text() else {
-                        continue;
-                    };
-                    let Ok(payload) = serde_json::from_str::<Value>(&content) else {
-                        continue;
-                    };
-                    let Some(selected_tools) = payload
-                        .get("active_selected_tools")
-                        .and_then(Value::as_array)
-                    else {
-                        continue;
-                    };
-                    let Some(selected_tools) = selected_tools
-                        .iter()
-                        .map(|value| value.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        continue;
-                    };
-                    active_selected_tools = Some(selected_tools);
-                }
-                _ => {}
-            }
-        }
-
-        active_selected_tools
     }
 
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -2308,6 +2308,7 @@ impl Session {
             &session_configuration,
             per_turn_config,
             model_info,
+            &self.services.models_manager,
             self.services
                 .network_proxy
                 .as_ref()
@@ -3855,7 +3856,20 @@ impl Session {
             .await
     }
 
-    pub(crate) async fn parse_mcp_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
+    pub(crate) async fn parse_mcp_tool_name(
+        &self,
+        name: &str,
+        namespace: &Option<String>,
+    ) -> Option<(String, String)> {
+        let tool_name = if let Some(namespace) = namespace {
+            if name.starts_with(namespace.as_str()) {
+                name
+            } else {
+                &format!("{namespace}{name}")
+            }
+        } else {
+            name
+        };
         self.services
             .mcp_connection_manager
             .read()
@@ -5145,6 +5159,11 @@ async fn spawn_review_thread(
     let review_web_search_mode = WebSearchMode::Disabled;
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
+        available_models: &sess
+            .services
+            .models_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
         session_source: parent_turn_context.session_source.clone(),
@@ -6066,7 +6085,7 @@ fn filter_codex_apps_mcp_tools(
         .iter()
         .filter(|(_, tool)| {
             if tool.server_name != CODEX_APPS_MCP_SERVER_NAME {
-                return true;
+                return false;
             }
             let Some(connector_id) = codex_apps_connector_id(tool) else {
                 return false;
@@ -6282,18 +6301,13 @@ async fn built_tools(
         );
 
         let mut selected_mcp_tools = filter_non_codex_apps_mcp_tools_only(&mcp_tools);
-
-        if let Some(selected_tools) = sess.get_mcp_tool_selection().await {
-            selected_mcp_tools.extend(filter_mcp_tools_by_name(&mcp_tools, &selected_tools));
-        }
-
-        selected_mcp_tools.extend(filter_codex_apps_mcp_tools_only(
+        selected_mcp_tools.extend(filter_codex_apps_mcp_tools(
             &mcp_tools,
             explicitly_enabled.as_ref(),
+            &turn_context.config,
         ));
 
-        mcp_tools =
-            connectors::filter_codex_apps_tools_by_policy(selected_mcp_tools, &turn_context.config);
+        mcp_tools = selected_mcp_tools;
     }
 
     Ok(Arc::new(ToolRouter::from_config(
@@ -6811,8 +6825,7 @@ async fn handle_assistant_item_done_in_plan_mode(
     {
         maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
 
-        if let Some(turn_item) =
-            handle_non_tool_response_item(item, true, Some(&turn_context.cwd)).await
+        if let Some(turn_item) = handle_non_tool_response_item(sess, turn_context, item, true).await
         {
             emit_turn_item_in_plan_mode(
                 sess,
@@ -6993,8 +7006,13 @@ async fn try_run_sampling_request(
                 needs_follow_up |= output_result.needs_follow_up;
             }
             ResponseEvent::OutputItemAdded(item) => {
-                if let Some(turn_item) =
-                    handle_non_tool_response_item(&item, plan_mode, Some(&turn_context.cwd)).await
+                if let Some(turn_item) = handle_non_tool_response_item(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &item,
+                    plan_mode,
+                )
+                .await
                 {
                     let mut turn_item = turn_item;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
