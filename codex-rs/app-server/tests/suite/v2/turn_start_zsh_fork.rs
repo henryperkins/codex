@@ -751,7 +751,10 @@ fn create_config_toml(
     feature_flags: &BTreeMap<Feature, bool>,
     zsh_path: &Path,
 ) -> std::io::Result<()> {
-    let mut features = BTreeMap::from([(Feature::RemoteModels, false)]);
+    let mut features = BTreeMap::from([
+        (Feature::RemoteModels, false),
+        (Feature::UseLegacyLandlock, true),
+    ]);
     for (feature, enabled) in feature_flags {
         features.insert(*feature, *enabled);
     }

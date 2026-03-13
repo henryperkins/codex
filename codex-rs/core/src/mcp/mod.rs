@@ -40,6 +40,8 @@ const CODEX_MCP_SERVER_SUBCOMMAND: &str = "mcp-server";
 const OPENAI_CONNECTORS_MCP_BASE_URL: &str = "https://api.openai.com";
 const OPENAI_CONNECTORS_MCP_PATH: &str = "/v1/connectors/gateways/flat/mcp";
 const REPO_TOOLS_MCP_ENABLED_TOOLS: [&str; 2] = ["query_project", "repo_index_refresh"];
+const REPO_TOOLS_MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const REPO_TOOLS_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalRepoToolsMcpLauncher {
@@ -275,15 +277,10 @@ fn resolve_local_repo_tools_mcp_launcher(
     })
 }
 
-pub(crate) fn repo_tools_mcp_server_config() -> Option<McpServerConfig> {
-    let repo_tools_exe = cargo_bin_env_path(CODEX_MCP_SERVER_BINARY_NAME)
-        .or_else(|| which_binary(CODEX_MCP_SERVER_BINARY_NAME));
-    let codex_exe =
-        cargo_bin_env_path(CODEX_CLI_BINARY_NAME).or_else(|| which_binary(CODEX_CLI_BINARY_NAME));
-    let launcher =
-        resolve_local_repo_tools_mcp_launcher(repo_tools_exe, env::current_exe().ok(), codex_exe)?;
-
-    Some(McpServerConfig {
+fn repo_tools_mcp_server_config_for_launcher(
+    launcher: LocalRepoToolsMcpLauncher,
+) -> McpServerConfig {
+    McpServerConfig {
         transport: McpServerTransportConfig::Stdio {
             command: launcher.command,
             args: launcher.args,
@@ -294,8 +291,8 @@ pub(crate) fn repo_tools_mcp_server_config() -> Option<McpServerConfig> {
         enabled: true,
         required: false,
         disabled_reason: None,
-        startup_timeout_sec: Some(Duration::from_secs(30)),
-        tool_timeout_sec: None,
+        startup_timeout_sec: Some(REPO_TOOLS_MCP_STARTUP_TIMEOUT),
+        tool_timeout_sec: Some(REPO_TOOLS_MCP_TOOL_TIMEOUT),
         enabled_tools: Some(
             REPO_TOOLS_MCP_ENABLED_TOOLS
                 .iter()
@@ -305,7 +302,18 @@ pub(crate) fn repo_tools_mcp_server_config() -> Option<McpServerConfig> {
         disabled_tools: None,
         scopes: None,
         oauth_resource: None,
-    })
+    }
+}
+
+pub(crate) fn repo_tools_mcp_server_config() -> Option<McpServerConfig> {
+    let repo_tools_exe = cargo_bin_env_path(CODEX_MCP_SERVER_BINARY_NAME)
+        .or_else(|| which_binary(CODEX_MCP_SERVER_BINARY_NAME));
+    let codex_exe =
+        cargo_bin_env_path(CODEX_CLI_BINARY_NAME).or_else(|| which_binary(CODEX_CLI_BINARY_NAME));
+    let launcher =
+        resolve_local_repo_tools_mcp_launcher(repo_tools_exe, env::current_exe().ok(), codex_exe)?;
+
+    Some(repo_tools_mcp_server_config_for_launcher(launcher))
 }
 
 pub(crate) fn with_codex_apps_mcp(
@@ -882,6 +890,29 @@ mod tests {
                 command: "/usr/bin/codex".to_string(),
                 args: vec!["mcp-server".to_string()],
             }
+        );
+    }
+
+    #[test]
+    fn repo_tools_mcp_server_config_for_launcher_uses_extended_tool_timeout() {
+        let config = repo_tools_mcp_server_config_for_launcher(LocalRepoToolsMcpLauncher {
+            command: "/tmp/codex-mcp-server".to_string(),
+            args: Vec::new(),
+        });
+
+        assert_eq!(
+            config.startup_timeout_sec,
+            Some(REPO_TOOLS_MCP_STARTUP_TIMEOUT)
+        );
+        assert_eq!(config.tool_timeout_sec, Some(REPO_TOOLS_MCP_TOOL_TIMEOUT));
+        assert_eq!(
+            config.enabled_tools,
+            Some(
+                REPO_TOOLS_MCP_ENABLED_TOOLS
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            )
         );
     }
 

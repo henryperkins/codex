@@ -8,6 +8,8 @@ use globset::GlobSet;
 use globset::GlobSetBuilder;
 use ignore::WalkBuilder;
 use qdrant_client::Qdrant;
+use qdrant_client::qdrant::CollectionInfo;
+use qdrant_client::qdrant::CollectionStatus;
 use qdrant_client::qdrant::Condition;
 use qdrant_client::qdrant::CreateCollectionBuilder;
 use qdrant_client::qdrant::CreateFieldIndexCollectionBuilder;
@@ -339,7 +341,7 @@ enum FullRefreshReason {
     UserRequested,
     EmbeddingModelChanged,
     VectorBackendChanged,
-    VectorCollectionMissing,
+    VectorBackendNotReady,
     VectorLayoutVersionChanged,
     StrictEmbeddingsNotReady,
 }
@@ -788,7 +790,7 @@ fn full_refresh_reason(
         return Some(FullRefreshReason::VectorBackendChanged);
     }
     if !stored_state.backend_ready {
-        return Some(FullRefreshReason::VectorCollectionMissing);
+        return Some(FullRefreshReason::VectorBackendNotReady);
     }
     let current_vector_layout_version = match current_backend {
         "qdrant" => Some(QDRANT_VECTOR_LAYOUT_VERSION),
@@ -864,17 +866,23 @@ fn next_embedding_ready(
     backfill_embeddings: bool,
     preserves_unscanned_existing: bool,
     backend_ready: bool,
+    skip_mode_preserves_current_configuration: bool,
+    vector_sync_invalidated: bool,
 ) -> bool {
-    if !matches!(embedding_mode, EmbeddingMode::Required) {
-        return false;
-    }
     if !backend_ready {
         return false;
     }
-    if !backfill_embeddings {
-        return true;
+    match embedding_mode {
+        EmbeddingMode::Skip => {
+            skip_mode_preserves_current_configuration && stored_ready && !vector_sync_invalidated
+        }
+        EmbeddingMode::Required => {
+            if !backfill_embeddings {
+                return true;
+            }
+            stored_ready || !preserves_unscanned_existing
+        }
     }
-    stored_ready || !preserves_unscanned_existing
 }
 
 async fn refresh_index(
@@ -1104,6 +1112,58 @@ impl VectorBackend {
     }
 }
 
+fn qdrant_collection_info_ready(
+    collection_name: &str,
+    collection_info: &CollectionInfo,
+    indexed_chunk_count: usize,
+) -> anyhow::Result<bool> {
+    let expected_points_count =
+        u64::try_from(indexed_chunk_count).context("indexed chunk count should fit in u64")?;
+    let collection_status = CollectionStatus::try_from(collection_info.status)
+        .unwrap_or(CollectionStatus::UnknownCollectionStatus);
+    if matches!(
+        collection_status,
+        CollectionStatus::Red | CollectionStatus::UnknownCollectionStatus
+    ) {
+        tracing::warn!(
+            collection_name,
+            status = collection_status.as_str_name(),
+            points_count = ?collection_info.points_count,
+            indexed_vectors_count = ?collection_info.indexed_vectors_count,
+            expected_points_count,
+            "query_project qdrant collection is not healthy"
+        );
+        return Ok(false);
+    }
+    if let Some(points_count) = collection_info.points_count
+        && points_count < expected_points_count
+    {
+        tracing::warn!(
+            collection_name,
+            status = collection_status.as_str_name(),
+            points_count,
+            indexed_vectors_count = ?collection_info.indexed_vectors_count,
+            expected_points_count,
+            "query_project qdrant collection lost points compared to the local index"
+        );
+        return Ok(false);
+    }
+    if collection_info.points_count.is_none()
+        && let Some(indexed_vectors_count) = collection_info.indexed_vectors_count
+        && indexed_vectors_count < expected_points_count
+    {
+        tracing::warn!(
+            collection_name,
+            status = collection_status.as_str_name(),
+            indexed_vectors_count,
+            expected_points_count,
+            "query_project qdrant collection reports fewer indexed vectors than the local index"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 impl QdrantVectorStore {
     fn collection_name(&self) -> &str {
         match &self.inner {
@@ -1124,10 +1184,78 @@ impl QdrantVectorStore {
                 collection_name,
             } => Ok(client.collection_exists(collection_name.as_str()).await?),
             #[cfg(test)]
-            QdrantVectorStoreInner::Fake { state, .. } => Ok(state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("fake qdrant state should not be poisoned"))?
-                .collection_exists),
+            QdrantVectorStoreInner::Fake { state, .. } => {
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("fake qdrant state should not be poisoned"))?;
+                if let Some(error) = guard.collection_exists_error.take() {
+                    anyhow::bail!(error);
+                }
+                Ok(guard.collection_exists)
+            }
+        }
+    }
+
+    async fn collection_ready(&self, indexed_chunk_count: usize) -> anyhow::Result<bool> {
+        if indexed_chunk_count == 0 {
+            return Ok(true);
+        }
+        match &self.inner {
+            QdrantVectorStoreInner::Client {
+                client,
+                collection_name,
+            } => {
+                if !client.collection_exists(collection_name.as_str()).await? {
+                    return Ok(false);
+                }
+                let collection_info = client
+                    .collection_info(collection_name.as_str())
+                    .await?
+                    .result
+                    .with_context(|| {
+                        format!(
+                            "qdrant collection info for `{collection_name}` was missing a result"
+                        )
+                    })?;
+                qdrant_collection_info_ready(
+                    collection_name.as_str(),
+                    &collection_info,
+                    indexed_chunk_count,
+                )
+            }
+            #[cfg(test)]
+            QdrantVectorStoreInner::Fake {
+                collection_name,
+                state,
+            } => {
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("fake qdrant state should not be poisoned"))?;
+                if let Some(error) = guard.collection_exists_error.take() {
+                    anyhow::bail!(error);
+                }
+                if !guard.collection_exists {
+                    return Ok(false);
+                }
+                let points_count = u64::try_from(guard.points.len())
+                    .context("fake qdrant point count should fit in u64")?;
+                let collection_info = CollectionInfo {
+                    status: guard.collection_status,
+                    optimizer_status: None,
+                    segments_count: 1,
+                    config: None,
+                    payload_schema: HashMap::new(),
+                    points_count: Some(points_count),
+                    indexed_vectors_count: Some(points_count),
+                    warnings: Vec::new(),
+                    update_queue: None,
+                };
+                qdrant_collection_info_ready(
+                    collection_name.as_str(),
+                    &collection_info,
+                    indexed_chunk_count,
+                )
+            }
         }
     }
 
@@ -1226,6 +1354,9 @@ impl QdrantVectorStore {
                 let mut guard = state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("fake qdrant state should not be poisoned"))?;
+                if let Some(error) = guard.delete_path_error.take() {
+                    anyhow::bail!(error);
+                }
                 guard.delete_paths.push(path.to_string());
                 guard.points.retain(|_, point| point.path != path);
             }
@@ -1271,6 +1402,9 @@ impl QdrantVectorStore {
                 let mut guard = state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("fake qdrant state should not be poisoned"))?;
+                if let Some(error) = guard.upsert_chunks_error.take() {
+                    anyhow::bail!(error);
+                }
                 if !guard.collection_exists {
                     anyhow::bail!("fake qdrant collection is missing");
                 }
@@ -1438,13 +1572,34 @@ struct FakeQdrantPoint {
 }
 
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FakeQdrantStoreState {
     collection_exists: bool,
+    collection_status: i32,
     points: HashMap<i64, FakeQdrantPoint>,
     delete_paths: Vec<String>,
     ensure_dimensions: Vec<usize>,
     clear_count: usize,
+    collection_exists_error: Option<String>,
+    delete_path_error: Option<String>,
+    upsert_chunks_error: Option<String>,
+}
+
+#[cfg(test)]
+impl Default for FakeQdrantStoreState {
+    fn default() -> Self {
+        Self {
+            collection_exists: false,
+            collection_status: CollectionStatus::Green as i32,
+            points: HashMap::new(),
+            delete_paths: Vec::new(),
+            ensure_dimensions: Vec::new(),
+            clear_count: 0,
+            collection_exists_error: None,
+            delete_path_error: None,
+            upsert_chunks_error: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1617,8 +1772,28 @@ impl RepoHybridIndex {
             return Ok(true);
         }
         match self.vector_backend.qdrant_store() {
-            Some(vector_store) => vector_store.collection_exists().await,
+            Some(vector_store) => vector_store.collection_ready(indexed_chunk_count).await,
             None => Ok(true),
+        }
+    }
+
+    async fn vector_backend_ready_for_refresh(
+        &self,
+        indexed_chunk_count: usize,
+        embedding_mode: EmbeddingMode,
+    ) -> anyhow::Result<bool> {
+        match self.vector_backend_ready(indexed_chunk_count).await {
+            Ok(ready) => Ok(ready),
+            Err(err) if matches!(embedding_mode, EmbeddingMode::Skip) => {
+                tracing::warn!(
+                    error = %err,
+                    repo_root = %self.repo_root.display(),
+                    current_backend = self.vector_backend.name(),
+                    "query_project refresh treating vector backend probe failure as not ready"
+                );
+                Ok(false)
+            }
+            Err(err) => Err(err).context("failed to check vector backend readiness"),
         }
     }
 
@@ -1645,7 +1820,9 @@ impl RepoHybridIndex {
             self.load_metadata(METADATA_VECTOR_LAYOUT_VERSION).await?;
         let stored_chunk_count = self.count_chunks().await?;
         let current_backend = self.vector_backend.name();
-        let backend_ready = self.vector_backend_ready(stored_chunk_count).await?;
+        let backend_ready = self
+            .vector_backend_ready_for_refresh(stored_chunk_count, embedding_mode)
+            .await?;
         let stored_state = StoredEmbeddingState {
             model: stored_model.as_deref(),
             ready: stored_ready,
@@ -1677,9 +1854,7 @@ impl RepoHybridIndex {
                     FullRefreshReason::UserRequested => "a full refresh was explicitly requested",
                     FullRefreshReason::EmbeddingModelChanged => "the embedding model changed",
                     FullRefreshReason::VectorBackendChanged => "the vector backend changed",
-                    FullRefreshReason::VectorCollectionMissing => {
-                        "the vector collection is missing"
-                    }
+                    FullRefreshReason::VectorBackendNotReady => "the vector backend is not ready",
                     FullRefreshReason::VectorLayoutVersionChanged => {
                         "the vector layout version changed"
                     }
@@ -1716,6 +1891,9 @@ impl RepoHybridIndex {
             } else {
                 None
             };
+        if stored_ready && force_full {
+            self.set_metadata(METADATA_EMBEDDING_READY, "false").await?;
+        }
         if force_full {
             self.clear_all().await?;
             if let Some(vector_store) = vector_store {
@@ -1747,6 +1925,28 @@ impl RepoHybridIndex {
             &scanned_paths,
             glob_set.as_ref(),
         );
+        let needs_file_updates = scanned_files.iter().any(|(path, scanned)| {
+            let unchanged = existing_files.get(path).is_some_and(|existing| {
+                existing.modified_sec == scanned.modified_sec
+                    && existing.modified_nsec == scanned.modified_nsec
+                    && existing.size_bytes == scanned.size_bytes
+            });
+            !unchanged || backfill_embeddings
+        });
+        let needs_removals = existing_files.iter().any(|(path, _)| {
+            if scanned_paths.contains(path.as_str()) {
+                return false;
+            }
+            if let Some(glob_set) = glob_set.as_ref()
+                && !glob_set.is_match(path.as_str())
+            {
+                return false;
+            }
+            true
+        });
+        if stored_ready && !force_full && (needs_file_updates || needs_removals) {
+            self.set_metadata(METADATA_EMBEDDING_READY, "false").await?;
+        }
         for (path, _existing) in existing_files
             .iter()
             .filter(|(path, _)| !scanned_paths.contains(path.as_str()))
@@ -1758,10 +1958,10 @@ impl RepoHybridIndex {
             }
             let mut tx = self.pool.begin().await?;
             remove_file_from_index(&mut tx, path).await?;
+            tx.commit().await?;
             if let Some(vector_store) = vector_store {
                 vector_store.delete_path(path).await?;
             }
-            tx.commit().await?;
             stats.removed_files += 1;
         }
 
@@ -1780,10 +1980,10 @@ impl RepoHybridIndex {
                 None => {
                     let mut tx = self.pool.begin().await?;
                     remove_file_from_index(&mut tx, path).await?;
+                    tx.commit().await?;
                     if let Some(vector_store) = vector_store {
                         vector_store.delete_path(path).await?;
                     }
-                    tx.commit().await?;
                     continue;
                 }
             };
@@ -1801,10 +2001,10 @@ impl RepoHybridIndex {
                 .bind(scanned.size_bytes)
                 .execute(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 if let Some(vector_store) = vector_store {
                     vector_store.delete_path(path).await?;
                 }
-                tx.commit().await?;
                 stats.updated_files += 1;
                 continue;
             }
@@ -1865,6 +2065,7 @@ impl RepoHybridIndex {
                 .execute(&mut *tx)
                 .await?;
             }
+            tx.commit().await?;
             if let Some(vector_store) = vector_store {
                 vector_store.delete_path(path).await?;
                 if !qdrant_collection_initialized
@@ -1877,31 +2078,46 @@ impl RepoHybridIndex {
                     .upsert_chunks(path, inserted_chunk_ids.as_slice(), embeddings.as_slice())
                     .await?;
             }
-            tx.commit().await?;
             stats.updated_files += 1;
         }
 
         stats.indexed_chunks = self.count_chunks().await?;
-        self.set_metadata(METADATA_EMBEDDING_MODEL, &embedding_model)
+        if matches!(embedding_mode, EmbeddingMode::Required) || stored_model.is_none() {
+            self.set_metadata(METADATA_EMBEDDING_MODEL, &embedding_model)
+                .await?;
+        }
+        if matches!(embedding_mode, EmbeddingMode::Required) || stored_backend.is_none() {
+            self.set_metadata(METADATA_VECTOR_BACKEND, current_backend)
+                .await?;
+        }
+        let backend_ready = self
+            .vector_backend_ready_for_refresh(stats.indexed_chunks, embedding_mode)
             .await?;
-        self.set_metadata(METADATA_VECTOR_BACKEND, current_backend)
-            .await?;
-        let backend_ready = self.vector_backend_ready(stats.indexed_chunks).await?;
-        match self.vector_backend.layout_version() {
-            Some(layout_version)
-                if matches!(embedding_mode, EmbeddingMode::Required)
-                    && file_globs.is_empty()
-                    && backend_ready =>
-            {
-                self.set_metadata(METADATA_VECTOR_LAYOUT_VERSION, layout_version)
-                    .await?;
-            }
-            Some(_) => {}
-            None => {
-                self.set_metadata(METADATA_VECTOR_LAYOUT_VERSION, "")
-                    .await?;
+        if matches!(embedding_mode, EmbeddingMode::Required) {
+            match self.vector_backend.layout_version() {
+                Some(layout_version) if file_globs.is_empty() && backend_ready => {
+                    self.set_metadata(METADATA_VECTOR_LAYOUT_VERSION, layout_version)
+                        .await?;
+                }
+                Some(_) => {}
+                None => {
+                    self.set_metadata(METADATA_VECTOR_LAYOUT_VERSION, "")
+                        .await?;
+                }
             }
         }
+        let skip_mode_preserves_current_configuration = full_refresh_reason(
+            false,
+            EmbeddingMode::Required,
+            false,
+            stored_state,
+            embedding_model.as_str(),
+            current_backend,
+        )
+        .is_none();
+        let vector_sync_invalidated =
+            (force_full || stats.updated_files > 0 || stats.removed_files > 0)
+                && (!matches!(embedding_mode, EmbeddingMode::Required) || skip_vector_writes);
         let ready = if scoped_full_corpus_repair_reason.is_some() {
             false
         } else {
@@ -1911,6 +2127,8 @@ impl RepoHybridIndex {
                 backfill_embeddings,
                 preserves_unscanned_existing,
                 backend_ready,
+                skip_mode_preserves_current_configuration,
+                vector_sync_invalidated,
             )
         };
         self.set_metadata(
@@ -1997,7 +2215,24 @@ impl RepoHybridIndex {
                 0
             };
             let backend_ready = if embedding_ready {
-                self.vector_backend_ready(indexed_chunk_count).await?
+                match self.vector_backend_ready(indexed_chunk_count).await {
+                    Ok(ready) => ready,
+                    Err(err) => {
+                        if require_embeddings {
+                            return Err(err).context(
+                                "failed to check vector backend readiness in strict mode",
+                            );
+                        }
+                        tracing::warn!(
+                            error = %err,
+                            repo_root = %self.repo_root.display(),
+                            current_backend = self.vector_backend.name(),
+                            "query_project search falling back after vector backend readiness probe failure"
+                        );
+                        embedding_fallback_reason = Some(EMBEDDING_REASON_UNAVAILABLE);
+                        false
+                    }
+                }
             } else {
                 false
             };
@@ -2005,57 +2240,64 @@ impl RepoHybridIndex {
                 anyhow::bail!("embeddings are required but the index is not embedding-ready");
             }
             if embedding_ready && backend_ready {
-                match self
-                    .embed_texts(&embedding_model, &[query.to_string()])
-                    .await
-                {
-                    Ok(embeddings) => {
-                        let (query_embedding, fallback_reason) =
-                            query_embedding_or_fallback_reason(embeddings);
-                        if let Some(query_embedding) = query_embedding {
-                            let vector_prefilter = vector_prefilter_candidate_ids(
-                                blend_mode,
-                                &self.vector_backend,
-                                lexical_candidate_ids.as_slice(),
-                            );
-                            match self
-                                .vector_scores(
-                                    &query_embedding,
-                                    limit,
-                                    glob_set.as_ref(),
-                                    vector_prefilter,
-                                )
-                                .await
-                            {
-                                Ok(scores) => {
-                                    vector_scores = scores;
-                                }
-                                Err(err) => {
-                                    if require_embeddings {
-                                        return Err(err).context(
-                                            "failed to query vector backend in strict mode",
-                                        );
-                                    }
-                                    embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
-                                }
-                            }
-                        } else {
-                            if require_embeddings {
-                                anyhow::bail!(
-                                    "embeddings are required but query embedding was empty"
+                let query_embedding_mode =
+                    resolve_embedding_mode(require_embeddings, &embedding_model)?;
+                if matches!(query_embedding_mode.mode, EmbeddingMode::Required) {
+                    match self
+                        .embed_texts(&embedding_model, &[query.to_string()])
+                        .await
+                    {
+                        Ok(embeddings) => {
+                            let (query_embedding, fallback_reason) =
+                                query_embedding_or_fallback_reason(embeddings);
+                            if let Some(query_embedding) = query_embedding {
+                                let vector_prefilter = vector_prefilter_candidate_ids(
+                                    blend_mode,
+                                    &self.vector_backend,
+                                    lexical_candidate_ids.as_slice(),
                                 );
+                                match self
+                                    .vector_scores(
+                                        &query_embedding,
+                                        limit,
+                                        glob_set.as_ref(),
+                                        vector_prefilter,
+                                    )
+                                    .await
+                                {
+                                    Ok(scores) => {
+                                        vector_scores = scores;
+                                    }
+                                    Err(err) => {
+                                        if require_embeddings {
+                                            return Err(err).context(
+                                                "failed to query vector backend in strict mode",
+                                            );
+                                        }
+                                        embedding_fallback_reason =
+                                            Some(EMBEDDING_REASON_QUERY_FAILED);
+                                    }
+                                }
+                            } else {
+                                if require_embeddings {
+                                    anyhow::bail!(
+                                        "embeddings are required but query embedding was empty"
+                                    );
+                                }
+                                embedding_fallback_reason = fallback_reason;
                             }
-                            embedding_fallback_reason = fallback_reason;
+                        }
+                        Err(err) => {
+                            if require_embeddings {
+                                return Err(err).context("failed to embed query in strict mode");
+                            }
+                            embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
                         }
                     }
-                    Err(err) => {
-                        if require_embeddings {
-                            return Err(err).context("failed to embed query in strict mode");
-                        }
-                        embedding_fallback_reason = Some(EMBEDDING_REASON_QUERY_FAILED);
-                    }
+                } else {
+                    embedding_fallback_reason = query_embedding_mode.reason;
                 }
-            } else if embedding_ready {
+            } else if embedding_ready && embedding_fallback_reason.is_none() {
                 embedding_fallback_reason = Some(EMBEDDING_REASON_UNAVAILABLE);
             }
         }
@@ -3312,6 +3554,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skip_refresh_preserves_ready_metadata_when_index_is_unchanged() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(&server, vec![vec![vec![1.0_f32, 0.0_f32]]]).await;
+
+        let mut index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("required refresh");
+
+        let second = index
+            .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
+            .await
+            .expect("skip refresh");
+
+        assert_eq!(second.stats.updated_files, 0);
+        assert_eq!(second.stats.removed_files, 0);
+        assert!(second.ready);
+        assert!(index.embedding_ready().await.expect("embedding ready"));
+        assert_eq!(
+            index
+                .load_metadata(METADATA_EMBEDDING_MODEL)
+                .await
+                .expect("load embedding model"),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            index
+                .load_metadata(METADATA_VECTOR_BACKEND)
+                .await
+                .expect("load vector backend"),
+            Some("local".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_refresh_marks_index_not_ready_without_overwriting_embedding_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(&server, vec![vec![vec![1.0_f32, 0.0_f32]]]).await;
+
+        let mut index = RepoHybridIndex::open(repo_root, &QueryProjectIndex::default())
+            .await
+            .expect("open index");
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("required refresh");
+
+        let second = index
+            .refresh(
+                &[],
+                false,
+                "other-model".to_string(),
+                EmbeddingMode::Skip,
+                false,
+            )
+            .await
+            .expect("skip refresh with changed model");
+
+        assert_eq!(second.stats.updated_files, 0);
+        assert_eq!(second.stats.removed_files, 0);
+        assert!(!second.ready);
+        assert!(!index.embedding_ready().await.expect("embedding ready"));
+        assert_eq!(
+            index
+                .load_metadata(METADATA_EMBEDDING_MODEL)
+                .await
+                .expect("load embedding model"),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            index
+                .load_metadata(METADATA_VECTOR_BACKEND)
+                .await
+                .expect("load vector backend"),
+            Some("local".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_refresh_retries_in_skip_mode_when_qdrant_probe_errors() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let state = Arc::new(Mutex::new(FakeQdrantStoreState::default()));
+        let index = open_index_with_fake_qdrant(repo_root, Arc::clone(&state)).await;
+        index
+            .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
+            .await
+            .expect("initial refresh");
+        mark_qdrant_embedding_ready(&index, "model").await;
+
+        state
+            .lock()
+            .expect("lock fake qdrant state")
+            .collection_exists_error = Some("probe failed".to_string());
+        let mut embedding_mode = SelectedEmbeddingMode {
+            mode: EmbeddingMode::Required,
+            reason: None,
+            require_embeddings: false,
+        };
+
+        let outcome = refresh_index(&index, &[], false, "model", &mut embedding_mode)
+            .await
+            .expect("optional refresh should fall back to skip mode");
+
+        assert_eq!(embedding_mode.mode, EmbeddingMode::Skip);
+        assert!(!outcome.ready);
+        assert!(!index.embedding_ready().await.expect("embedding ready"));
+    }
+
+    #[tokio::test]
     async fn scoped_force_full_refresh_is_rejected() {
         let temp = tempdir().expect("tempdir");
         let repo_root = temp.path();
@@ -3453,13 +3836,26 @@ mod tests {
             .await
             .expect("set vector backend");
 
-        state.lock().expect("lock fake qdrant state").points.insert(
-            9_999,
-            FakeQdrantPoint {
-                path: "stale.rs".to_string(),
-                embedding: vec![1.0_f32, 0.0_f32],
-            },
-        );
+        state
+            .lock()
+            .expect("lock fake qdrant state")
+            .points
+            .extend([
+                (
+                    9_999,
+                    FakeQdrantPoint {
+                        path: "stale.rs".to_string(),
+                        embedding: vec![1.0_f32, 0.0_f32],
+                    },
+                ),
+                (
+                    10_000,
+                    FakeQdrantPoint {
+                        path: "stale-two.rs".to_string(),
+                        embedding: vec![1.0_f32, 0.0_f32],
+                    },
+                ),
+            ]);
 
         let outcome = index
             .refresh(
@@ -3975,6 +4371,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_falls_back_when_qdrant_collection_is_red() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(&server, vec![vec![vec![1.0_f32, 0.0_f32]]]).await;
+
+        let state = Arc::new(Mutex::new(FakeQdrantStoreState {
+            collection_exists: true,
+            ..Default::default()
+        }));
+        let mut index = open_index_with_fake_qdrant(repo_root, Arc::clone(&state)).await;
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("refresh");
+
+        state
+            .lock()
+            .expect("lock fake qdrant state")
+            .collection_status = CollectionStatus::Red as i32;
+        let outcome = index
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::Hybrid(0.6),
+                &[],
+                "model".to_string(),
+                false,
+            )
+            .await
+            .expect("search with red qdrant collection");
+
+        assert_eq!(
+            outcome.embedding_fallback_reason,
+            Some(EMBEDDING_REASON_UNAVAILABLE)
+        );
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].path, "README.md");
+
+        let err = index
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::Hybrid(0.6),
+                &[],
+                "model".to_string(),
+                true,
+            )
+            .await
+            .expect_err("strict mode should fail when qdrant is red");
+        assert!(
+            err.to_string()
+                .contains("embeddings are required but the index is not embedding-ready"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_falls_back_when_qdrant_readiness_probe_errors() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let state = Arc::new(Mutex::new(FakeQdrantStoreState::default()));
+        let index = open_index_with_fake_qdrant(repo_root, Arc::clone(&state)).await;
+        index
+            .refresh(&[], false, "model".to_string(), EmbeddingMode::Skip, false)
+            .await
+            .expect("refresh");
+        mark_qdrant_embedding_ready(&index, "model").await;
+
+        state
+            .lock()
+            .expect("lock fake qdrant state")
+            .collection_exists_error = Some("probe failed".to_string());
+        let outcome = index
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::Hybrid(0.6),
+                &[],
+                "model".to_string(),
+                false,
+            )
+            .await
+            .expect("search with qdrant readiness probe error");
+
+        assert_eq!(
+            outcome.embedding_fallback_reason,
+            Some(EMBEDDING_REASON_UNAVAILABLE)
+        );
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].path, "README.md");
+
+        state
+            .lock()
+            .expect("lock fake qdrant state")
+            .collection_exists_error = Some("probe failed again".to_string());
+        let err = index
+            .search(
+                "needle",
+                5,
+                SearchBlendMode::Hybrid(0.6),
+                &[],
+                "model".to_string(),
+                true,
+            )
+            .await
+            .expect_err("strict mode should fail when qdrant readiness probing errors");
+        assert!(
+            err.to_string()
+                .contains("failed to check vector backend readiness in strict mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn strict_search_fails_without_embedding_ready_index() {
         let temp = tempdir().expect("tempdir");
         let repo_root = temp.path();
@@ -4228,6 +4752,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qdrant_write_failures_leave_local_refresh_committed_and_not_ready() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "first version").expect("write README");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(
+            &server,
+            vec![vec![vec![1.0_f32, 0.0_f32]], vec![vec![0.5_f32, 0.5_f32]]],
+        )
+        .await;
+
+        let state = Arc::new(Mutex::new(FakeQdrantStoreState {
+            collection_exists: true,
+            ..Default::default()
+        }));
+        let mut index = open_index_with_fake_qdrant(repo_root, Arc::clone(&state)).await;
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("initial refresh");
+
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(repo_root.join("README.md"), "second version with more text")
+            .expect("rewrite README");
+        state
+            .lock()
+            .expect("lock fake qdrant state")
+            .upsert_chunks_error = Some("injected upsert failure".to_string());
+
+        let err = index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect_err("refresh should fail when qdrant upsert fails");
+
+        assert!(
+            err.to_string().contains("injected upsert failure"),
+            "unexpected error: {err}"
+        );
+        assert!(!index.embedding_ready().await.expect("embedding ready"));
+
+        let outcome = index
+            .search(
+                "second",
+                1,
+                SearchBlendMode::LexicalOnly,
+                &[],
+                "model".to_string(),
+                false,
+            )
+            .await
+            .expect("lexical search should see committed local changes");
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].path, "README.md");
+        assert!(outcome.results[0].snippet.contains("second version"));
+
+        let guard = state.lock().expect("lock fake qdrant state");
+        assert_eq!(guard.delete_paths, vec!["README.md".to_string()]);
+        assert!(guard.points.is_empty());
+    }
+
+    #[tokio::test]
     async fn refresh_rebuilds_when_qdrant_collection_is_missing() {
         let temp = tempdir().expect("tempdir");
         let repo_root = temp.path();
@@ -4261,6 +4862,64 @@ mod tests {
         let guard = state.lock().expect("lock fake qdrant state");
         assert!(guard.collection_exists);
         assert_eq!(guard.ensure_dimensions, vec![2]);
+        assert_eq!(outcome.stats.updated_files, 1);
+        assert!(outcome.ready);
+    }
+
+    #[tokio::test]
+    async fn refresh_rebuilds_when_qdrant_collection_loses_points() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("README.md"), "needle").expect("write README");
+
+        let server = MockServer::start().await;
+        mount_openai_embeddings(
+            &server,
+            vec![vec![vec![1.0_f32, 0.0_f32]], vec![vec![1.0_f32, 0.0_f32]]],
+        )
+        .await;
+
+        let state = Arc::new(Mutex::new(FakeQdrantStoreState {
+            collection_exists: true,
+            ..Default::default()
+        }));
+        let mut index = open_index_with_fake_qdrant(repo_root, Arc::clone(&state)).await;
+        index.embeddings_base_url_override = Some(format!("{}/v1", server.uri()));
+        index.embedding_api_key_override = Some("test-key".to_string());
+
+        index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("initial refresh");
+
+        {
+            let mut guard = state.lock().expect("lock fake qdrant state");
+            guard.clear_count = 0;
+            guard.ensure_dimensions.clear();
+            guard.points.clear();
+        }
+
+        let outcome = index
+            .refresh(
+                &[],
+                false,
+                "model".to_string(),
+                EmbeddingMode::Required,
+                false,
+            )
+            .await
+            .expect("required refresh should rebuild qdrant collection after point loss");
+
+        let guard = state.lock().expect("lock fake qdrant state");
+        assert_eq!(guard.clear_count, 1);
+        assert_eq!(guard.ensure_dimensions, vec![2]);
+        assert_eq!(guard.points.len(), 1);
         assert_eq!(outcome.stats.updated_files, 1);
         assert!(outcome.ready);
     }
