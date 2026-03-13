@@ -2,8 +2,8 @@
 #![allow(clippy::unwrap_used)]
 
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
-use std::time::Instant;
 
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -57,23 +57,22 @@ async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_turn_and_measure(test: &TestCodex, prompt: &str) -> anyhow::Result<Duration> {
-    let start = Instant::now();
-    run_turn(test, prompt).await?;
-    Ok(start.elapsed())
-}
-
 #[allow(clippy::expect_used)]
 async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
     let mut builder = test_codex().with_model("test-gpt-5.1-codex");
     builder.build(server).await
 }
 
-fn assert_parallel_duration(actual: Duration) {
-    // Allow headroom for slow CI scheduling; barrier synchronization already enforces overlap.
+fn shell_file_barrier_command(create_path: &Path, wait_for_path: &Path) -> String {
+    format!(
+        "touch {create_path:?}; for _ in $(seq 1 500); do [ -f {wait_for_path:?} ] && exit 0; sleep 0.01; done; exit 1"
+    )
+}
+
+fn assert_shell_command_succeeded(output: &str) {
     assert!(
-        actual < Duration::from_millis(1_600),
-        "expected parallel execution to finish quickly, got {actual:?}"
+        output.starts_with("Exit code: 0\n"),
+        "expected successful shell_command output, got {output:?}"
     );
 }
 
@@ -133,8 +132,7 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
 
     run_turn(&test, "warm up parallel tool").await?;
 
-    let duration = run_turn_and_measure(&test, "exercise sync tool").await?;
-    assert_parallel_duration(duration);
+    run_turn(&test, "exercise sync tool").await?;
 
     Ok(())
 }
@@ -147,15 +145,21 @@ async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
     let mut builder = test_codex().with_model("gpt-5.1");
     let test = builder.build(&server).await?;
 
+    let shell_barrier_dir = tempfile::tempdir()?;
+    let call_one_ready = shell_barrier_dir.path().join("call-1.ready");
+    let call_two_ready = shell_barrier_dir.path().join("call-2.ready");
     let shell_args = json!({
-        "command": "sleep 0.25",
-        // Avoid user-specific shell startup cost (e.g. zsh profile scripts) in timing assertions.
+        "command": shell_file_barrier_command(&call_one_ready, &call_two_ready),
         "login": false,
-        "timeout_ms": 1_000,
+        "timeout_ms": 7_000,
+    });
+    let shell_args_two = json!({
+        "command": shell_file_barrier_command(&call_two_ready, &call_one_ready),
+        "login": false,
+        "timeout_ms": 7_000,
     });
     let args_one = serde_json::to_string(&shell_args)?;
-    let args_two = serde_json::to_string(&shell_args)?;
-
+    let args_two = serde_json::to_string(&shell_args_two)?;
     let first_response = sse(vec![
         json!({"type": "response.created", "response": {"id": "resp-1"}}),
         ev_function_call("call-1", "shell_command", &args_one),
@@ -166,10 +170,24 @@ async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
         ev_assistant_message("msg-1", "done"),
         ev_completed("resp-2"),
     ]);
-    mount_sse_sequence(&server, vec![first_response, second_response]).await;
+    let tool_output_request =
+        mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
-    let duration = run_turn_and_measure(&test, "run shell_command twice").await?;
-    assert_parallel_duration(duration);
+    run_turn(&test, "run shell_command twice").await?;
+
+    let request = tool_output_request
+        .last_request()
+        .expect("shell parallel test should capture tool outputs");
+    assert_shell_command_succeeded(
+        &request
+            .function_call_output_text("call-1")
+            .expect("missing shell output for first call"),
+    );
+    assert_shell_command_succeeded(
+        &request
+            .function_call_output_text("call-2")
+            .expect("missing shell output for second call"),
+    );
 
     Ok(())
 }
@@ -181,17 +199,22 @@ async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let test = build_codex_with_test_tool(&server).await?;
 
+    let shell_barrier_dir = tempfile::tempdir()?;
+    let tool_ready = shell_barrier_dir.path().join("tool.ready");
+    let shell_ready = shell_barrier_dir.path().join("shell.ready");
     let sync_args = json!({
-        "sleep_after_ms": 300
+        "file_barrier": {
+            "create_path": tool_ready,
+            "wait_for_path": shell_ready,
+            "timeout_ms": 5_000,
+        }
     })
     .to_string();
     let shell_args = serde_json::to_string(&json!({
-        "command": "sleep 0.25",
-        // Avoid user-specific shell startup cost in timing assertions.
+        "command": shell_file_barrier_command(&shell_ready, &tool_ready),
         "login": false,
-        "timeout_ms": 1_000,
+        "timeout_ms": 7_000,
     }))?;
-
     let first_response = sse(vec![
         json!({"type": "response.created", "response": {"id": "resp-1"}}),
         ev_function_call("call-1", "test_sync_tool", &sync_args),
@@ -202,10 +225,23 @@ async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
         ev_assistant_message("msg-1", "done"),
         ev_completed("resp-2"),
     ]);
-    mount_sse_sequence(&server, vec![first_response, second_response]).await;
+    let tool_output_request =
+        mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
-    let duration = run_turn_and_measure(&test, "mix tools").await?;
-    assert_parallel_duration(duration);
+    run_turn(&test, "mix tools").await?;
+
+    let request = tool_output_request
+        .last_request()
+        .expect("mixed parallel test should capture tool outputs");
+    assert_eq!(
+        request.function_call_output_text("call-1"),
+        Some("ok".to_string())
+    );
+    assert_shell_command_succeeded(
+        &request
+            .function_call_output_text("call-2")
+            .expect("missing shell output for mixed tool call"),
+    );
 
     Ok(())
 }

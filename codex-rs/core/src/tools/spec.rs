@@ -1500,6 +1500,28 @@ fn create_test_sync_tool() -> ToolSpec {
             },
         ),
     ]);
+    let file_barrier_properties = BTreeMap::from([
+        (
+            "create_path".to_string(),
+            JsonSchema::String {
+                description: Some("Path to create before waiting on the peer marker".to_string()),
+            },
+        ),
+        (
+            "wait_for_path".to_string(),
+            JsonSchema::String {
+                description: Some("Path that must exist before the barrier opens".to_string()),
+            },
+        ),
+        (
+            "timeout_ms".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Maximum time in milliseconds to wait for the peer marker".to_string(),
+                ),
+            },
+        ),
+    ]);
 
     let properties = BTreeMap::from([
         (
@@ -1523,6 +1545,14 @@ fn create_test_sync_tool() -> ToolSpec {
             JsonSchema::Object {
                 properties: barrier_properties,
                 required: Some(vec!["id".to_string(), "participants".to_string()]),
+                additional_properties: Some(false.into()),
+            },
+        ),
+        (
+            "file_barrier".to_string(),
+            JsonSchema::Object {
+                properties: file_barrier_properties,
+                required: Some(vec!["create_path".to_string(), "wait_for_path".to_string()]),
                 additional_properties: Some(false.into()),
             },
         ),

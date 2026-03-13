@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -37,6 +38,14 @@ struct BarrierArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct FileBarrierArgs {
+    create_path: PathBuf,
+    wait_for_path: PathBuf,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct TestSyncArgs {
     #[serde(default)]
     sleep_before_ms: Option<u64>,
@@ -44,6 +53,8 @@ struct TestSyncArgs {
     sleep_after_ms: Option<u64>,
     #[serde(default)]
     barrier: Option<BarrierArgs>,
+    #[serde(default)]
+    file_barrier: Option<FileBarrierArgs>,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -84,6 +95,10 @@ impl ToolHandler for TestSyncHandler {
 
         if let Some(barrier) = args.barrier {
             wait_on_barrier(barrier).await?;
+        }
+
+        if let Some(file_barrier) = args.file_barrier {
+            wait_on_file_barrier(file_barrier).await?;
         }
 
         if let Some(delay) = args.sleep_after_ms
@@ -151,4 +166,46 @@ async fn wait_on_barrier(args: BarrierArgs) -> Result<(), FunctionCallError> {
     }
 
     Ok(())
+}
+
+async fn wait_on_file_barrier(args: FileBarrierArgs) -> Result<(), FunctionCallError> {
+    if args.timeout_ms == 0 {
+        return Err(FunctionCallError::RespondToModel(
+            "file barrier timeout must be greater than zero".to_string(),
+        ));
+    }
+
+    tokio::fs::write(&args.create_path, b"ready")
+        .await
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "test_sync_tool could not create file barrier marker {}: {err}",
+                args.create_path.display()
+            ))
+        })?;
+
+    let timeout = Duration::from_millis(args.timeout_ms);
+    let start = tokio::time::Instant::now();
+    loop {
+        if tokio::fs::try_exists(&args.wait_for_path)
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "test_sync_tool could not check file barrier marker {}: {err}",
+                    args.wait_for_path.display()
+                ))
+            })?
+        {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "test_sync_tool file barrier wait timed out for {}",
+                args.wait_for_path.display()
+            )));
+        }
+
+        sleep(Duration::from_millis(10)).await;
+    }
 }

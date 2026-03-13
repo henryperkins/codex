@@ -13,6 +13,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
+use core_test_support::linux_sandbox_no_network_skip_reason;
 use core_test_support::process::process_is_alive;
 use core_test_support::process::wait_for_pid_file;
 use core_test_support::process::wait_for_process_exit;
@@ -2595,6 +2596,10 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping unified_exec_runs_under_sandbox: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
 

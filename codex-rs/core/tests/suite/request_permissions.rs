@@ -18,6 +18,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::linux_sandbox_no_network_skip_reason;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -313,6 +314,10 @@ fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissi
 async fn with_additional_permissions_requires_approval_under_on_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -490,6 +495,10 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
 async fn relative_additional_permissions_resolve_against_tool_workdir() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -790,6 +799,10 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp
 async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -999,6 +1012,10 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
 async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1122,6 +1139,10 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1239,6 +1260,10 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1350,6 +1375,10 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1461,6 +1490,10 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping request_permissions sandbox test: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;

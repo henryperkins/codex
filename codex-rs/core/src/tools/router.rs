@@ -83,10 +83,32 @@ impl ToolRouter {
     }
 
     pub fn tool_supports_parallel(&self, tool_name: &str) -> bool {
-        self.specs
+        let supports_named_tool = self
+            .specs
             .iter()
             .filter(|config| config.supports_parallel_tool_calls)
-            .any(|config| config.spec.name() == tool_name)
+            .any(|config| config.spec.name() == tool_name);
+        if supports_named_tool {
+            return true;
+        }
+
+        if matches!(
+            tool_name,
+            "shell" | "container.exec" | "local_shell" | "shell_command"
+        ) {
+            return self
+                .specs
+                .iter()
+                .filter(|config| config.supports_parallel_tool_calls)
+                .any(|config| {
+                    matches!(
+                        config.spec.name(),
+                        "shell" | "local_shell" | "shell_command" | "exec_command"
+                    )
+                });
+        }
+
+        false
     }
 
     #[instrument(level = "trace", skip_all, err)]

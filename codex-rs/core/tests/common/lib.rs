@@ -12,7 +12,17 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::Output;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use tokio::process::Command;
 
 pub mod apps_test_server;
 pub mod context_snapshot;
@@ -261,6 +271,217 @@ pub fn sandbox_env_var() -> &'static str {
 
 pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+}
+
+#[cfg(target_os = "linux")]
+const BWRAP_UNAVAILABLE_ERR: &str = "build-time bubblewrap is not available in this build.";
+#[cfg(target_os = "linux")]
+const LINUX_SANDBOX_TIMEOUT_MS: u64 = 4_000;
+#[cfg(target_os = "linux")]
+const LINUX_SANDBOX_PERMISSION_ERR_SNIPPETS: &[&str] = &[
+    "loopback: Failed RTM_NEWADDR",
+    "loopback: Failed RTM_NEWLINK",
+    "setting up uid map: Permission denied",
+    "No permissions to create a new namespace",
+    "error isolating Linux network namespace for proxy mode",
+];
+#[cfg(target_os = "linux")]
+const PROXY_ENV_KEYS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "YARN_HTTP_PROXY",
+    "YARN_HTTPS_PROXY",
+    "NPM_CONFIG_HTTP_PROXY",
+    "NPM_CONFIG_HTTPS_PROXY",
+    "NPM_CONFIG_PROXY",
+    "BUNDLE_HTTP_PROXY",
+    "BUNDLE_HTTPS_PROXY",
+    "PIP_PROXY",
+    "DOCKER_HTTP_PROXY",
+    "DOCKER_HTTPS_PROXY",
+];
+
+#[cfg(target_os = "linux")]
+fn create_env_from_core_vars() -> HashMap<String, String> {
+    let policy = codex_core::config::types::ShellEnvironmentPolicy::default();
+    codex_core::exec_env::create_env(&policy, None)
+}
+
+#[cfg(target_os = "linux")]
+fn strip_proxy_env(env: &mut HashMap<String, String>) {
+    for key in PROXY_ENV_KEYS {
+        env.remove(*key);
+        let lower = key.to_ascii_lowercase();
+        env.remove(lower.as_str());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_bwrap_unavailable_output(output: &Output) -> bool {
+    String::from_utf8_lossy(&output.stderr).contains(BWRAP_UNAVAILABLE_ERR)
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_sandbox_permission_error(stderr: &str) -> bool {
+    LINUX_SANDBOX_PERMISSION_ERR_SNIPPETS
+        .iter()
+        .any(|snippet| stderr.contains(snippet))
+}
+
+#[cfg(target_os = "linux")]
+async fn run_linux_sandbox_direct(
+    command: &[&str],
+    sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
+    allow_network_for_proxy: bool,
+    env: HashMap<String, String>,
+    timeout_ms: u64,
+) -> anyhow::Result<Output> {
+    let sandbox_exe = codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
+        .context("find binary for codex-linux-sandbox")?;
+    let cwd = std::env::current_dir().context("current dir should exist")?;
+    let policy_json = serde_json::to_string(sandbox_policy).context("serialize sandbox policy")?;
+
+    let mut args = vec![
+        "--sandbox-policy-cwd".to_string(),
+        cwd.to_string_lossy().to_string(),
+        "--sandbox-policy".to_string(),
+        policy_json,
+    ];
+    if allow_network_for_proxy {
+        args.push("--allow-network-for-proxy".to_string());
+    }
+    args.push("--".to_string());
+    args.extend(command.iter().map(|entry| (*entry).to_string()));
+
+    let mut cmd = Command::new(sandbox_exe);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output())
+        .await
+        .context("sandbox command should not time out")??;
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+async fn bwrap_availability_skip_reason() -> Option<String> {
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+
+    let output = match run_linux_sandbox_direct(
+        &["bash", "-c", "true"],
+        &codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
+        false,
+        env,
+        LINUX_SANDBOX_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return Some(format!(
+                "codex-linux-sandbox is not runnable in this environment: {err}"
+            ));
+        }
+    };
+
+    if is_bwrap_unavailable_output(&output) {
+        Some("vendored bubblewrap was not built in this environment".to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub async fn linux_sandbox_no_network_skip_reason() -> Option<String> {
+    if let Some(skip_reason) = bwrap_availability_skip_reason().await {
+        return Some(skip_reason);
+    }
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    let output = match run_linux_sandbox_direct(
+        &["bash", "-c", "true"],
+        &codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
+        false,
+        env,
+        LINUX_SANDBOX_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => return Some(format!("codex-linux-sandbox probe failed: {err}")),
+    };
+    if output.status.success() {
+        return None;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_linux_sandbox_permission_error(stderr.as_ref()) {
+        return Some(format!(
+            "Linux sandbox requires kernel namespace privileges unavailable here: {}",
+            stderr.trim()
+        ));
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn linux_sandbox_no_network_skip_reason() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub async fn linux_sandbox_managed_proxy_skip_reason() -> Option<String> {
+    if let Some(skip_reason) = bwrap_availability_skip_reason().await {
+        return Some(skip_reason);
+    }
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    env.insert("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+
+    let output = match run_linux_sandbox_direct(
+        &["bash", "-c", "true"],
+        &codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+        true,
+        env,
+        LINUX_SANDBOX_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return Some(format!(
+                "codex-linux-sandbox managed-proxy probe failed: {err}"
+            ));
+        }
+    };
+    if output.status.success() {
+        return None;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_linux_sandbox_permission_error(stderr.as_ref()) {
+        return Some(format!(
+            "managed proxy requires kernel namespace privileges unavailable here: {}",
+            stderr.trim()
+        ));
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn linux_sandbox_managed_proxy_skip_reason() -> Option<String> {
+    None
 }
 
 pub fn format_with_current_shell(command: &str) -> Vec<String> {

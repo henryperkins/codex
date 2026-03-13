@@ -22,6 +22,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
+use core_test_support::linux_sandbox_managed_proxy_skip_reason;
 use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -1577,6 +1578,10 @@ fn scenarios() -> Vec<ScenarioSpec> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_matrix_covers_all_modes() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_managed_proxy_skip_reason().await {
+        eprintln!("skipping approval matrix test: {skip_reason}");
+        return Ok(());
+    }
 
     for scenario in scenarios() {
         run_scenario(&scenario).await?;

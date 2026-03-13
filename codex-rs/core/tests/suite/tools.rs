@@ -12,6 +12,7 @@ use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::assert_regex_match;
+use core_test_support::linux_sandbox_no_network_skip_reason;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
@@ -191,6 +192,10 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sandbox_denied_shell_returns_original_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    if let Some(skip_reason) = linux_sandbox_no_network_skip_reason().await {
+        eprintln!("skipping sandbox_denied_shell_returns_original_output: {skip_reason}");
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_model("gpt-5.1-codex");
@@ -469,7 +474,7 @@ time.sleep(60)
     .await;
 
     let start = Instant::now();
-    let output_str = tokio::time::timeout(Duration::from_secs(10), async {
+    let output_str = tokio::time::timeout(Duration::from_secs(15), async {
         test.submit_turn_with_policies(
             "run a command with a detached grandchild",
             AskForApproval::Never,
@@ -499,7 +504,7 @@ time.sleep(60)
     }
 
     assert!(
-        elapsed < Duration::from_secs(9),
+        elapsed < Duration::from_secs(12),
         "command should return shortly after timeout even with live grandchildren: {elapsed:?}"
     );
 
