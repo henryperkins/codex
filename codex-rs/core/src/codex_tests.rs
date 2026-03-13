@@ -27,6 +27,7 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::ReadOnlyAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use tracing::Span;
 
 use crate::protocol::CompactedItem;
@@ -2218,11 +2219,11 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
         .notify_request_permissions_response(
             "missing",
             codex_protocol::request_permissions::RequestPermissionsResponse {
-                permissions: codex_protocol::models::PermissionProfile {
+                permissions: RequestPermissionProfile {
                     network: Some(codex_protocol::models::NetworkPermissions {
                         enabled: Some(true),
                     }),
-                    ..Default::default()
+                    ..RequestPermissionProfile::default()
                 },
                 scope: PermissionGrantScope::Turn,
             },
@@ -2254,11 +2255,11 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
     let turn_context = Arc::new(turn_context);
     let call_id = "call-1".to_string();
     let expected_response = codex_protocol::request_permissions::RequestPermissionsResponse {
-        permissions: codex_protocol::models::PermissionProfile {
+        permissions: RequestPermissionProfile {
             network: Some(codex_protocol::models::NetworkPermissions {
                 enabled: Some(true),
             }),
-            ..Default::default()
+            ..RequestPermissionProfile::default()
         },
         scope: PermissionGrantScope::Turn,
     };
@@ -2274,11 +2275,11 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
                     call_id,
                     codex_protocol::request_permissions::RequestPermissionsArgs {
                         reason: Some("need network".to_string()),
-                        permissions: codex_protocol::models::PermissionProfile {
+                        permissions: RequestPermissionProfile {
                             network: Some(codex_protocol::models::NetworkPermissions {
                                 enabled: Some(true),
                             }),
-                            ..Default::default()
+                            ..RequestPermissionProfile::default()
                         },
                     },
                 )
@@ -2334,11 +2335,11 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
             call_id,
             codex_protocol::request_permissions::RequestPermissionsArgs {
                 reason: Some("need network".to_string()),
-                permissions: codex_protocol::models::PermissionProfile {
+                permissions: RequestPermissionProfile {
                     network: Some(codex_protocol::models::NetworkPermissions {
                         enabled: Some(true),
                     }),
-                    ..Default::default()
+                    ..RequestPermissionProfile::default()
                 },
             },
         )
@@ -2348,7 +2349,7 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
         response,
         Some(
             codex_protocol::request_permissions::RequestPermissionsResponse {
-                permissions: codex_protocol::models::PermissionProfile::default(),
+                permissions: RequestPermissionProfile::default(),
                 scope: PermissionGrantScope::Turn,
             }
         )
