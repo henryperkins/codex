@@ -398,7 +398,6 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
 }
 
 #[test]
-#[test]
 fn for_prompt_rewrites_image_generation_calls_when_images_are_supported() {
     let history = create_history_with_items(vec![
         ResponseItem::ImageGenerationCall {
@@ -454,7 +453,6 @@ fn for_prompt_rewrites_image_generation_calls_when_images_are_supported() {
     );
 }
 
-#[test]
 #[test]
 fn for_prompt_rewrites_image_generation_calls_when_images_are_unsupported() {
     let history = create_history_with_items(vec![
